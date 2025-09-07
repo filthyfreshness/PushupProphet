@@ -73,6 +73,11 @@ def schedule_random_daily(chat_id: int) -> None:
     random_jobs[chat_id] = job
 
 # --------- Handlers ----------
+
+@dp.message(Command("chatid"))
+async def chatid_cmd(msg: Message):
+    await msg.answer(f"Chat ID: <code>{msg.chat.id}</code>")
+
 @dp.message(CommandStart())
 async def start_cmd(msg: Message):
     await msg.answer(
@@ -162,3 +167,4 @@ async def on_startup():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
