@@ -3,6 +3,8 @@ from typing import Dict, Optional
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi import Response
+
 import uvicorn
 
 from aiogram import Bot, Dispatcher
@@ -165,6 +167,11 @@ app = FastAPI()
 def health():
     return {"ok": True, "service": "pushup-prophet"}
 
+@app.head("/")
+def health_head():
+    return Response(status_code=200)
+
+
 @app.on_event("startup")
 async def on_startup():
     # makes sure no old webhook is set; polling will be the only mode
@@ -191,6 +198,7 @@ async def on_startup():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
 
 
