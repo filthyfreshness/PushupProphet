@@ -167,12 +167,27 @@ def health():
 
 @app.on_event("startup")
 async def on_startup():
-    # Start the Telegram bot loop in the background
-    asyncio.create_task(run_bot())
+    asyncio.create_task(run_bot())  # start Telegram bot loop
+
+    # Auto-enable daily schedule for groups listed in env var
+    ids = os.getenv("GROUP_CHAT_IDS", "").strip()
+    if ids:
+        for raw in ids.split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                chat_id = int(raw)
+                schedule_random_daily(chat_id)
+                logging.info(f"Auto-enabled daily random post for chat {chat_id}")
+            except Exception as e:
+                logging.exception(f"Failed to auto-enable for chat {raw}: {e}")
+
 
 # If you want to run locally:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
 
