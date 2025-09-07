@@ -8,6 +8,7 @@ import uvicorn
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 from aiogram.filters import Command, CommandStart
+from aiogram import F 
 from aiogram.enums.parse_mode import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
@@ -73,10 +74,16 @@ def schedule_random_daily(chat_id: int) -> None:
     random_jobs[chat_id] = job
 
 # --------- Handlers ----------
-
+# Primary: works for /chatid and /chatid@pushupprophetbot
 @dp.message(Command("chatid"))
 async def chatid_cmd(msg: Message):
     await msg.answer(f"Chat ID: <code>{msg.chat.id}</code>")
+
+# Fallback: catches odd variations like trailing spaces, mentions, etc.
+@dp.message(F.text.func(lambda t: isinstance(t, str) and t.strip().lower().startswith(("/chatid", "/chatid@"))))
+async def chatid_fallback(msg: Message):
+    await msg.answer(f"Chat ID: <code>{msg.chat.id}</code>")
+
 
 @dp.message(CommandStart())
 async def start_cmd(msg: Message):
@@ -167,4 +174,5 @@ async def on_startup():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
