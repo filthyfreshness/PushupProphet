@@ -167,6 +167,9 @@ def health():
 
 @app.on_event("startup")
 async def on_startup():
+    # makes sure no old webhook is set; polling will be the only mode
+    await bot.delete_webhook(drop_pending_updates=True)
+  
     asyncio.create_task(run_bot())  # start Telegram bot loop
 
     # Auto-enable daily schedule for groups listed in env var
@@ -188,6 +191,7 @@ async def on_startup():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
 
 
