@@ -2,8 +2,7 @@ import os, re, asyncio, logging, datetime as dt, random
 from typing import Dict, Optional
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi import Response
+from fastapi import FastAPI, Response
 
 import uvicorn
 
@@ -157,9 +156,6 @@ async def roll_cmd(msg: Message):
     return await msg.answer("Usage:\n/roll 1d5  (→ 1..5)\n/roll 6    (→ 1..6)\n/roll 3d6  (→ three 1..6 rolls + sum)")
 
 # --------- Run bot + web server together ----------
-async def run_bot():
-    scheduler.start()
-    await dp.start_polling(bot)
 
 app = FastAPI()
 
@@ -170,6 +166,10 @@ def health():
 @app.head("/")
 def health_head():
     return Response(status_code=200)
+
+async def run_bot():
+    scheduler.start()
+    await dp.start_polling(bot)
 
 
 @app.on_event("startup")
@@ -198,6 +198,7 @@ async def on_startup():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
 
 
