@@ -29,9 +29,13 @@ if not BOT_TOKEN:
     )
 
 TZ = timezone("Europe/Stockholm")
-DAILY_TEXT = "The Forgiveness Chain has begun! Best of luck!"
+DAILY_TEXT = "THE FORGIVENESS CHAIN BEGINS NOW. Lay down excuses and ascend. May the power of Push be with you."
 WINDOW_START = 7   # 07:00
 WINDOW_END = 22    # 22:00 (inclusive)
+
+# ---- Weekly Prophecy config ----
+PEOPLE = {1: "Fresh", 2: "Momo", 3: "Valle", 4: "Tän", 5: "Hampa"}
+ALLOW_REPEAT = True  # False => mercy & punishment must be different
 
 # --------- Bot setup ----------
 logging.basicConfig(level=logging.INFO)
@@ -210,6 +214,65 @@ async def send_daily_quote(chat_id: int):
 
 # ================== End Quotes section ==================
 
+# ================== Weekly Prophecy (Sun 11:00 + /prophecy) ==================
+
+async def start_prophecy_sequence(chat_id: int):
+    """
+    t+0:  announce
+    t+3m: reveal MERCY (name from PEOPLE)
+    t+4m: warn punishment in 1 minute
+    t+5m: reveal PUNISHED + final line
+    """
+    announce = (
+        "ATTENTION EVERYONE\n"
+        "The Prophecy has been revealed! In 3 minutes, you will hear WHO WILL RECEIVE MERCY tomorrow.\n"
+        "@Wabbadabbadubdub @Hampuz @FilthyFresh @ThugnificentMomo @Bowlcut00 "
+    )
+    await bot.send_message(chat_id, announce)
+
+    now = dt.datetime.now(TZ)
+    t_mercy = now + dt.timedelta(minutes=3)
+    t_warn  = t_mercy + dt.timedelta(minutes=1)
+    t_pun   = t_warn  + dt.timedelta(minutes=1)
+
+    first_pick_num: Optional[int] = None
+
+    async def reveal_mercy():
+        nonlocal first_pick_num
+        n = _sysrand.randint(1, 5)
+        first_pick_num = n
+        await bot.send_message(
+            chat_id,
+            f"🔮 The Prophecy speaks...\nWHO WILL RECEIVE MERCY tomorrow: <b>{PEOPLE[n]}</b>"
+        )
+
+    async def warn_punishment():
+        await bot.send_message(
+            chat_id,
+            "Of course, we cannot have mercy without punishment. In one minute, you will find out WHO WILL BE THE PUNISHED ONE. May the fortunes be with you."
+        )
+
+    async def reveal_punishment_and_final():
+        if ALLOW_REPEAT:
+            n = _sysrand.randint(1, 5)
+        else:
+            while True:
+                n = _sysrand.randint(1, 5)
+                if n != first_pick_num:
+                    break
+        await bot.send_message(
+            chat_id,
+            f"⚖️ The verdict is in.\nWHO WILL BE THE PUNISHED ONE: <b>{PEOPLE[n]}</b>"
+        )
+        await bot.send_message(
+            chat_id,
+            "The weekly prophecies have been spoken. May the force of the Pushup Prophet be with you!"
+        )
+
+    scheduler.add_job(reveal_mercy, "date", run_date=t_mercy)
+    scheduler.add_job(warn_punishment, "date", run_date=t_warn)
+    scheduler.add_job(reveal_punishment_and_final, "date", run_date=t_pun)
+
 # --------- Handlers ----------
 # Primary: works for /chatid and /chatid@pushupprophetbot
 @dp.message(Command("chatid"))
@@ -232,6 +295,7 @@ async def start_cmd(msg: Message):
         "/share_wisdom – send the next quote now\n"
         "/wisdom – same as /share_wisdom\n"
         "/quote – same as /share_wisdom\n"
+        "/prophecy – announce now, reveal MERCY in 3m, warn at 4m, reveal PUNISHED at 5m\n"
         "/enable_random – start daily random message\n"
         "/disable_random – stop daily message\n"
         "/status_random – show whether daily post is enabled\n"
@@ -312,6 +376,11 @@ async def share_wisdom_cmd(msg: Message):
 async def share_wisdom_space_alias(msg: Message):
     await _send_next_quote_to_chat(msg.chat.id)
 
+# Manual trigger for the prophecy sequence
+@dp.message(Command("prophecy"))
+async def prophecy_cmd(msg: Message):
+    await start_prophecy_sequence(msg.chat.id)
+
 # --------- Run bot + web server together ----------
 
 app = FastAPI()
@@ -360,6 +429,19 @@ async def on_startup():
                 )
                 logging.info(f"Scheduled daily quote (07:00) for chat {chat_id}")
 
+                # Weekly Prophecy every Sunday at 11:00 Stockholm
+                scheduler.add_job(
+                    start_prophecy_sequence,
+                    "cron",
+                    day_of_week="sun",
+                    hour=11,
+                    minute=0,
+                    args=[chat_id],
+                    id=f"weekly_prophecy_{chat_id}",
+                    replace_existing=True,
+                )
+                logging.info(f"Scheduled weekly prophecy (Sun 11:00) for chat {chat_id}")
+
             except Exception as e:
                 logging.exception(f"Startup scheduling failed for chat {raw}: {e}")
 
@@ -367,4 +449,3 @@ async def on_startup():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
-
