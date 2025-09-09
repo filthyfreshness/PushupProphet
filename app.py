@@ -1,6 +1,7 @@
-import os, re, asyncio, logging, datetime as dt, random
+import os, re, asyncio, logging, datetime as dt, random, html
 from typing import Dict, Optional
 from pathlib import Path
+from collections import deque
 
 from fastapi import FastAPI, Response
 import uvicorn
@@ -31,17 +32,6 @@ TZ = timezone("Europe/Stockholm")
 DAILY_TEXT = "The Forgiveness Chain has begun! Best of luck!"
 WINDOW_START = 7   # 07:00
 WINDOW_END = 22    # 22:00 (inclusive)
-
-# ---- Name mapping for Prophecy (1..5) ----
-PEOPLE: Dict[int, str] = {
-    1: "Fresh",
-    2: "Momo",
-    3: "Valle",
-    4: "Tän",
-    5: "Hampa",
-}
-# True = the two picks may be the same person; False = must be different
-ALLOW_REPEAT = True
 
 # --------- Bot setup ----------
 logging.basicConfig(level=logging.INFO)
@@ -84,66 +74,147 @@ def schedule_random_daily(chat_id: int) -> None:
     job = scheduler.add_job(send_and_reschedule, "date", run_date=run_at)
     random_jobs[chat_id] = job
 
-# --------- Prophecy sequence helper ----------
-async def start_prophecy_sequence(chat_id: int):
-    """
-    t+0:  announce
-    t+3m: reveal MERCY (name from PEOPLE)
-    t+4m: warn that punishment is in 1 minute
-    t+5m: reveal PUNISHED (name from PEOPLE) + final line
-    """
-    # 0) ANNOUNCE NOW
-    announce = (
-        "ATTENTION EVERYONE\n"
-        "The Prophecy has been revealed! In 3 minutes, it you will hear WHO WILL RECEIVE MERCY tomorrow."
-    )
-    await bot.send_message(chat_id, announce)
+# ================== Quotes rotation (daily 07:00 + /share_wisdom) ==================
 
-    now = dt.datetime.now(TZ)
-    t_mercy = now + dt.timedelta(minutes=3)
-    t_warn  = t_mercy + dt.timedelta(minutes=1)
-    t_pun   = t_warn  + dt.timedelta(minutes=1)
+# TODO: Paste your real quotes here (each as a string). Examples:
+QUOTES = [
+    "Discipline is choosing what you want most over what you want now.",
+    "Small daily improvements are the key to long-term results.",
+    "The body achieves what the mind believes.",
+    "Consistency beats intensity when intensity is inconsistent.",
+    "Courage is one step ahead of fear.",
+    "“Gravity is my quill; with each rep I write strength upon your bones.”",
+    "“Do not count your pushups—make your pushups count, and the numbers will fear you.”",
+    "“Form is truth. Without truth, repetitions are only noise.”",
+    "“When your arms tremble, listen—this is your weakness volunteering to leave.”",
+    "“The floor is not your enemy; it is the altar where you lay down excuses.”",
+    "“Consistency is the spell that turns effort into destiny.”",
+    "“Breathe like a tide, move like a vow, rise like a promise kept.”",
+    "“Rest is the secret rep—unseen, but written in tomorrow’s power.”",
+    "“Progress bows to patience; ego bows to technique.”",
+    "“Kiss the earth with your chest and return wiser—every descent is a teacher, every ascent a testimony.”",
+    "“The plank is the parent of the pushup; honor the parent, and the child grows mighty.”",
+    "“Do not bargain with depth—the earth hears every half-truth.”",
+    "“Ego loads the shoulders; wisdom loads the calendar.”",
+    "“Reps are a language: tension the grammar, breath the punctuation.”",
+    "“A straight spine tells a straight story—lie not to your lower back.”",
+    "“When progress stalls, change the question: narrower hands, slower descent, truer form.”",
+    "“Tempo reveals character—pause at the bottom and meet yourself.”",
+    "“If wrists protest, rotate the world: fists, handles, or incline—wisdom bends, not breaks.”",
+    "“Your first clean pushup is a door; your thousandth, a road.”",
+    "“On doubtful days, do one honest rep—prophecy begins with a single truth.”",
+    "“On heavy days, shorten the sets, never the standard.”",
+    "“A missed day costs coin, not destiny—pay, confess, continue.”",
+    "“When the Forgiveness Chain is cast, move as one; shared discipline lightens every debt.”",
+    "“Day 75 tests the mind—slow the tempo, breathe the count, and the wall becomes a doorway.”",
+    "“Day 100 is not an ending but an inheritance—keep a daily tithe: one perfect pushup to remember who you became.”",
+    "“Mid-journey math: divide the mountain into honest tens and climb.”",
+    "“Protect the wrists, warm the shoulders—oil the hinges before opening the heavy door.”",
+    "“Let the last set be the cleanest; finish with dignity, not desperation.”",
+    "“Debt may weigh your coin; poor form will tax your future—pay the pot, not your joints.”",
+    "“Schedule is a silent spotter—set alarms, stack habits, keep promises.”",
+    "“When doubt visits, breathe a three-count descent and meet yourself at the bottom.”",
+    "“On day 100, do not stop—carry a legacy forward: one perfect pushup, every day, forever.”",
+    "“The floor keeps perfect score; it only counts the truth.”",
+    "“Brace the core, squeeze the glutes—make your body one unbroken vow.”",
+    "“Elbows close like gates at forty-five; open wider and the storm will enter.”",
+    "“Touch the ground with your chest, not your pride.”",
+    "“The lockout is a promise; break it and the next rep breaks you.”",
+    "“Incline is a bridge, not an excuse—cross it to reach mastery.”",
+    "“Grease the groove: many doors open to those who knock lightly and often.”",
+    "“Slow negatives carve strength into stone.”",
+    "“He who rushes the bottom dodges the lesson.”",
+    "“Your scapulae are wings; spread at the top, glide to the next ascent.”",
+    "“Hydrate your discipline; dry resolve cracks.”",
+    "“Sleep is the smithy where today’s efforts become tomorrow’s iron.”",
+    "“Warm-up is the toll you pay to cross into heavy work.”",
+    "“If pain speaks in joints, listen with humility and change the path.”",
+    "“Count sets by breaths: three in descent, three out to rise—let calm lead effort.”",
+    "“Do fewer with honor rather than many with alibis.”",
+    "“A straight gaze steadies the spine; look where you wish to go.”",
+    "“When companions falter, lend cadence not judgment.”",
+    "“Deload to reload—the bow that never slackens cannot fire true.”",
+    "“Technique first, volume second, vanity never.”",
+    "“Hands beneath shoulders—foundations belong under walls.”",
+    "“On the hardest days, move at the speed of honesty.”",
+    "“Record your reps; memory flatters, ink does not.”",
+    "“Make the last two centimeters your signature.”",
+    "“Strength grows in quiet places—between sets, between days.”",
+    "“Let discipline be boring and results be loud.”",
+    "“Finish your promise on the floor, then carry it into your life.”",
+    "“Treat the first set like a greeting and the last like a goodbye—both deserve respect.”",
+    "“Diamond hands belong under your heart—narrow the base to widen your courage.”",
+    "“Archer pushups teach patience; strength favors those who learn to lean.”",
+    "“Decline is not defeat; it is ascent by another name.”",
+    "“Between rep and rep lives posture; guard it like a secret.”",
+    "“Fatigue is honest; negotiate with sets, not standards.”",
+    "“Train the serratus—protract at the top and you shall press with the whole ribcage.”",
+    "“Your breath is a metronome; let it set the pace your pride cannot.”",
+    "“A century of days is built from minutes; put them where your mouth is.”",
+    "“The floor is a mirror—approach it with the face you want to wear.”",
+    "“Do not chase burn; chase precision—the fire will follow.”",
+    "“Strength is a quiet harvest; sow today, reap when no one claps.”",
+    "“Every rep has a birthplace: the brace.”",
+    "“If shoulders roll forward, call the scapula home.”",
+    "“The first rep proves your readiness; the last rep proves your character.”",
+    "“Hard sets whisper lessons that easy sets never learn.”",
+    "“Make your warm-up a love letter to your joints.”",
+    "“Skill is the savings account of effort; deposit daily.”",
+    "“Pushups do not make you humble; poor form should.”",
+    "“Depth is democratic—everyone can afford the truth.”",
+    "“Chase mastery like a shadow; it stays with those who move in light.”",
+    "“When numbers rise, range must not fall.”",
+    "“Control the descent, own the ascent.”",
+    "“Rotate your variations; monotony is the rust of progress.”",
+    "“Incline for learning, decline for earning, standard for judgment.”",
+    "“Let soreness be a storyteller, not a jailer.”",
+    "“If the floor is far, stack books—build knowledge and height together.”",
+    "“Five clean now beats fifty crooked later.”",
+    "“Reset your hands, reset your mind.”",
+    "“Pauses forge honesty at the bottom; lockouts stamp the seal at the top.”",
+    "“Count integrity, then reps.”",
+    "“The day you don’t want to is the day you must.”",
+    "“Community multiplies resolve; match your cadence to the slowest and bring them home.”",
+    "“A single crooked rep teaches more than a hundred excuses.”",
+    "“Your chest meets the earth; your spirit meets its standard.”",
+    "“Make failure a data point, not a destiny.”",
+    "“Recovery writes the chapter your training begins.”",
+    "“Calories are ink; protein is the bold font.”",
+    "“Stretch the pecs, open the T-spine—unlock the door you keep pushing.”",
+    "“Keep elbows soft at the top; locked is lawful, jammed is foolish.”",
+    "“Raise your standards before you raise your reps.”",
+]
 
-    first_pick_num: Optional[int] = None
+# Per-chat rotation state: each chat_id has a deque of randomized quote indices.
+_quote_rotation: Dict[int, deque] = {}
 
-    async def reveal_mercy():
-        nonlocal first_pick_num
-        n = _sysrand.randint(1, 5)
-        first_pick_num = n
-        name = PEOPLE[n]
-        await bot.send_message(
-            chat_id,
-            f"🔮 The Prophecy speaks...\nWHO WILL RECEIVE MERCY tomorrow: <b>{name}</b>"
-        )
+def _init_quote_rotation(chat_id: int) -> None:
+    if not QUOTES:
+        _quote_rotation[chat_id] = deque()
+        return
+    order = list(range(len(QUOTES)))
+    _sysrand.shuffle(order)
+    _quote_rotation[chat_id] = deque(order)
 
-    async def warn_punishment():
-        await bot.send_message(
-            chat_id,
-            "Of course, we cannot have mercy without punishment. In one minute, you will find out WHO WILL BE THE PUNISHED ONE. May the fortunes be with you."
-        )
+def _next_quote(chat_id: int) -> Optional[str]:
+    if not QUOTES:
+        return None
+    dq = _quote_rotation.get(chat_id)
+    if dq is None or not dq:
+        _init_quote_rotation(chat_id)
+        dq = _quote_rotation[chat_id]
+    idx = dq.popleft()
+    return QUOTES[idx]
 
-    async def reveal_punishment_and_final():
-        if ALLOW_REPEAT:
-            n = _sysrand.randint(1, 5)
-        else:
-            while True:
-                n = _sysrand.randint(1, 5)
-                if n != first_pick_num:
-                    break
-        name = PEOPLE[n]
-        await bot.send_message(
-            chat_id,
-            f"⚖️ The verdict is in.\nWHO WILL BE THE PUNISHED ONE: <b>{name}</b>"
-        )
-        await bot.send_message(
-            chat_id,
-            "The weekly prophecies have been spoken. May the force of the Pushup Prophet be with you!"
-        )
+async def send_daily_quote(chat_id: int):
+    q = _next_quote(chat_id)
+    if q is None:
+        return
+    # Escape for HTML mode to avoid parse errors if quote has <, >, &
+    safe = html.escape(q)
+    await bot.send_message(chat_id, f"🕖 Daily Wisdom\n{safe}")
 
-    # Schedule the 3 timed steps
-    scheduler.add_job(reveal_mercy, "date", run_date=t_mercy)
-    scheduler.add_job(warn_punishment, "date", run_date=t_warn)
-    scheduler.add_job(reveal_punishment_and_final, "date", run_date=t_pun)
+# ================== End Quotes section ==================
 
 # --------- Handlers ----------
 # Primary: works for /chatid and /chatid@pushupprophetbot
@@ -161,12 +232,13 @@ async def start_cmd(msg: Message):
     await msg.answer(
         "Hi! I can:\n"
         "• Post 1 time per day at a random time (07:00–22:00 Stockholm) with our Forgiveness Chain message.\n"
+        "• Share a daily quote at 07:00 Stockholm (per group) and rotate through your list randomly without repeats.\n"
         "• Roll dice with /roll (e.g., /roll 1d5 → 1..5).\n\n"
         "Commands:\n"
         "/enable_random – start daily random message\n"
         "/disable_random – stop daily message\n"
         "/status_random – show whether daily post is enabled\n"
-        "/prophecy – announce now, reveal MERCY in 3 min, warn, then reveal PUNISHED at 5 min total\n"
+        "/share_wisdom – send the next quote now (uses the same rotation as 07:00)\n"
         "/roll &lt;pattern&gt; – roll dice (examples: /roll 1d5, /roll 6, /roll 3d6)\n"
     )
 
@@ -226,12 +298,16 @@ async def roll_cmd(msg: Message):
 
     return await msg.answer("Usage:\n/roll 1d5  (→ 1..5)\n/roll 6    (→ 1..6)\n/roll 3d6  (→ three 1..6 rolls + sum)")
 
-# Manual trigger for the full prophecy sequence
-@dp.message(Command("prophecy"))
-async def prophecy_cmd(msg: Message):
-    await start_prophecy_sequence(msg.chat.id)
+# --- New command: /share_wisdom (consumes next quote in rotation) ---
+@dp.message(Command("share_wisdom"))
+async def share_wisdom_cmd(msg: Message):
+    q = _next_quote(msg.chat.id)
+    if not q:
+        return await msg.answer("No quotes configured yet.")
+    await msg.answer(html.escape(q))
 
 # --------- Run bot + web server together ----------
+
 app = FastAPI()
 
 @app.get("/")
@@ -262,31 +338,24 @@ async def on_startup():
                 continue
             try:
                 chat_id = int(raw)
+                # Forgiveness Chain daily random-time window
                 schedule_random_daily(chat_id)
                 logging.info(f"Auto-enabled daily random post for chat {chat_id}")
-            except Exception as e:
-                logging.exception(f"Failed to auto-enable for chat {raw}: {e}")
 
-        # Auto-schedule weekly Prophecy every Sunday at 11:00 (Stockholm) for each chat
-        for raw in ids.split(","):
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                chat_id = int(raw)
+                # Daily quotes at 07:00 Stockholm
                 scheduler.add_job(
-                    start_prophecy_sequence,
+                    send_daily_quote,
                     "cron",
-                    day_of_week="sun",
-                    hour=11,
+                    hour=7,
                     minute=0,
                     args=[chat_id],
-                    id=f"weekly_prophecy_{chat_id}",
+                    id=f"daily_quote_{chat_id}",
                     replace_existing=True,
                 )
-                logging.info(f"Scheduled weekly prophecy (Sun 11:00) for chat {chat_id}")
+                logging.info(f"Scheduled daily quote (07:00) for chat {chat_id}")
+
             except Exception as e:
-                logging.exception(f"Failed to schedule weekly prophecy for chat {raw}: {e}")
+                logging.exception(f"Startup scheduling failed for chat {raw}: {e}")
 
 # If you want to run locally:
 if __name__ == "__main__":
