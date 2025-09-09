@@ -29,9 +29,15 @@ if not BOT_TOKEN:
     )
 
 TZ = timezone("Europe/Stockholm")
-DAILY_TEXT = "THE FORGIVENESS CHAIN BEGINS NOW. Lay down excuses and ascend. May the power of Push be with you."
+DAILY_TEXT = "THE FORGIVENESS CHAIN BEGINS NOW. Lay down excuses and ascend. May the power of Push be with you all."
 WINDOW_START = 7   # 07:00
 WINDOW_END = 22    # 22:00 (inclusive)
+
+FOLLOWUP_TEXT = (
+    "The hour has passed, the covenant stands. No debt weighs upon those who rise in unison. "
+    "The choice has always been yours. I hope you made the right one."
+)
+
 
 # ---- Weekly Prophecy config ----
 PEOPLE = {1: "Fresh", 2: "Momo", 3: "Valle", 4: "Tän", 5: "Hampa"}
@@ -68,8 +74,19 @@ def schedule_random_daily(chat_id: int) -> None:
 
     async def send_and_reschedule():
         try:
+            # 1) Send the Forgiveness Chain announcement
             await bot.send_message(chat_id, DAILY_TEXT)
+
+            # 2) Schedule the 1-hour follow-up message
+            follow_time = dt.datetime.now(TZ) + dt.timedelta(hours=1)
+
+            async def send_followup():
+                await bot.send_message(chat_id, FOLLOWUP_TEXT)
+
+            scheduler.add_job(send_followup, "date", run_date=follow_time)
+
         finally:
+            # 3) Schedule tomorrow's random-time post
             tomorrow = dt.datetime.now(TZ) + dt.timedelta(days=1)
             next_run = next_random_time(tomorrow)
             new_job = scheduler.add_job(send_and_reschedule, "date", run_date=next_run)
@@ -77,6 +94,7 @@ def schedule_random_daily(chat_id: int) -> None:
 
     job = scheduler.add_job(send_and_reschedule, "date", run_date=run_at)
     random_jobs[chat_id] = job
+
 
 # ================== Quotes rotation (daily 07:00 + /share_wisdom) ==================
 
@@ -449,3 +467,4 @@ async def on_startup():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
