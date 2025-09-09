@@ -76,13 +76,7 @@ def schedule_random_daily(chat_id: int) -> None:
 
 # ================== Quotes rotation (daily 07:00 + /share_wisdom) ==================
 
-# TODO: Paste your real quotes here (each as a string). Examples:
 QUOTES = [
-    "Discipline is choosing what you want most over what you want now.",
-    "Small daily improvements are the key to long-term results.",
-    "The body achieves what the mind believes.",
-    "Consistency beats intensity when intensity is inconsistent.",
-    "Courage is one step ahead of fear.",
     "“Gravity is my quill; with each rep I write strength upon your bones.”",
     "“Do not count your pushups—make your pushups count, and the numbers will fear you.”",
     "“Form is truth. Without truth, repetitions are only noise.”",
@@ -235,10 +229,12 @@ async def start_cmd(msg: Message):
         "• Share a daily quote at 07:00 Stockholm (per group) and rotate through your list randomly without repeats.\n"
         "• Roll dice with /roll (e.g., /roll 1d5 → 1..5).\n\n"
         "Commands:\n"
+        "/share_wisdom – send the next quote now\n"
+        "/wisdom – same as /share_wisdom\n"
+        "/quote – same as /share_wisdom\n"
         "/enable_random – start daily random message\n"
         "/disable_random – stop daily message\n"
         "/status_random – show whether daily post is enabled\n"
-        "/share_wisdom – send the next quote now (uses the same rotation as 07:00)\n"
         "/roll &lt;pattern&gt; – roll dice (examples: /roll 1d5, /roll 6, /roll 3d6)\n"
     )
 
@@ -298,13 +294,23 @@ async def roll_cmd(msg: Message):
 
     return await msg.answer("Usage:\n/roll 1d5  (→ 1..5)\n/roll 6    (→ 1..6)\n/roll 3d6  (→ three 1..6 rolls + sum)")
 
-# --- New command: /share_wisdom (consumes next quote in rotation) ---
-@dp.message(Command("share_wisdom"))
-async def share_wisdom_cmd(msg: Message):
-    q = _next_quote(msg.chat.id)
+# --- Helpers for sending the next quote ---
+async def _send_next_quote_to_chat(chat_id: int):
+    q = _next_quote(chat_id)
     if not q:
-        return await msg.answer("No quotes configured yet.")
-    await msg.answer(html.escape(q))
+        await bot.send_message(chat_id, "No quotes configured yet.")
+        return
+    await bot.send_message(chat_id, html.escape(q))
+
+# Official command with aliases: /share_wisdom, /wisdom, /quote
+@dp.message(Command(("share_wisdom", "wisdom", "quote")))
+async def share_wisdom_cmd(msg: Message):
+    await _send_next_quote_to_chat(msg.chat.id)
+
+# Fallback for people who type `/share wisdom`
+@dp.message(F.text.func(lambda t: isinstance(t, str) and t.strip().lower().startswith("/share wisdom")))
+async def share_wisdom_space_alias(msg: Message):
+    await _send_next_quote_to_chat(msg.chat.id)
 
 # --------- Run bot + web server together ----------
 
