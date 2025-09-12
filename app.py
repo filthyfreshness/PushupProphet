@@ -487,20 +487,19 @@ async def chatid_fallback(msg: Message):
 @dp.message(CommandStart())
 async def start_cmd(msg: Message):
     await msg.answer(
-        "Hi! I can:\n"
-        "• Post 1 time per day at a random time (07:00–22:00 Stockholm) with our Forgiveness Chain message.\n"
-        "• Share a daily quote at 07:00 Stockholm (per group) and rotate through your list randomly without repeats.\n"
-        "• Roll dice with /roll (e.g., /roll 1d5 → 1..5).\n"
+        "I am the Pushup Prophet! For my loyal subjects, I can:\n"
+        "• /share_wisdom for those who seek knowledge and guidance.\n"
+        "• /Roll dice (e.g., /roll 1d5 → 1..5).\n"
         "• Summon the Dice of Fate with /fate (one roll per person per day).\n"
-        "• Receive your thanks and offer a blessing (/thanks) — with a rare Favor of Gratitude.\n\n"
+
         "Commands:\n"
-        "/share_wisdom – send the next quote now\n"
         "/enable_random – start daily random message\n"
         "/disable_random – stop daily message\n"
         "/status_random – show whether daily post is enabled\n"
-        "/roll &lt;pattern&gt; – roll dice (examples: /roll 1d5, /roll 6, /roll 3d6)\n"
-        "/fate – summon the Dice of Fate\n"
-        "/thanks – offer gratitude to the Prophet"
+        "\n"
+        "Remember to always show your gratitude to the Pushup Prophet\n"
+
+
     )
 
 @dp.message(Command("help"))
@@ -654,5 +653,6 @@ async def on_startup():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
 
