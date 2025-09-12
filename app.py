@@ -375,42 +375,47 @@ async def fate_roll(cb: CallbackQuery):
 
 # ================== Gratitude / Blessings (5% favor) ==================
 
+# ================== Gratitude / Blessings (5% favor) ==================
+
 BLESSINGS = [
-    "🙏 The Prophet inclines his head. Gratitude sharpens strength; walk in favor.",
-    "🌿 Your thanks are received. May your reps be true and your ledger light.",
-    "🕊️ Gratitude oils the gears of discipline. Go steady, with breath like tide.",
-    "🔥 The altar remembers those who bow with thanks. Rise with a lighter heart.",
-    "🌅 Gratitude is dawn for the diligent—carry its light into your sets.",
-    # +10 new variations:
-    "🌾 May your discipline be bread for hungry days; go in quiet strength.",
-    "🛡️ May your joints be guarded and your will unbroken.",
-    "🌊 Breathe like the tide; let steadiness carry you to shore.",
-    "⚖️ Balance effort with wisdom—the floor counts only truth.",
+    "🙏 Your thanks are heard and held. May steadiness be your crown.",
+    "🌿 I receive your gratitude, and return a quiet strength.",
+    "🕊️ Your words reach the altar; rise lighter and go clean.",
+    "🔥 Your gratitude is accepted; let resolve burn without smoke.",
+    "🌅 Your thanks are received at dawn; may your first rep be honest.",
+    "🌾 I accept your thanks; may your discipline feed the days ahead.",
+    "🛡️ Your gratitude is noted; may your joints be guarded and your will unbroken.",
+    "🌊 Your thanks land like tide; may rhythm carry you to shore.",
+    "⚖️ I receive your thanks; balance effort with wisdom—the floor counts only truth.",
     "🔔 Your gratitude rings true; let your sets answer the echo.",
-    "🌟 Walk the straight line: truth at the bottom, dignity at the top.",
-    "🍃 Move clean, rest clean—greatness grows in quiet soil.",
-    "⛓️ Keep your promises; links become chains or armor—choose.",
-    "🗡️ Cut through doubt with one honest rep.",
-    "🏛️ Stand tall; your standard is the temple you live in.",
+    "🌟 Your thanks are welcomed; keep truth at the bottom, dignity at the top.",
+    "🍃 I accept your thanks; greatness grows in quiet soil.",
+    "⛓️ Your gratitude is counted; let your promises become armor.",
+    "🗡️ Your thanks are received; cut through doubt with one honest rep.",
+    "🏛️ Your gratitude is accepted; stand tall—your standard is your temple.",
 ]
 
 async def _respond_to_thanks(msg: Message):
+    # Personal acknowledgement + blessing; 5% chance to grant favor
+    first = (msg.from_user.first_name or "").strip()
+    last = (getattr(msg.from_user, "last_name", None) or "").strip()
+    display = (first + " " + last).strip() or (("@" + msg.from_user.username) if msg.from_user.username else "traveler")
+    name_html = html.escape(display)
+
     blessing = _sysrand.choice(BLESSINGS)
-    # 5% chance to grant a 20 kr deduction
+    base = f"Your thanks are received, <b>{name_html}</b>.\n{blessing}"
+
     if _sysrand.random() < 0.05:
         text = (
-            f"{blessing}\n\n"
+            f"{base}\n\n"
             "🪙 <b>Favor of Gratitude</b>\n"
             "Because you showed loyalty, you may deduct <b>20 kr</b> from your debt."
         )
     else:
-        text = blessing
+        text = base
+
     await msg.answer(text)
 
-# Commands for thanks
-@dp.message(Command("thanks", "thankyou", "thank", "tack"))
-async def thanks_cmd(msg: Message):
-    await _respond_to_thanks(msg)
 
 # Natural-language thanks (non-commands)
 THANKS_PATTERN = re.compile(r"\b(thanks|thank\s*you|tack(?:\s*så\s*mycket)?)\b", re.IGNORECASE)
@@ -608,3 +613,4 @@ async def on_startup():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
