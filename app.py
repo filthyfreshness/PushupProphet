@@ -427,6 +427,80 @@ async def thanks_natural(msg: Message):
 
 # ================== End Gratitude section ==================
 
+# === Negativity / insult watcher (replace your previous block with this one) ===
+# Triggers when someone insults or speaks negatively to the Prophet/bot.
+# It fires if:
+#  A) A mention of the Prophet/bot appears in the same message as an insult word (any order), OR
+#  B) The message contains certain strong phrases like "fuck this shit" / "fucking bullshit" / etc.
+
+INSULT_RE = re.compile(
+    r"""
+    (?ix)
+    (
+        # ---- A) Mention + insult (either order) ----
+        (?:
+            (?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b)
+            .*?
+            (?:\bf\W*u\W*c\W*k\b|\bf\*+ck\b|\bfuck(?:ing|er|ed)?\b|\bbull\W*sh(?:it|\\*?t)\b|\bshit\b|\bcrap\b|\btrash\b|\bgarbage\b|\bsucks?\b|\bstupid\b|\bidiot\b|\bmoron\b|\bdumb\b|\bloser\b|\bpathetic\b|\blame\b|\bawful\b|\bterrible\b|\buseless\b|\bworthless\b|\bannoying\b|\bcringe\b|\bfraud\b|\bfake\b|\bclown\b|\bnonsense\b|\bbs\b|\bstfu\b|\bshut\s*up\b|\bgo\s*away\b|\bget\s*lost\b|\bscrew\s*you\b|\b(?:hate|hating)\s+(?:you|this)\b)
+        )
+        |
+        (?:
+            (?:\bf\W*u\W*c\W*k\b|\bf\*+ck\b|\bfuck(?:ing|er|ed)?\b|\bbull\W*sh(?:it|\\*?t)\b|\bshit\b|\bcrap\b|\btrash\b|\bgarbage\b|\bsucks?\b|\bstupid\b|\bidiot\b|\bmoron\b|\bdumb\b|\bloser\b|\bpathetic\b|\blame\b|\bawful\b|\bterrible\b|\buseless\b|\bworthless\b|\bannoying\b|\bcringe\b|\bfraud\b|\bfake\b|\bclown\b|\bnonsense\b|\bbs\b|\bstfu\b|\bshut\s*up\b|\bgo\s*away\b|\bget\s*lost\b|\bscrew\s*you\b|\b(?:hate|hating)\s+(?:you|this)\b)
+            .*?
+            (?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b)
+        )
+        |
+        # ---- B) Strong general phrases (catch-alls) ----
+        \bfuck\s*this\s*shit\b
+        |
+        \bfuck(?:ing)?\s+bull\W*shit\b
+        |
+        \b(?:bull\W*shit|bullsh\*?t)\s*(?:prophet|bot|push\s*up\s*prophet)\b
+        |
+        \b(?:f\W*u\W*c\W*k|f\*+ck)\b
+        |
+        \b(?:bull\W*shit|bullsh\*?t)\b
+        |
+        \b(?:piece\s*of\s*shit|garbage\s*bot|trash\s*bot|worst\s*bot)\b
+        |
+        \b(?:fuck\s*off|go\s*to\s*hell)\b
+    )
+    """,
+)
+
+REBUKES = [
+    "I hear your anger, {name}. I receive it—and I answer with steadiness.",
+    "Your words land, {name}. I take them in, and I remain your witness.",
+    "I receive your sting, {name}. May your breath be longer than your temper.",
+    "Noted, {name}. Your voice is heard; let your form speak next.",
+    "Heard, {name}. I accept your heat—discipline will cool it.",
+    "I accept your edge, {name}. The floor counts truth; so do I.",
+    "Taken in, {name}. Let us turn sharp words into clean reps.",
+    "Received, {name}. I stand; may your resolve stand with me.",
+    "Your message is clear, {name}. Let patience be clearer.",
+    "Understood, {name}. I acknowledge you—and call you higher.",
+    "I hear you, {name}. I do not flinch; I invite you back to the work.",
+    "Acknowledged, {name}. Strength listens, then answers with action.",
+    "Your frustration is seen, {name}. I hold it, and I hold the standard.",
+    "I take your words, {name}. I will still meet you at the floor.",
+    "Message received, {name}. Let your next rep say more than this one.",
+]
+
+def _compose_rebuke(user_name: Optional[str]) -> str:
+    safe = html.escape(user_name or "traveler")
+    base = _sysrand.choice(REBUKES).format(name=safe)
+    # 10% chance of a 10 kr penance
+    if _sysrand.random() < 0.10:
+        base += "\n\n<b>Edict:</b> Lay <b>10 kr</b> in the pot as penance for disrespect."
+    return base
+
+@dp.message(F.text.func(lambda t: isinstance(t, str) and INSULT_RE.search(t)))
+async def prophet_insult_rebuke(msg: Message):
+    text = _compose_rebuke(getattr(msg.from_user, "first_name", None))
+    await msg.answer(text)
+# === end insult watcher ===
+
+
 # --- Helpers for sending the next quote ---
 async def _send_next_quote_to_chat(chat_id: int):
     q = _next_quote(chat_id)
@@ -653,6 +727,7 @@ async def on_startup():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
 
 
