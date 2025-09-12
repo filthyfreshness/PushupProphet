@@ -369,8 +369,27 @@ async def fate_roll(cb: CallbackQuery):
 
     await cb.answer()  # stop the inline-button spinner
     await cb.message.answer(epic)
+# Natural-language trigger to summon the Dice of Fate (no slash)
+# We require the word "fate" to avoid colliding with casual "roll" talk.
+FATE_SUMMON_RE = re.compile(
+    r"\b(?:dice\s+of\s+fate|summon(?:\s+the)?\s+dice(?:\s+of\s+fate)?|fate\s+dice|roll\s+the\s+dice\s+of\s+fate)\b",
+    re.IGNORECASE
+)
+
+@dp.message(F.text.func(lambda t: isinstance(t, str)
+                        and not t.strip().startswith("/")
+                        and FATE_SUMMON_RE.search(t)))
+async def fate_natural(msg: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Roll the Dice 🎲", callback_data="fate:roll"),
+        InlineKeyboardButton(text="Cancel", callback_data="fate:cancel"),
+    ]])
+    await msg.answer("“You dare summon the Dice of Fate. The air trembles with judgment.”")
+    await msg.answer(FATE_RULES_TEXT, reply_markup=kb)
 
 # ================== End Dice section ==================
+
+
 
 # ================== Gratitude / Blessings (single unified block, 5% favor) ==================
 BLESSINGS = [
@@ -527,13 +546,31 @@ async def _send_next_quote_to_chat(chat_id: int):
 async def share_wisdom_cmd(msg: Message):
     await _send_next_quote_to_chat(msg.chat.id)
 
-# Natural-language trigger for "share wisdom" (no slash)
-SHARE_WISDOM_NAT = re.compile(r"\bshare\s+wisdom\b", re.IGNORECASE)
+# Natural-language trigger for asking wisdom (no slash)
+# Matches phrases like:
+# "share wisdom", "give me wisdom", "say something wise", "wisdom please",
+# "teach me", "I seek wisdom", "prophet, share wisdom", "drop some wisdom" etc.
+_WISDOM_PATTERNS = [
+    r"\bshare\s+wisdom\b",
+    r"\bgive\s+(?:me\s+)?wisdom\b",
+    r"\bsay\s+(?:something\s+)?wise\b",
+    r"\bwisdom\s+please\b",
+    r"\bteach\s+me\b",
+    r"\bi\s+seek\s+wisdom\b",
+    r"\bprophet[,!\s]*\s*(?:share|give|drop)\s+(?:some\s+)?wisdom\b",
+    r"\bdrop\s+(?:some\s+)?wisdom\b",
+]
+_WISDOM_RES = [re.compile(p, re.IGNORECASE) for p in _WISDOM_PATTERNS]
+
+def _matches_wisdom_nat(t: str) -> bool:
+    return any(rx.search(t) for rx in _WISDOM_RES)
+
 @dp.message(F.text.func(lambda t: isinstance(t, str)
                         and not t.strip().startswith("/")
-                        and SHARE_WISDOM_NAT.search(t)))
+                        and _matches_wisdom_nat(t)))
 async def share_wisdom_natural(msg: Message):
     await _send_next_quote_to_chat(msg.chat.id)
+
 
 # Fallback for people who type `/share wisdom`
 @dp.message(F.text.func(lambda t: isinstance(t, str) and t.strip().lower().startswith("/share wisdom")))
@@ -556,10 +593,11 @@ SUMMON_PATTERN = re.compile(r"\b(pushup\s*prophet|prophet)\b", re.IGNORECASE)
                         and not t.strip().startswith("/")
                         and SUMMON_PATTERN.search(t)
                         and not THANKS_RE.search(t)
-                        and not SHARE_WISDOM_NAT.search(t)
+                        and not _matches_wisdom_nat(t)
                         and not APOLOGY_RE.search(t)))
 async def summon_reply(msg: Message):
     await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
+
 
 # --------- Other Handlers ----------
 # Primary: works for /chatid and /chatid@pushupprophetbot
@@ -576,19 +614,16 @@ async def chatid_fallback(msg: Message):
 async def start_cmd(msg: Message):
     await msg.answer(
         "I am the Pushup Prophet.\n\n"
-        "What I can do:\n"
-        "• <b>/share_wisdom</b> — receive a daily quote of form and resolve.\n"
-        "• <b>/roll &lt;pattern&gt;</b> — roll dice (e.g., /roll 1d5, /roll 6, /roll 3d6).\n"
-        "• <b>/fate</b> — summon the Dice of Fate (one roll per person per day).\n\n"
-
-        "Forgiveness Chain controls:\n"
-        "• <b>/enable_random</b> — enable the Forgiveness Chain for this chat: 1 random daily announcement "
-        "(07:00–22:00 Stockholm) + a follow-up 1 hour later.\n"
-        "• <b>/disable_random</b> — disable the Forgiveness Chain for this chat.\n"
-        "• <b>/status_random</b> — check whether the Forgiveness Chain is enabled.\n\n"
-        "Tip: In groups with privacy mode ON, only slash-commands are seen by the bot. "
-        "To trigger natural phrases like “share wisdom”, disable privacy mode in @BotFather or DM the bot."
+        "What I can do for you:\n"
+        "• Ask for wisdom and I shall give.\n"
+        "• Summon the Dice of Fate (one roll per person per day).\n\n"
+        "Be aware of the Forgiveness Chain:\n"
+        "• /enable_random — enable the Forgiveness Chain for this chat.\n"
+        "• /disable_random — disable the Forgiveness Chain for this chat.\n"
+        "• /status_random — check whether the Forgiveness Chain is enabled.\n\n"
+        "You shall see me at every dawn. May the power of the Push be with you."
     )
+
 
 @dp.message(Command("help"))
 async def help_cmd(msg: Message):
@@ -732,4 +767,5 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
