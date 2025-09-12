@@ -410,6 +410,50 @@ async def thanks_plain(msg: Message):
     text = _compose_blessing(getattr(msg.from_user, "first_name", None))
     await msg.answer(text)
 # ================== End Gratitude section ==================
+# ================== Apologies / Absolution (kind but stern) ==================
+APOLOGY_RE = re.compile(
+    r"\b("
+    r"sorry|i\s*(?:am|’m|'m)\s*sorry|i\s*apolog(?:ise|ize)|apologies|apology|"
+    r"my\s*bad|my\s*fault|i\s*was\s*wrong|didn'?t\s*mean|forgive\s*me|"
+    r"förlåt|ursäkta|jag\s*är\s*ledsen|ber\s*om\s*ursäkt|mitt\s*fel"
+    r")\b",
+    re.IGNORECASE
+)
+
+APOLOGY_RESPONSES = [
+    "Your apology is received, {name}. Mercy given; standard unchanged—meet it.",
+    "I accept your apology, {name}. Make it right in form and in habit.",
+    "Apology taken in, {name}. Rise cleaner; let your next set speak.",
+    "Heard and accepted, {name}. Forgiveness is a door—walk through with discipline.",
+    "I receive this apology, {name}. No excuses; only better repetitions.",
+    "Acknowledged, {name}. The slate is lighter; the bar is not.",
+    "Your apology lands true, {name}. Now let consistency seal it.",
+    "Accepted, {name}. Pay with honesty at the bottom and patience at the top.",
+    "I grant you grace, {name}. Earn it in the quiet work.",
+    "Apology noted, {name}. The floor keeps score—answer it.",
+    "I hear contrition, {name}. Return to the standard; leave the drama.",
+    "Received, {name}. Forgiveness is given; trust is trained.",
+    "Your apology is accounted for, {name}. Now do the next right rep.",
+    "I accept and remember, {name}. Let this be a turn, not a tale.",
+    "Grace extends to you, {name}. Guard your form; guard your word.",
+    "Apology accepted, {name}. Show me steadiness—louder than talk.",
+    "Your regret is clear, {name}. Set your spine; set your course.",
+    "I receive your apology, {name}. Be exact; be early; be better.",
+    "Pardon granted, {name}. Debt remains to effort—pay it daily.",
+    "Your apology is welcomed, {name}. Let discipline finish what remorse began.",
+]
+
+def _compose_absolution(user_name: Optional[str]) -> str:
+    safe = html.escape(user_name or "friend")
+    return _sysrand.choice(APOLOGY_RESPONSES).format(name=safe)
+
+@dp.message(F.text.func(lambda t: isinstance(t, str)
+                        and not t.strip().startswith("/")
+                        and APOLOGY_RE.search(t)))
+async def apology_reply(msg: Message):
+    text = _compose_absolution(getattr(msg.from_user, "first_name", None))
+    await msg.answer(text)
+# ================== End Apologies section ==================
 
 # === Negativity / insult watcher (fixed compile flags) ===
 INSULT_RE = re.compile(r"""
@@ -466,7 +510,7 @@ def _compose_rebuke(user_name: Optional[str]) -> str:
         base += "\n\n<b>Edict:</b> Lay <b>20 kr</b> in the pot as penance for disrespect."
     return base
 
-@dp.message(F.text.func(lambda t: isinstance(t, str) and INSULT_RE.search(t)))
+@dp.message(F.text.func(lambda t: isinstance(t, str) and INSULT_RE.search(t) and not APOLOGY_RE.search(t)))
 async def prophet_insult_rebuke(msg: Message):
     text = _compose_rebuke(getattr(msg.from_user, "first_name", None))
     await msg.answer(text)
@@ -514,7 +558,8 @@ SUMMON_PATTERN = re.compile(r"\b(pushup\s*prophet|prophet)\b", re.IGNORECASE)
                         and not t.strip().startswith("/")
                         and SUMMON_PATTERN.search(t)
                         and not THANKS_RE.search(t)
-                        and not SHARE_WISDOM_NAT.search(t)))
+                        and not SHARE_WISDOM_NAT.search(t)
+                        and not APOLOGY_RE.search(t)))
 async def summon_reply(msg: Message):
     await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
 
@@ -662,3 +707,4 @@ async def on_startup():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
