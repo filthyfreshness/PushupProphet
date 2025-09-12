@@ -461,7 +461,7 @@ REBUKES = [
 def _compose_rebuke(user_name: Optional[str]) -> str:
     safe = html.escape(user_name or "traveler")
     base = _sysrand.choice(REBUKES).format(name=safe)
-    # 10% chance of a 10 kr penance
+    # 10% chance of a 10 kr/20 kr penance (your code currently uses 20 kr)
     if _sysrand.random() < 0.10:
         base += "\n\n<b>Edict:</b> Lay <b>20 kr</b> in the pot as penance for disrespect."
     return base
@@ -613,17 +613,22 @@ def health_head():
     return Response(status_code=200)
 
 async def run_bot():
+    # Start scheduler first, then polling
     scheduler.start()
     await dp.start_polling(bot)
 
 @app.on_event("startup")
 async def on_startup():
-    # makes sure no old webhook is set; polling will be the only mode
-    await bot.delete_webhook(drop_pending_updates=True)
+    # Try to remove any webhook; don't crash the app if Telegram is slow/unreachable
+    try:
+        await bot.delete_webhook(drop_pending_updates=True, request_timeout=10)
+    except Exception as e:
+        logging.warning(f"delete_webhook failed ({e!r}); continuing with polling.")
 
-    asyncio.create_task(run_bot())  # start Telegram bot loop
+    # Start the bot loop in the background
+    asyncio.create_task(run_bot())
 
-    # Auto-enable daily schedule for groups listed in env var
+    # Pre-schedule jobs for listed group chats
     ids = os.getenv("GROUP_CHAT_IDS", "").strip()
     if ids:
         for raw in ids.split(","):
@@ -647,7 +652,6 @@ async def on_startup():
                     replace_existing=True,
                 )
                 logging.info(f"Scheduled daily quote (07:00) for chat {chat_id}")
-
             except Exception as e:
                 logging.exception(f"Startup scheduling failed for chat {raw}: {e}")
 
