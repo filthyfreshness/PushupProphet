@@ -7,7 +7,7 @@ from fastapi import FastAPI, Response
 import uvicorn
 
 from aiogram import Bot, Dispatcher
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command, CommandStart
 from aiogram import F
 from aiogram.enums.parse_mode import ParseMode
@@ -29,19 +29,9 @@ if not BOT_TOKEN:
     )
 
 TZ = timezone("Europe/Stockholm")
-DAILY_TEXT = "THE FORGIVENESS CHAIN BEGINS NOW. Lay down excuses and ascend. May the power of Push be with you all."
+DAILY_TEXT = "THE FORGIVENESS CHAIN BEGINS NOW. Lay down excuses and ascend. May the power of Push be with you."
 WINDOW_START = 7   # 07:00
 WINDOW_END = 22    # 22:00 (inclusive)
-
-FOLLOWUP_TEXT = (
-    "The hour has passed, the covenant stands. No debt weighs upon those who rise in unison. "
-    "The choice has always been yours. I hope you made the right one."
-)
-
-
-# ---- Weekly Prophecy config ----
-PEOPLE = {1: "Fresh", 2: "Momo", 3: "Valle", 4: "Tän", 5: "Hampa"}
-ALLOW_REPEAT = True  # False => mercy & punishment must be different
 
 # --------- Bot setup ----------
 logging.basicConfig(level=logging.INFO)
@@ -74,19 +64,15 @@ def schedule_random_daily(chat_id: int) -> None:
 
     async def send_and_reschedule():
         try:
-            # 1) Send the Forgiveness Chain announcement
             await bot.send_message(chat_id, DAILY_TEXT)
-
-            # 2) Schedule the 1-hour follow-up message
-            follow_time = dt.datetime.now(TZ) + dt.timedelta(hours=1)
-
-            async def send_followup():
-                await bot.send_message(chat_id, FOLLOWUP_TEXT)
-
-            scheduler.add_job(send_followup, "date", run_date=follow_time)
-
+            # NEW: follow-up exactly 1 hour later
+            await asyncio.sleep(60 * 60)
+            await bot.send_message(
+                chat_id,
+                "The hour has passed, the covenant stands. No debt weighs upon those who rise in unison. "
+                "The choice has always been yours. I hope you made the right one."
+            )
         finally:
-            # 3) Schedule tomorrow's random-time post
             tomorrow = dt.datetime.now(TZ) + dt.timedelta(days=1)
             next_run = next_random_time(tomorrow)
             new_job = scheduler.add_job(send_and_reschedule, "date", run_date=next_run)
@@ -96,8 +82,11 @@ def schedule_random_daily(chat_id: int) -> None:
     random_jobs[chat_id] = job
 
 
-# ================== Quotes rotation (daily 07:00 + /share_wisdom) ==================
+# --- Player roster used by Weekly Prophecy AND Dice of Fate ---
+PLAYERS = ["Fresh", "Momo", "Valle", "Tän", "Hampa"]
 
+
+# ================== Quotes rotation (daily 07:00 + /share_wisdom) ==================
 QUOTES = [
     "“Gravity is my quill; with each rep I write strength upon your bones.”",
     "“Do not count your pushups—make your pushups count, and the numbers will fear you.”",
@@ -230,66 +219,206 @@ async def send_daily_quote(chat_id: int):
     safe = html.escape(q)
     await bot.send_message(chat_id, f"🕖 Daily Wisdom\n{safe}")
 
-# ================== End Quotes section ==================
+# ================== DICE OF FATE (no DB, one roll/day in-memory) ==================
 
-# ================== Weekly Prophecy (Sun 11:00 + /prophecy) ==================
+# Weighted ranges on 1..100
+FATE_BUCKETS = [
+    (1, 3,   "miracle"),          # 3%
+    (4, 15,  "shared_burden"),    # 12%
+    (16, 25, "trial_form"),       # 10%
+    (26, 35, "command_prophet"),  # 9%
+    (36, 40, "mercy_coin"),       # 6%
+    (41, 50, "hurricane"),        # 10%
+    (51, 65, "oath_dawn"),        # 15%
+    (66, 80, "trial_flesh"),      # 15%
+    (81, 95, "tribute_blood"),    # 15%
+    (96, 100,"wrath"),            # 5%
+]
 
-async def start_prophecy_sequence(chat_id: int):
-    """
-    t+0:  announce
-    t+3m: reveal MERCY (name from PEOPLE)
-    t+4m: warn punishment in 1 minute
-    t+5m: reveal PUNISHED + final line
-    """
-    announce = (
-        "ATTENTION EVERYONE\n"
-        "The Prophecy has been revealed! In 3 minutes, you will hear WHO WILL RECEIVE MERCY tomorrow.\n"
-        "@Wabbadabbadubdub @Hampuz @FilthyFresh @ThugnificentMomo @Bowlcut00 "
-    )
-    await bot.send_message(chat_id, announce)
+FATE_RULES_TEXT = (
+    "<b>Dice of Fate – Outcomes</b>\n"
+    "1–3 (3%) — ✨ <b>The Miracle</b> — Halve your debt\n"
+    "4–15 (12%) — 🤝 <b>Shared Burden</b> — Give away 30 pushups to a random player\n"
+    "16–25 (10%) — ⚔️ <b>Trial of Form</b> — 10 perfect pushups → erase 20 kr of debt\n"
+    "26–35 (9%) — 👑 <b>Command of the Prophet</b> — Choose a player: 30 pushups or 30 kr\n"
+    "36–40 (6%) — 🪙 <b>Mercy Coin</b> — Skip one regular pushup day\n"
+    "\n"
+    "41–50 (10%) — 🌪️ <b>Hurricane of Chaos</b> — +10 kr; shift 10% to another\n"
+    "51–65 (15%) — 🌅 <b>Oath of Dawn</b> — Be first tomorrow or pay 30 kr\n"
+    "66–80 (15%) — 🔥 <b>Trial of Flesh</b> — 100 pushups today or +45 kr\n"
+    "81–95 (15%) — 🩸 <b>Tribute of Blood</b> — Pay 50 kr\n"
+    "96–100 (5%) — ⚡ <b>Prophet’s Wrath</b> — Double your debt"
+)
 
-    now = dt.datetime.now(TZ)
-    t_mercy = now + dt.timedelta(minutes=3)
-    t_warn  = t_mercy + dt.timedelta(minutes=1)
-    t_pun   = t_warn  + dt.timedelta(minutes=1)
+# Per-chat in-memory limiter: {chat_id: (date, set(user_id))}
+_fate_rolls: Dict[int, tuple[dt.date, set[int]]] = {}
 
-    first_pick_num: Optional[int] = None
+def _today_stockholm_date() -> dt.date:
+    return dt.datetime.now(TZ).date()
 
-    async def reveal_mercy():
-        nonlocal first_pick_num
-        n = _sysrand.randint(1, 5)
-        first_pick_num = n
-        await bot.send_message(
-            chat_id,
-            f"🔮 The Prophecy speaks...\nWHO WILL RECEIVE MERCY tomorrow: <b>{PEOPLE[n]}</b>"
-        )
+def _fate_reset_if_new_day(chat_id: int):
+    today = _today_stockholm_date()
+    state = _fate_rolls.get(chat_id)
+    if not state or state[0] != today:
+        _fate_rolls[chat_id] = (today, set())
 
-    async def warn_punishment():
-        await bot.send_message(
-            chat_id,
-            "Of course, we cannot have mercy without punishment. In one minute, you will find out WHO WILL BE THE PUNISHED ONE. May the fortunes be with you."
-        )
+def _fate_has_rolled_today(chat_id: int, user_id: int) -> bool:
+    _fate_reset_if_new_day(chat_id)
+    return user_id in _fate_rolls[chat_id][1]
 
-    async def reveal_punishment_and_final():
-        if ALLOW_REPEAT:
-            n = _sysrand.randint(1, 5)
-        else:
-            while True:
-                n = _sysrand.randint(1, 5)
-                if n != first_pick_num:
-                    break
-        await bot.send_message(
-            chat_id,
-            f"⚖️ The verdict is in.\nWHO WILL BE THE PUNISHED ONE: <b>{PEOPLE[n]}</b>"
-        )
-        await bot.send_message(
-            chat_id,
-            "The weekly prophecies have been spoken. May the force of the Pushup Prophet be with you!"
-        )
+def _fate_mark_rolled(chat_id: int, user_id: int):
+    _fate_reset_if_new_day(chat_id)
+    _fate_rolls[chat_id][1].add(user_id)
 
-    scheduler.add_job(reveal_mercy, "date", run_date=t_mercy)
-    scheduler.add_job(warn_punishment, "date", run_date=t_warn)
-    scheduler.add_job(reveal_punishment_and_final, "date", run_date=t_pun)
+def _pick_fate_key() -> str:
+    roll = _sysrand.randint(1, 100)
+    for lo, hi, key in FATE_BUCKETS:
+        if lo <= roll <= hi:
+            return key
+    return "wrath"
+
+def _fate_epic_text(key: str, target_name: Optional[str] = None) -> str:
+    closers = [
+        "Thus it is spoken—walk wisely.",
+        "So decrees the Prophet—bear the mark with honor.",
+        "The die grows silent; let your deeds answer.",
+        "The seal is set; may your will not waver.",
+        "The wind keeps the tally; choose well.",
+    ]
+    end = _sysrand.choice(closers)
+
+    texts = {
+        "miracle": (
+            "✨ <b>The Miracle</b>\n"
+            "The scales tilt toward mercy. Your burden is cleaved in half."
+        ),
+        "shared_burden": (
+            "🤝 <b>Shared Burden</b>\n"
+            + (
+                f"Gift 30 pushups to <b>{html.escape(target_name)}</b>; let strength travel from hand to hand."
+                if target_name else
+                "Gift 30 pushups to a random player; let strength travel from hand to hand."
+            )
+        ),
+        "trial_form": (
+            "⚔️ <b>Trial of Form</b>\n"
+            "Offer 10 perfect pushups—tempo true, depth honest—and erase 20 kr of debt."
+        ),
+        "command_prophet": (
+            "👑 <b>Command of the Prophet</b>\n"
+            "Name a player. They must choose: 30 pushups or 30 kr. Authority tests friendship."
+        ),
+        "mercy_coin": (
+            "🪙 <b>Mercy Coin</b>\n"
+            "One regular day is pardoned. Do not spend it cheaply."
+        ),
+        "hurricane": (
+            "🌪️ <b>Hurricane of Chaos</b>\n"
+            "Fortune stings and swirls: +10 kr, and a tithe of your weight shifts to another."
+        ),
+        "oath_dawn": (
+            "🌅 <b>Oath of Dawn</b>\n"
+            "Be first to rise tomorrow or pay 30 kr. Dawn reveals the faithful."
+        ),
+        "trial_flesh": (
+            "🔥 <b>Trial of Flesh</b>\n"
+            "Choose today: 100 pushups—or lay 45 kr upon the altar."
+        ),
+        "tribute_blood": (
+            "🩸 <b>Tribute of Blood</b>\n"
+            "The pot demands 50 kr. Pay without grudge, learn without delay."
+        ),
+        "wrath": (
+            "⚡ <b>Prophet’s Wrath</b>\n"
+            "Your debt is doubled. Pride withers; discipline takes its seat."
+        ),
+    }
+    return texts.get(key, "The die rolls into shadow.") + f"\n\n<i>{end}</i>"
+
+    end = _sysrand.choice(closers)
+
+    texts = {
+        "miracle": (
+            "✨ <b>The Miracle</b>\n"
+            "The scales tilt toward mercy. Your burden is cleaved in half."
+        ),
+        "shared_burden": (
+            "🤝 <b>Shared Burden</b>\n"
+            "Gift 30 pushups to a random player; let strength travel from hand to hand."
+        ),
+        "trial_form": (
+            "⚔️ <b>Trial of Form</b>\n"
+            "Offer 10 perfect pushups—tempo true, depth honest—and erase 20 kr of debt."
+        ),
+        "command_prophet": (
+            "👑 <b>Command of the Prophet</b>\n"
+            "Name a player. They must choose: 30 pushups or 30 kr. Authority tests friendship."
+        ),
+        "mercy_coin": (
+            "🪙 <b>Mercy Coin</b>\n"
+            "One regular day is pardoned. Do not spend it cheaply."
+        ),
+        "hurricane": (
+            "🌪️ <b>Hurricane of Chaos</b>\n"
+            "Fortune stings and swirls: +10 kr, and a tithe of your weight shifts to another."
+        ),
+        "oath_dawn": (
+            "🌅 <b>Oath of Dawn</b>\n"
+            "Be first to rise tomorrow or pay 30 kr. Dawn reveals the faithful."
+        ),
+        "trial_flesh": (
+            "🔥 <b>Trial of Flesh</b>\n"
+            "Choose today: 100 pushups—or lay 45 kr upon the altar."
+        ),
+        "tribute_blood": (
+            "🩸 <b>Tribute of Blood</b>\n"
+            "The pot demands 50 kr. Pay without grudge, learn without delay."
+        ),
+        "wrath": (
+            "⚡ <b>Prophet’s Wrath</b>\n"
+            "Your debt is doubled. Pride withers; discipline takes its seat."
+        ),
+    }
+    return texts.get(key, "The die rolls into shadow.") + f"\n\n<i>{end}</i>"
+
+# Command to summon the Dice of Fate
+@dp.message(Command("fate", "dice", "dice_of_fate"))
+async def fate_cmd(msg: Message):
+    await msg.answer("“You dare summon the Dice of Fate. The air trembles with judgment.”")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Roll the Dice 🎲", callback_data="fate:roll"),
+        InlineKeyboardButton(text="Cancel", callback_data="fate:cancel"),
+    ]])
+    await msg.answer(FATE_RULES_TEXT, reply_markup=kb)
+
+@dp.callback_query(F.data == "fate:cancel")
+async def fate_cancel(cb: CallbackQuery):
+    await cb.answer("The Dice return to their slumber.")
+    await cb.message.answer("The Dice close their eyes. Another day, perhaps.")
+
+@dp.callback_query(F.data == "fate:roll")
+async def fate_roll(cb: CallbackQuery):
+    chat_id = cb.message.chat.id
+    user_id = cb.from_user.id
+
+    if _fate_has_rolled_today(chat_id, user_id):
+        return await cb.answer("You have already rolled today. Return with the next dawn.", show_alert=True)
+
+    _fate_mark_rolled(chat_id, user_id)
+    fate_key = _pick_fate_key()
+
+    # If the fate is Shared Burden, pick a random player from roster
+    target = None
+    if fate_key == "shared_burden":
+        target = _sysrand.choice(PLAYERS) if PLAYERS else None
+
+    epic = _fate_epic_text(fate_key, target_name=target)
+
+    await cb.answer()  # stop the inline-button spinner
+    await cb.message.answer(epic)
+
+
+# ================== End Dice section ==================
 
 # --------- Handlers ----------
 # Primary: works for /chatid and /chatid@pushupprophetbot
@@ -308,16 +437,17 @@ async def start_cmd(msg: Message):
         "Hi! I can:\n"
         "• Post 1 time per day at a random time (07:00–22:00 Stockholm) with our Forgiveness Chain message.\n"
         "• Share a daily quote at 07:00 Stockholm (per group) and rotate through your list randomly without repeats.\n"
-        "• Roll dice with /roll (e.g., /roll 1d5 → 1..5).\n\n"
+        "• Roll dice with /roll (e.g., /roll 1d5 → 1..5).\n"
+        "• Summon the Dice of Fate with /fate (one roll per person per day).\n\n"
         "Commands:\n"
         "/share_wisdom – send the next quote now\n"
         "/wisdom – same as /share_wisdom\n"
         "/quote – same as /share_wisdom\n"
-        "/prophecy – announce now, reveal MERCY in 3m, warn at 4m, reveal PUNISHED at 5m\n"
         "/enable_random – start daily random message\n"
         "/disable_random – stop daily message\n"
         "/status_random – show whether daily post is enabled\n"
         "/roll &lt;pattern&gt; – roll dice (examples: /roll 1d5, /roll 6, /roll 3d6)\n"
+        "/fate – summon the Dice of Fate\n"
     )
 
 @dp.message(Command("help"))
@@ -394,11 +524,6 @@ async def share_wisdom_cmd(msg: Message):
 async def share_wisdom_space_alias(msg: Message):
     await _send_next_quote_to_chat(msg.chat.id)
 
-# Manual trigger for the prophecy sequence
-@dp.message(Command("prophecy"))
-async def prophecy_cmd(msg: Message):
-    await start_prophecy_sequence(msg.chat.id)
-
 # --------- Run bot + web server together ----------
 
 app = FastAPI()
@@ -431,7 +556,7 @@ async def on_startup():
                 continue
             try:
                 chat_id = int(raw)
-                # Forgiveness Chain daily random-time window
+                # Forgiveness Chain daily random-time window (+1h follow-up)
                 schedule_random_daily(chat_id)
                 logging.info(f"Auto-enabled daily random post for chat {chat_id}")
 
@@ -447,19 +572,6 @@ async def on_startup():
                 )
                 logging.info(f"Scheduled daily quote (07:00) for chat {chat_id}")
 
-                # Weekly Prophecy every Sunday at 11:00 Stockholm
-                scheduler.add_job(
-                    start_prophecy_sequence,
-                    "cron",
-                    day_of_week="sun",
-                    hour=11,
-                    minute=0,
-                    args=[chat_id],
-                    id=f"weekly_prophecy_{chat_id}",
-                    replace_existing=True,
-                )
-                logging.info(f"Scheduled weekly prophecy (Sun 11:00) for chat {chat_id}")
-
             except Exception as e:
                 logging.exception(f"Startup scheduling failed for chat {raw}: {e}")
 
@@ -467,4 +579,3 @@ async def on_startup():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
-
