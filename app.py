@@ -34,7 +34,9 @@ WINDOW_START = 7   # 07:00
 WINDOW_END = 22    # 22:00 (inclusive)
 
 # --------- Bot setup ----------
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+logger = logging.getLogger("pushup-prophet")
+
 _sysrand = random.SystemRandom()
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -410,6 +412,7 @@ async def thanks_plain(msg: Message):
     text = _compose_blessing(getattr(msg.from_user, "first_name", None))
     await msg.answer(text)
 # ================== End Gratitude section ==================
+
 # ================== Apologies / Absolution (kind but stern) ==================
 APOLOGY_RE = re.compile(
     r"\b("
@@ -455,7 +458,7 @@ async def apology_reply(msg: Message):
     await msg.answer(text)
 # ================== End Apologies section ==================
 
-# === Negativity / insult watcher (fixed compile flags) ===
+# === Negativity / insult watcher ===
 INSULT_RE = re.compile(r"""
 (
     # ---- A) Mention + insult (either order) ----
@@ -524,7 +527,7 @@ async def _send_next_quote_to_chat(chat_id: int):
         return
     await bot.send_message(chat_id, html.escape(q))
 
-# Official command: ONLY /share_wisdom (aliases removed)
+# Official command: ONLY /share_wisdom
 @dp.message(Command("share_wisdom"))
 async def share_wisdom_cmd(msg: Message):
     await _send_next_quote_to_chat(msg.chat.id)
@@ -577,16 +580,19 @@ async def chatid_fallback(msg: Message):
 @dp.message(CommandStart())
 async def start_cmd(msg: Message):
     await msg.answer(
-        "I am the Pushup Prophet. Here is what I can do:\n\n"
-        "• <b>Forgiveness Chain</b>: a daily post at a <i>random time</i> between 07:00–22:00 Stockholm, "
-        "followed by a reminder exactly +1h. Enable with <b>/enable_random</b>, disable with <b>/disable_random</b>, "
-        "and check with <b>/status_random</b>.\n"
-        "• <b>Daily Wisdom</b>: quotes rotate per chat and also send automatically at 07:00. "
-        "Use <b>/share_wisdom</b> or just type <i>share wisdom</i>.\n"
-        "• <b>Dice of Fate</b>: summon with <b>/fate</b> (one roll per person per day).\n"
-        "• <b>Dice</b>: roll standard dice with <b>/roll</b> (e.g., /roll 3d6).\n"
-        "• <b>Blessings</b>: say thanks or use <b>/thanks</b> (5% chance of 20 kr favor).\n\n"
-        "Speak my name (<i>prophet</i> / <i>pushup prophet</i>) and I may answer."
+        "I am the Pushup Prophet.\n\n"
+        "What I can do:\n"
+        "• <b>/share_wisdom</b> — receive a daily quote of form and resolve.\n"
+        "• <b>/roll &lt;pattern&gt;</b> — roll dice (e.g., /roll 1d5, /roll 6, /roll 3d6).\n"
+        "• <b>/fate</b> — summon the Dice of Fate (one roll per person per day).\n"
+        "• <b>/thanks</b> — offer gratitude and receive a blessing (5% chance of 20 kr favor).\n\n"
+        "Forgiveness Chain controls:\n"
+        "• <b>/enable_random</b> — enable the Forgiveness Chain for this chat: 1 random daily announcement "
+        "(07:00–22:00 Stockholm) + a follow-up 1 hour later.\n"
+        "• <b>/disable_random</b> — disable the Forgiveness Chain for this chat.\n"
+        "• <b>/status_random</b> — check whether the Forgiveness Chain is enabled.\n\n"
+        "Tip: In groups with privacy mode ON, only slash-commands are seen by the bot. "
+        "To trigger natural phrases like “share wisdom”, disable privacy mode in @BotFather or DM the bot."
     )
 
 @dp.message(Command("help"))
@@ -596,11 +602,7 @@ async def help_cmd(msg: Message):
 @dp.message(Command("enable_random"))
 async def enable_random_cmd(msg: Message):
     schedule_random_daily(msg.chat.id)
-    await msg.answer(
-        "✅ <b>Forgiveness Chain enabled</b> for this chat.\n"
-        "I will post once per day at a random time between 07:00–22:00 Stockholm, "
-        "then send a follow-up exactly +1 hour later."
-    )
+    await msg.answer("✅ Forgiveness Chain enabled for this chat. I will announce once per day between 07:00–22:00 Stockholm, then follow up 1 hour later.")
 
 @dp.message(Command("disable_random"))
 async def disable_random_cmd(msg: Message):
@@ -610,7 +612,7 @@ async def disable_random_cmd(msg: Message):
             job.remove()
         except Exception:
             pass
-        await msg.answer("🛑 <b>Forgiveness Chain disabled</b> for this chat.")
+        await msg.answer("🛑 Forgiveness Chain disabled for this chat.")
     else:
         await msg.answer("It wasn’t enabled for this chat.")
 
@@ -661,22 +663,38 @@ def health_head():
     return Response(status_code=200)
 
 async def run_bot():
-    # Start scheduler first, then polling
     scheduler.start()
+    logger.info("Scheduler started")
     await dp.start_polling(bot)
 
 @app.on_event("startup")
 async def on_startup():
-    # Try to remove any webhook; don't crash the app if Telegram is slow/unreachable
+    # Identify the bot and log it early
     try:
-        await bot.delete_webhook(drop_pending_updates=True, request_timeout=10)
+        me = await bot.get_me()
+        logger.info(f"Bot authorized: @{me.username} (id={me.id})")
     except Exception as e:
-        logging.warning(f"delete_webhook failed ({e!r}); continuing with polling.")
+        logger.exception("get_me failed. Is BOT_TOKEN correct?")
+        raise
 
-    # Start the bot loop in the background
-    asyncio.create_task(run_bot())
+    # Ensure webhook is removed before polling (with retries/timeouts)
+    for attempt in range(1, 6):
+        try:
+            await bot.delete_webhook(drop_pending_updates=True, request_timeout=30)
+            info = await bot.get_webhook_info()
+            if not info.url:
+                logger.info("Webhook cleared successfully.")
+                break
+            logger.warning(f"Webhook still set to: {info.url!r} (attempt {attempt})")
+        except Exception as e:
+            logger.warning(f"delete_webhook attempt {attempt} failed: {e}")
+        await asyncio.sleep(min(2 ** attempt, 10))
+    else:
+        logger.error("Could not clear webhook after multiple attempts. Polling may not receive updates.")
 
-    # Pre-schedule jobs for listed group chats
+    asyncio.create_task(run_bot())  # start Telegram bot loop
+
+    # Auto-enable daily schedule for groups listed in env var
     ids = os.getenv("GROUP_CHAT_IDS", "").strip()
     if ids:
         for raw in ids.split(","):
@@ -687,7 +705,7 @@ async def on_startup():
                 chat_id = int(raw)
                 # Forgiveness Chain daily random-time window (+1h follow-up)
                 schedule_random_daily(chat_id)
-                logging.info(f"Auto-enabled daily random post for chat {chat_id}")
+                logger.info(f"Auto-enabled Forgiveness Chain for chat {chat_id}")
 
                 # Daily quotes at 07:00 Stockholm
                 scheduler.add_job(
@@ -699,12 +717,23 @@ async def on_startup():
                     id=f"daily_quote_{chat_id}",
                     replace_existing=True,
                 )
-                logging.info(f"Scheduled daily quote (07:00) for chat {chat_id}")
+                logger.info(f"Scheduled daily quote (07:00) for chat {chat_id}")
+
             except Exception as e:
-                logging.exception(f"Startup scheduling failed for chat {raw}: {e}")
+                logger.exception(f"Startup scheduling failed for chat {raw}: {e}")
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        await scheduler.shutdown(wait=False)
+    except Exception:
+        pass
+    try:
+        await bot.session.close()
+    except Exception:
+        pass
 
 # If you want to run locally:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
-
