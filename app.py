@@ -218,35 +218,40 @@ async def send_daily_quote(chat_id: int):
     safe = html.escape(q)
     await bot.send_message(chat_id, f"🕖 Daily Wisdom\n{safe}")
 
-# ================== DICE OF FATE (no DB, one roll/day in-memory) ==================
+# ================== DICE OF FATE ==================
 
-# Weighted ranges on 1..100
-FATE_BUCKETS = [
-    (1, 3,   "miracle"),          # 3%
-    (4, 15,  "shared_burden"),    # 12%
-    (16, 25, "trial_form"),       # 10%
-    (26, 35, "command_prophet"),  # 9%
-    (36, 40, "mercy_coin"),       # 6%
-    (41, 50, "hurricane"),        # 10%
-    (51, 65, "oath_dawn"),        # 15%
-    (66, 80, "trial_flesh"),      # 15%
-    (81, 95, "tribute_blood"),    # 15%
-    (96, 100,"wrath"),            # 5%
+# New weights (sum to 100)
+FATE_WEIGHTS = [
+    ("miracle",         3),  # 3%
+    ("mercy_coin",      6),  # 6%
+    ("trial_form",     10),  # 10%
+    ("command_prophet",10),  # 10%
+    ("giver",          12),  # 12%  (renamed from shared_burden)
+    ("hurricane",      10),  # 10%
+    ("oath_dawn",      16),  # 16%
+    ("trial_flesh",    15),  # 15%
+    ("tribute_blood",  15),  # 15%
+    ("wrath",           3),  # 3%
 ]
 
+def _pick_fate_key() -> str:
+    keys = [k for k, _ in FATE_WEIGHTS]
+    weights = [w for _, w in FATE_WEIGHTS]
+    return _sysrand.choices(keys, weights=weights, k=1)[0]
+
 FATE_RULES_TEXT = (
-    "<b>Dice of Fate – Outcomes</b>\n"
-    "1–3 (3%) — ✨ <b>The Miracle</b> — Halve your debt\n"
-    "4–15 (12%) — 🤝 <b>Shared Burden</b> — Give away 30 pushups to a random player\n"
-    "16–25 (10%) — ⚔️ <b>Trial of Form</b> — 10 perfect pushups → erase 20 kr of debt\n"
-    "26–35 (9%) — 👑 <b>Command of the Prophet</b> — Choose a player: 30 pushups or 30 kr\n"
-    "36–40 (6%) — 🪙 <b>Mercy Coin</b> — Skip one regular pushup day\n"
+    "<b>Dice of Fate</b>\n\n"
+    "(3%) — ✨ <b>The Miracle</b> — Halve your debt\n"
+    "(6%) — 🪙 <b>Mercy Coin</b> — Skip one regular pushup day\n"
+    "(10%) — ⚔️ <b>Trial of Form</b> — Do 10 perfect pushups → erase 20 kr of debt\n"
+    "(10%) — 👑 <b>Command of the Prophet</b> — Pick a player: He does 30 pushups or 30 kr\n"
+    "(12%) — 🤝 <b>The Giver</b> — Give away 40 of your daily pushups to a random player\n"
     "\n"
-    "41–50 (10%) — 🌪️ <b>Hurricane of Chaos</b> — +10 kr; shift 10% to another\n"
-    "51–65 (15%) — 🌅 <b>Oath of Dawn</b> — Be first tomorrow or pay 30 kr\n"
-    "66–80 (15%) — 🔥 <b>Trial of Flesh</b> — 100 pushups today or +45 kr\n"
-    "81–95 (15%) — 🩸 <b>Tribute of Blood</b> — Pay 50 kr\n"
-    "96–100 (5%) — ⚡ <b>Prophet’s Wrath</b> — Double your debt"
+    "(10%) — 🌪️ <b>Hurricane of Chaos</b> — Pay 10 kr; shift 10% of your debt to random player\n"
+    "(16%) — 🌅 <b>Oath of Dawn</b> — Be first tomorrow or pay 30 kr\n"
+    "(15%) — 🔥 <b>Trial of Flesh</b> — 100 pushups today or +45 kr\n"
+    "(15%) — 🩸 <b>Tribute of Blood</b> — Pay 50 kr\n"
+    "(3%) — ⚡ <b>Prophet’s Wrath</b> — Double your debt"
 )
 
 # Per-chat in-memory limiter: {chat_id: (date, set(user_id))}
@@ -269,13 +274,6 @@ def _fate_mark_rolled(chat_id: int, user_id: int):
     _fate_reset_if_new_day(chat_id)
     _fate_rolls[chat_id][1].add(user_id)
 
-def _pick_fate_key() -> str:
-    roll = _sysrand.randint(1, 100)
-    for lo, hi, key in FATE_BUCKETS:
-        if lo <= roll <= hi:
-            return key
-    return "wrath"
-
 def _fate_epic_text(key: str, target_name: Optional[str] = None) -> str:
     closers = [
         "Thus it is spoken—walk wisely.",
@@ -291,21 +289,21 @@ def _fate_epic_text(key: str, target_name: Optional[str] = None) -> str:
             "✨ <b>The Miracle</b>\n"
             "The scales tilt toward mercy. Your burden is cleaved in half."
         ),
-        "shared_burden": (
-            "🤝 <b>Shared Burden</b>\n"
+        "giver": (
+            "🤝 <b>The Giver</b>\n"
             + (
-                f"Gift 30 pushups to <b>{html.escape(target_name)}</b>; let strength travel from hand to hand."
+                f"Give away <b>40</b> of your daily pushups to <b>{html.escape(target_name)}</b>. Strength shared is strength multiplied."
                 if target_name else
-                "Gift 30 pushups to a random player; let strength travel from hand to hand."
+                "Give away <b>40</b> of your daily pushups to a random player. Strength shared is strength multiplied."
             )
         ),
         "trial_form": (
             "⚔️ <b>Trial of Form</b>\n"
-            "Offer 10 perfect pushups—tempo true, depth honest—and erase 20 kr of debt."
+            "Offer <b>10</b> perfect pushups—tempo true, depth honest—and erase <b>20 kr</b> of debt."
         ),
         "command_prophet": (
             "👑 <b>Command of the Prophet</b>\n"
-            "Name a player. They must choose: 30 pushups or 30 kr. Authority tests friendship."
+            "Pick a player: he does <b>30</b> pushups or pays <b>30 kr</b>. Authority tests friendship."
         ),
         "mercy_coin": (
             "🪙 <b>Mercy Coin</b>\n"
@@ -313,19 +311,19 @@ def _fate_epic_text(key: str, target_name: Optional[str] = None) -> str:
         ),
         "hurricane": (
             "🌪️ <b>Hurricane of Chaos</b>\n"
-            "Fortune stings and swirls: +10 kr, and a tithe of your weight shifts to another."
+            "Pay <b>10 kr</b>; then shift <b>10%</b> of your debt to a random player."
         ),
         "oath_dawn": (
             "🌅 <b>Oath of Dawn</b>\n"
-            "Be first to rise tomorrow or pay 30 kr. Dawn reveals the faithful."
+            "Be first to rise tomorrow or pay <b>30 kr</b>. Dawn reveals the faithful."
         ),
         "trial_flesh": (
             "🔥 <b>Trial of Flesh</b>\n"
-            "Choose today: 100 pushups—or lay 45 kr upon the altar."
+            "Choose today: <b>100</b> pushups—or lay <b>45 kr</b> upon the altar."
         ),
         "tribute_blood": (
             "🩸 <b>Tribute of Blood</b>\n"
-            "The pot demands 50 kr. Pay without grudge, learn without delay."
+            "The pot demands <b>50 kr</b>. Pay without grudge, learn without delay."
         ),
         "wrath": (
             "⚡ <b>Prophet’s Wrath</b>\n"
@@ -334,7 +332,7 @@ def _fate_epic_text(key: str, target_name: Optional[str] = None) -> str:
     }
     return texts.get(key, "The die rolls into shadow.") + f"\n\n<i>{end}</i>"
 
-# Command to summon the Dice of Fate
+# --- /fate command & flow ---
 @dp.message(Command("fate", "dice", "dice_of_fate"))
 async def fate_cmd(msg: Message):
     await msg.answer("“You dare summon the Dice of Fate. The air trembles with judgment.”")
@@ -360,22 +358,45 @@ async def fate_roll(cb: CallbackQuery):
     _fate_mark_rolled(chat_id, user_id)
     fate_key = _pick_fate_key()
 
-    # If the fate is Shared Burden, pick a random player from roster
+    # If the fate is The Giver, pick a random player from roster
     target = None
-    if fate_key == "shared_burden":
+    if fate_key == "giver":
         target = _sysrand.choice(PLAYERS) if PLAYERS else None
 
     epic = _fate_epic_text(fate_key, target_name=target)
 
     await cb.answer()  # stop the inline-button spinner
-    await cb.message.answer(epic)
+
+    if fate_key == "hurricane":
+        # Add a button to select a random player for the 10% shift
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🎯 Select random player", callback_data="hurricane:spin")
+        ]])
+        await cb.message.answer(epic, reply_markup=kb)
+    else:
+        await cb.message.answer(epic)
+
+# Handle the Hurricane random player selection
+@dp.callback_query(F.data == "hurricane:spin")
+async def hurricane_spin(cb: CallbackQuery):
+    # Try to avoid picking the invoker themself if their first_name matches a PLAYERS entry.
+    invoker = (cb.from_user.first_name or "").strip()
+    candidates = [p for p in PLAYERS if p.lower() != invoker.lower()] or PLAYERS
+    if not candidates:
+        await cb.answer("No players configured.", show_alert=True)
+        return
+    target = _sysrand.choice(candidates)
+    await cb.answer()
+    await cb.message.answer(
+        f"🎯 The storm chooses: <b>{html.escape(target)}</b>.\n"
+        f"Shift <b>10%</b> of your debt to them. Order is restored."
+    )
+
 # Natural-language trigger to summon the Dice of Fate (no slash)
-# We require the word "fate" to avoid colliding with casual "roll" talk.
 FATE_SUMMON_RE = re.compile(
     r"\b(?:dice\s+of\s+fate|summon(?:\s+the)?\s+dice(?:\s+of\s+fate)?|fate\s+dice|roll\s+the\s+dice\s+of\s+fate)\b",
     re.IGNORECASE
 )
-
 @dp.message(F.text.func(lambda t: isinstance(t, str)
                         and not t.strip().startswith("/")
                         and FATE_SUMMON_RE.search(t)))
@@ -387,11 +408,7 @@ async def fate_natural(msg: Message):
     await msg.answer("“You dare summon the Dice of Fate. The air trembles with judgment.”")
     await msg.answer(FATE_RULES_TEXT, reply_markup=kb)
 
-# ================== End Dice section ==================
-
-
-
-# ================== Gratitude / Blessings (single unified block, 5% favor) ==================
+# ================== Gratitude / Blessings (5% favor, anti-abuse) ==================
 BLESSINGS = [
     "Your thanks is heard, {name}. May your shoulders carry light burdens and your will grow heavy with resolve.",
     "Gratitude received, {name}. Walk with steady breath; strength will meet you there.",
@@ -418,14 +435,36 @@ def _compose_blessing(user_name: Optional[str]) -> str:
         base += "\n\n🪙 <b>Favor of Gratitude</b> — Deduct <b>20 kr</b> from your debt for your loyalty."
     return base
 
+# --- Anti-abuse limiter for gratitude (per-user, per-day) ---
+_gratitude_uses: Dict[int, tuple[dt.date, int]] = {}
+
+def _gratitude_inc_and_get(user_id: int) -> int:
+    today = _today_stockholm_date()
+    state = _gratitude_uses.get(user_id)
+    if not state or state[0] != today:
+        _gratitude_uses[user_id] = (today, 0)
+    count = _gratitude_uses[user_id][1] + 1
+    _gratitude_uses[user_id] = (today, count)
+    return count
+
+def _compose_gratitude_penalty(user_name: Optional[str]) -> str:
+    safe = html.escape(user_name or "friend")
+    return (
+        f"Your gratitude pours too freely today, {safe}. The floor is not fooled by sugar on the tongue.\n"
+        f"Let your deeds do the thanking.\n\n"
+        f"<b>Edict:</b> Lay <b>10 kr</b> in the pot and return with a steadier heart."
+    )
 
 # Natural-language thanks (thanks/thank you/thx/ty/tack/tack så mycket)
 THANKS_RE = re.compile(r"\b(thank(?:\s*you)?|thanks|thx|ty|tack(?:\s*så\s*mycket)?)\b", re.IGNORECASE)
 @dp.message(F.text.func(lambda t: isinstance(t, str) and not t.strip().startswith("/") and THANKS_RE.search(t)))
 async def thanks_plain(msg: Message):
-    text = _compose_blessing(getattr(msg.from_user, "first_name", None))
-    await msg.answer(text)
-# ================== End Gratitude section ==================
+    attempts = _gratitude_inc_and_get(msg.from_user.id)
+    name = getattr(msg.from_user, "first_name", None)
+    if attempts > 5:
+        await msg.answer(_compose_gratitude_penalty(name))
+    else:
+        await msg.answer(_compose_blessing(name))
 
 # ================== Apologies / Absolution (kind but stern) ==================
 APOLOGY_RE = re.compile(
@@ -470,7 +509,6 @@ def _compose_absolution(user_name: Optional[str]) -> str:
 async def apology_reply(msg: Message):
     text = _compose_absolution(getattr(msg.from_user, "first_name", None))
     await msg.answer(text)
-# ================== End Apologies section ==================
 
 # === Negativity / insult watcher ===
 INSULT_RE = re.compile(r"""
@@ -531,7 +569,6 @@ def _compose_rebuke(user_name: Optional[str]) -> str:
 async def prophet_insult_rebuke(msg: Message):
     text = _compose_rebuke(getattr(msg.from_user, "first_name", None))
     await msg.answer(text)
-# === end insult watcher ===
 
 # --- Helpers for sending the next quote ---
 async def _send_next_quote_to_chat(chat_id: int):
@@ -547,9 +584,6 @@ async def share_wisdom_cmd(msg: Message):
     await _send_next_quote_to_chat(msg.chat.id)
 
 # Natural-language trigger for asking wisdom (no slash)
-# Matches phrases like:
-# "share wisdom", "give me wisdom", "say something wise", "wisdom please",
-# "teach me", "I seek wisdom", "prophet, share wisdom", "drop some wisdom" etc.
 _WISDOM_PATTERNS = [
     r"\bshare\s+wisdom\b",
     r"\bgive\s+(?:me\s+)?wisdom\b",
@@ -561,7 +595,6 @@ _WISDOM_PATTERNS = [
     r"\bdrop\s+(?:some\s+)?wisdom\b",
 ]
 _WISDOM_RES = [re.compile(p, re.IGNORECASE) for p in _WISDOM_PATTERNS]
-
 def _matches_wisdom_nat(t: str) -> bool:
     return any(rx.search(t) for rx in _WISDOM_RES)
 
@@ -570,7 +603,6 @@ def _matches_wisdom_nat(t: str) -> bool:
                         and _matches_wisdom_nat(t)))
 async def share_wisdom_natural(msg: Message):
     await _send_next_quote_to_chat(msg.chat.id)
-
 
 # Fallback for people who type `/share wisdom`
 @dp.message(F.text.func(lambda t: isinstance(t, str) and t.strip().lower().startswith("/share wisdom")))
@@ -587,7 +619,6 @@ SUMMON_RESPONSES = [
     "The floor remembers every name. What do you ask?",
     "I rise where I’m named. What truth do you seek?",
 ]
-
 SUMMON_PATTERN = re.compile(r"\b(pushup\s*prophet|prophet)\b", re.IGNORECASE)
 @dp.message(F.text.func(lambda t: isinstance(t, str)
                         and not t.strip().startswith("/")
@@ -597,7 +628,6 @@ SUMMON_PATTERN = re.compile(r"\b(pushup\s*prophet|prophet)\b", re.IGNORECASE)
                         and not APOLOGY_RE.search(t)))
 async def summon_reply(msg: Message):
     await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
-
 
 # --------- Other Handlers ----------
 # Primary: works for /chatid and /chatid@pushupprophetbot
@@ -623,7 +653,6 @@ async def start_cmd(msg: Message):
         "• /status_random — check whether the Forgiveness Chain is enabled.\n\n"
         "You shall see me at every dawn. May the power of the Push be with you."
     )
-
 
 @dp.message(Command("help"))
 async def help_cmd(msg: Message):
@@ -767,5 +796,3 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
-
-
