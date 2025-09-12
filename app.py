@@ -584,8 +584,8 @@ async def start_cmd(msg: Message):
         "What I can do:\n"
         "• <b>/share_wisdom</b> — receive a daily quote of form and resolve.\n"
         "• <b>/roll &lt;pattern&gt;</b> — roll dice (e.g., /roll 1d5, /roll 6, /roll 3d6).\n"
-        "• <b>/fate</b> — summon the Dice of Fate (one roll per person per day).\n"
-        "• <b>/thanks</b> — offer gratitude and receive a blessing (5% chance of 20 kr favor).\n\n"
+        "• <b>/fate</b> — summon the Dice of Fate (one roll per person per day).\n\n"
+
         "Forgiveness Chain controls:\n"
         "• <b>/enable_random</b> — enable the Forgiveness Chain for this chat: 1 random daily announcement "
         "(07:00–22:00 Stockholm) + a follow-up 1 hour later.\n"
