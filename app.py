@@ -529,6 +529,47 @@ async def status_random_cmd(msg: Message):
     enabled = msg.chat.id in random_jobs
     await msg.answer(f"Status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
 
+# === Blessings for thanks (paste everything below) ===
+BLESSINGS = [
+    "Your thanks is heard, {name}. May your shoulders carry light burdens and your will grow heavy with resolve.",
+    "Gratitude received, {name}. Walk with steady breath; strength will meet you there.",
+    "I accept your thanks, {name}. May your form be honest and your progress inevitable.",
+    "Your gratitude is a good omen, {name}. Rise clean, descend wiser.",
+    "I hear you, {name}. Let patience be your spotter and discipline your crown.",
+    "Thanks received, {name}. May the floor count only truths from your chest.",
+    "Your words land true, {name}. Let calm lead effort and effort shape destiny.",
+    "I accept this tribute of thanks, {name}. May your last rep be your cleanest.",
+    "Gratitude noted, {name}. Keep the vow; the vow will keep you.",
+    "I receive your thanks, {name}. Temper the ego, sharpen the technique.",
+    "Your thanks rings clear, {name}. May rest write tomorrow’s strength into your bones.",
+    "Heard and held, {name}. Let the first push greet the day, and the last bless your night.",
+    "I take your thanks, {name}. Let honesty be your range and courage your tempo.",
+    "Your gratitude strengthens the circle, {name}. Share cadence; arrive together.",
+    "Acknowledged, {name}. May your spine stay straight and your standard even straighter.",
+]
+
+def _compose_blessing(user_name: Optional[str]) -> str:
+    safe_name = html.escape(user_name or "friend")
+    base = _sysrand.choice(BLESSINGS).format(name=safe_name)
+    # 5% chance of a small gift
+    if _sysrand.random() < 0.05:
+        base += "\n\n<b>Favor falls upon you.</b> Deduct <b>20 kr</b> from your debt for your gratitude and loyalty."
+    return base
+
+# /thanks command
+@dp.message(Command("thanks"))
+async def thanks_cmd(msg: Message):
+    text = _compose_blessing(getattr(msg.from_user, "first_name", None))
+    await msg.answer(text)
+
+# Natural language thanks (e.g., thanks/thank you/thx/ty/tack)
+@dp.message(F.text.regexp(re.compile(r"\b(thank\s*you|thanks|thx|ty|tack)\b", re.IGNORECASE)))
+async def thanks_plain(msg: Message):
+    text = _compose_blessing(getattr(msg.from_user, "first_name", None))
+    await msg.answer(text)
+# === end blessings block ===
+
+
 DICE_RE = re.compile(r"^\s*(\d+)\s*[dD]\s*(\d+)\s*$")
 @dp.message(Command("roll"))
 async def roll_cmd(msg: Message):
@@ -613,4 +654,5 @@ async def on_startup():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
