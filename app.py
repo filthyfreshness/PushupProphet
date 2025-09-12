@@ -399,11 +399,6 @@ def _compose_blessing(user_name: Optional[str]) -> str:
         base += "\n\n🪙 <b>Favor of Gratitude</b> — Deduct <b>20 kr</b> from your debt for your loyalty."
     return base
 
-# /thanks command
-@dp.message(Command("thanks"))
-async def thanks_cmd(msg: Message):
-    text = _compose_blessing(getattr(msg.from_user, "first_name", None))
-    await msg.answer(text)
 
 # Natural-language thanks (thanks/thank you/thx/ty/tack/tack så mycket)
 THANKS_RE = re.compile(r"\b(thank(?:\s*you)?|thanks|thx|ty|tack(?:\s*så\s*mycket)?)\b", re.IGNORECASE)
@@ -737,3 +732,4 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
