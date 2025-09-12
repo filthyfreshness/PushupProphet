@@ -81,10 +81,8 @@ def schedule_random_daily(chat_id: int) -> None:
     job = scheduler.add_job(send_and_reschedule, "date", run_date=run_at)
     random_jobs[chat_id] = job
 
-
 # --- Player roster used by Weekly Prophecy AND Dice of Fate ---
 PLAYERS = ["Fresh", "Momo", "Valle", "Tän", "Hampa"]
-
 
 # ================== Quotes rotation (daily 07:00 + /share_wisdom) ==================
 QUOTES = [
@@ -370,103 +368,77 @@ async def fate_roll(cb: CallbackQuery):
     await cb.answer()  # stop the inline-button spinner
     await cb.message.answer(epic)
 
-
 # ================== End Dice section ==================
 
-# ================== Gratitude / Blessings (5% favor) ==================
-
-# ================== Gratitude / Blessings (5% favor) ==================
-
+# ================== Gratitude / Blessings (single unified block, 5% favor) ==================
 BLESSINGS = [
-    "🙏 Your thanks are heard and held. May steadiness be your crown.",
-    "🌿 I receive your gratitude, and return a quiet strength.",
-    "🕊️ Your words reach the altar; rise lighter and go clean.",
-    "🔥 Your gratitude is accepted; let resolve burn without smoke.",
-    "🌅 Your thanks are received at dawn; may your first rep be honest.",
-    "🌾 I accept your thanks; may your discipline feed the days ahead.",
-    "🛡️ Your gratitude is noted; may your joints be guarded and your will unbroken.",
-    "🌊 Your thanks land like tide; may rhythm carry you to shore.",
-    "⚖️ I receive your thanks; balance effort with wisdom—the floor counts only truth.",
-    "🔔 Your gratitude rings true; let your sets answer the echo.",
-    "🌟 Your thanks are welcomed; keep truth at the bottom, dignity at the top.",
-    "🍃 I accept your thanks; greatness grows in quiet soil.",
-    "⛓️ Your gratitude is counted; let your promises become armor.",
-    "🗡️ Your thanks are received; cut through doubt with one honest rep.",
-    "🏛️ Your gratitude is accepted; stand tall—your standard is your temple.",
+    "Your thanks is heard, {name}. May your shoulders carry light burdens and your will grow heavy with resolve.",
+    "Gratitude received, {name}. Walk with steady breath; strength will meet you there.",
+    "I accept your thanks, {name}. May your form be honest and your progress inevitable.",
+    "Your gratitude is a good omen, {name}. Rise clean, descend wiser.",
+    "I hear you, {name}. Let patience be your spotter and discipline your crown.",
+    "Thanks received, {name}. May the floor count only truths from your chest.",
+    "Your words land true, {name}. Let calm lead effort and effort shape destiny.",
+    "I accept this tribute of thanks, {name}. May your last rep be your cleanest.",
+    "Gratitude noted, {name}. Keep the vow; the vow will keep you.",
+    "I receive your thanks, {name}. Temper the ego, sharpen the technique.",
+    "Your thanks rings clear, {name}. May rest write tomorrow’s strength into your bones.",
+    "Heard and held, {name}. Let the first push greet the day, and the last bless your night.",
+    "I take your thanks, {name}. Let honesty be your range and courage your tempo.",
+    "Your gratitude strengthens the circle, {name}. Share cadence; arrive together.",
+    "Acknowledged, {name}. May your spine stay straight and your standard even straighter.",
 ]
 
-async def _respond_to_thanks(msg: Message):
-    # Personal acknowledgement + blessing; 5% chance to grant favor
-    first = (msg.from_user.first_name or "").strip()
-    last = (getattr(msg.from_user, "last_name", None) or "").strip()
-    display = (first + " " + last).strip() or (("@" + msg.from_user.username) if msg.from_user.username else "traveler")
-    name_html = html.escape(display)
-
-    blessing = _sysrand.choice(BLESSINGS)
-    base = f"Your thanks are received, <b>{name_html}</b>.\n{blessing}"
-
+def _compose_blessing(user_name: Optional[str]) -> str:
+    safe = html.escape(user_name or "friend")
+    base = _sysrand.choice(BLESSINGS).format(name=safe)
+    # 5% chance of a small gift
     if _sysrand.random() < 0.05:
-        text = (
-            f"{base}\n\n"
-            "🪙 <b>Favor of Gratitude</b>\n"
-            "Because you showed loyalty, you may deduct <b>20 kr</b> from your debt."
-        )
-    else:
-        text = base
+        base += "\n\n🪙 <b>Favor of Gratitude</b> — Deduct <b>20 kr</b> from your debt for your loyalty."
+    return base
 
+# /thanks command
+@dp.message(Command("thanks"))
+async def thanks_cmd(msg: Message):
+    text = _compose_blessing(getattr(msg.from_user, "first_name", None))
     await msg.answer(text)
 
-
-# Natural-language thanks (non-commands)
-THANKS_PATTERN = re.compile(r"\b(thanks|thank\s*you|tack(?:\s*så\s*mycket)?)\b", re.IGNORECASE)
-@dp.message(F.text.func(lambda t: isinstance(t, str)
-                        and not t.strip().startswith("/")
-                        and THANKS_PATTERN.search(t)))
-async def thanks_natural(msg: Message):
-    await _respond_to_thanks(msg)
-
+# Natural-language thanks (thanks/thank you/thx/ty/tack/tack så mycket)
+THANKS_RE = re.compile(r"\b(thank(?:\s*you)?|thanks|thx|ty|tack(?:\s*så\s*mycket)?)\b", re.IGNORECASE)
+@dp.message(F.text.func(lambda t: isinstance(t, str) and not t.strip().startswith("/") and THANKS_RE.search(t)))
+async def thanks_plain(msg: Message):
+    text = _compose_blessing(getattr(msg.from_user, "first_name", None))
+    await msg.answer(text)
 # ================== End Gratitude section ==================
 
-# === Negativity / insult watcher (replace your previous block with this one) ===
-# Triggers when someone insults or speaks negatively to the Prophet/bot.
-# It fires if:
-#  A) A mention of the Prophet/bot appears in the same message as an insult word (any order), OR
-#  B) The message contains certain strong phrases like "fuck this shit" / "fucking bullshit" / etc.
-
-INSULT_RE = re.compile(
-    r"""
-    (?ix)
-    (
-        # ---- A) Mention + insult (either order) ----
-        (?:
-            (?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b)
-            .*?
-            (?:\bf\W*u\W*c\W*k\b|\bf\*+ck\b|\bfuck(?:ing|er|ed)?\b|\bbull\W*sh(?:it|\\*?t)\b|\bshit\b|\bcrap\b|\btrash\b|\bgarbage\b|\bsucks?\b|\bstupid\b|\bidiot\b|\bmoron\b|\bdumb\b|\bloser\b|\bpathetic\b|\blame\b|\bawful\b|\bterrible\b|\buseless\b|\bworthless\b|\bannoying\b|\bcringe\b|\bfraud\b|\bfake\b|\bclown\b|\bnonsense\b|\bbs\b|\bstfu\b|\bshut\s*up\b|\bgo\s*away\b|\bget\s*lost\b|\bscrew\s*you\b|\b(?:hate|hating)\s+(?:you|this)\b)
-        )
-        |
-        (?:
-            (?:\bf\W*u\W*c\W*k\b|\bf\*+ck\b|\bfuck(?:ing|er|ed)?\b|\bbull\W*sh(?:it|\\*?t)\b|\bshit\b|\bcrap\b|\btrash\b|\bgarbage\b|\bsucks?\b|\bstupid\b|\bidiot\b|\bmoron\b|\bdumb\b|\bloser\b|\bpathetic\b|\blame\b|\bawful\b|\bterrible\b|\buseless\b|\bworthless\b|\bannoying\b|\bcringe\b|\bfraud\b|\bfake\b|\bclown\b|\bnonsense\b|\bbs\b|\bstfu\b|\bshut\s*up\b|\bgo\s*away\b|\bget\s*lost\b|\bscrew\s*you\b|\b(?:hate|hating)\s+(?:you|this)\b)
-            .*?
-            (?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b)
-        )
-        |
-        # ---- B) Strong general phrases (catch-alls) ----
-        \bfuck\s*this\s*shit\b
-        |
-        \bfuck(?:ing)?\s+bull\W*shit\b
-        |
-        \b(?:bull\W*shit|bullsh\*?t)\s*(?:prophet|bot|push\s*up\s*prophet)\b
-        |
-        \b(?:f\W*u\W*c\W*k|f\*+ck)\b
-        |
-        \b(?:bull\W*shit|bullsh\*?t)\b
-        |
-        \b(?:piece\s*of\s*shit|garbage\s*bot|trash\s*bot|worst\s*bot)\b
-        |
-        \b(?:fuck\s*off|go\s*to\s*hell)\b
+# === Negativity / insult watcher (fixed compile flags) ===
+INSULT_RE = re.compile(r"""
+(
+    # ---- A) Mention + insult (either order) ----
+    (?:
+        (?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b)
+        .*?
+        (?:\bf\W*u\W*c\W*k\b|\bf\*+ck\b|\bfuck(?:ing|er|ed)?\b|\bbull\W*sh(?:it|\*?t)\b|\bshit\b|\bcrap\b|\btrash\b|\bgarbage\b|\bsucks?\b|\bstupid\b|\bidiot\b|\bmoron\b|\bdumb\b|\bloser\b|\bpathetic\b|\blame\b|\bawful\b|\bterrible\b|\buseless\b|\bworthless\b|\bannoying\b|\bcringe\b|\bfraud\b|\bfake\b|\bclown\b|\bnonsense\b|\bbs\b|\bstfu\b|\bshut\s*up\b|\bgo\s*away\b|\bget\s*lost\b|\bscrew\s*you\b|\b(?:hate|hating)\s+(?:you|this)\b)
     )
-    """,
+    |
+    (?:
+        (?:\bf\W*u\W*c\W*k\b|\bf\*+ck\b|\bfuck(?:ing|er|ed)?\b|\bbull\W*sh(?:it|\*?t)\b|\bshit\b|\bcrap\b|\btrash\b|\bgarbage\b|\bsucks?\b|\bstupid\b|\bidiot\b|\bmoron\b|\bdumb\b|\bloser\b|\bpathetic\b|\blame\b|\bawful\b|\bterrible\b|\buseless\b|\bworthless\b|\bannoying\b|\bcringe\b|\bfraud\b|\bfake\b|\bclown\b|\bnonsense\b|\bbs\b|\bstfu\b|\bshut\s*up\b|\bgo\s*away\b|\bget\s*lost\b|\bscrew\s*you\b|\b(?:hate|hating)\s+(?:you|this)\b)
+        .*?
+        (?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b)
+    )
+    |
+    # ---- B) Strong general phrases (catch-alls) ----
+    \bfuck\s*this\s*shit\b
+    |
+    \bfuck(?:ing)?\s+bull\W*shit\b
+    |
+    \b(?:bull\W*shit|bullsh\*?t)\s*(?:prophet|bot|push\s*up\s*prophet)\b
+    |
+    \b(?:garbage\s*bot|trash\s*bot|worst\s*bot)\b
+    |
+    \b(?:fuck\s*off|go\s*to\s*hell)\b
 )
+""", re.IGNORECASE | re.VERBOSE)
 
 REBUKES = [
     "I hear your anger, {name}. I receive it—and I answer with steadiness.",
@@ -491,7 +463,7 @@ def _compose_rebuke(user_name: Optional[str]) -> str:
     base = _sysrand.choice(REBUKES).format(name=safe)
     # 10% chance of a 10 kr penance
     if _sysrand.random() < 0.10:
-        base += "\n\n<b>Edict:</b> Lay <b>10 kr</b> in the pot as penance for disrespect."
+        base += "\n\n<b>Edict:</b> Lay <b>20 kr</b> in the pot as penance for disrespect."
     return base
 
 @dp.message(F.text.func(lambda t: isinstance(t, str) and INSULT_RE.search(t)))
@@ -499,7 +471,6 @@ async def prophet_insult_rebuke(msg: Message):
     text = _compose_rebuke(getattr(msg.from_user, "first_name", None))
     await msg.answer(text)
 # === end insult watcher ===
-
 
 # --- Helpers for sending the next quote ---
 async def _send_next_quote_to_chat(chat_id: int):
@@ -542,7 +513,7 @@ SUMMON_PATTERN = re.compile(r"\b(pushup\s*prophet|prophet)\b", re.IGNORECASE)
 @dp.message(F.text.func(lambda t: isinstance(t, str)
                         and not t.strip().startswith("/")
                         and SUMMON_PATTERN.search(t)
-                        and not THANKS_PATTERN.search(t)
+                        and not THANKS_RE.search(t)
                         and not SHARE_WISDOM_NAT.search(t)))
 async def summon_reply(msg: Message):
     await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
@@ -563,17 +534,15 @@ async def start_cmd(msg: Message):
     await msg.answer(
         "I am the Pushup Prophet! For my loyal subjects, I can:\n"
         "• /share_wisdom for those who seek knowledge and guidance.\n"
-        "• /Roll dice (e.g., /roll 1d5 → 1..5).\n"
-        "• Summon the Dice of Fate with /fate (one roll per person per day).\n"
-
+        "• Roll dice (e.g., /roll 1d5 → 1..5).\n"
+        "• Summon the Dice of Fate with /fate (one roll per person per day).\n\n"
         "Commands:\n"
         "/enable_random – start daily random message\n"
         "/disable_random – stop daily message\n"
         "/status_random – show whether daily post is enabled\n"
+        "/thanks – receive a blessing (5% favor)\n"
         "\n"
-        "Remember to always show your gratitude to the Pushup Prophet\n"
-
-
+        "Remember to always show your gratitude to the Pushup Prophet.\n"
     )
 
 @dp.message(Command("help"))
@@ -601,47 +570,6 @@ async def disable_random_cmd(msg: Message):
 async def status_random_cmd(msg: Message):
     enabled = msg.chat.id in random_jobs
     await msg.answer(f"Status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
-
-# === Blessings for thanks (paste everything below) ===
-BLESSINGS = [
-    "Your thanks is heard, {name}. May your shoulders carry light burdens and your will grow heavy with resolve.",
-    "Gratitude received, {name}. Walk with steady breath; strength will meet you there.",
-    "I accept your thanks, {name}. May your form be honest and your progress inevitable.",
-    "Your gratitude is a good omen, {name}. Rise clean, descend wiser.",
-    "I hear you, {name}. Let patience be your spotter and discipline your crown.",
-    "Thanks received, {name}. May the floor count only truths from your chest.",
-    "Your words land true, {name}. Let calm lead effort and effort shape destiny.",
-    "I accept this tribute of thanks, {name}. May your last rep be your cleanest.",
-    "Gratitude noted, {name}. Keep the vow; the vow will keep you.",
-    "I receive your thanks, {name}. Temper the ego, sharpen the technique.",
-    "Your thanks rings clear, {name}. May rest write tomorrow’s strength into your bones.",
-    "Heard and held, {name}. Let the first push greet the day, and the last bless your night.",
-    "I take your thanks, {name}. Let honesty be your range and courage your tempo.",
-    "Your gratitude strengthens the circle, {name}. Share cadence; arrive together.",
-    "Acknowledged, {name}. May your spine stay straight and your standard even straighter.",
-]
-
-def _compose_blessing(user_name: Optional[str]) -> str:
-    safe_name = html.escape(user_name or "friend")
-    base = _sysrand.choice(BLESSINGS).format(name=safe_name)
-    # 5% chance of a small gift
-    if _sysrand.random() < 0.05:
-        base += "\n\n<b>Favor falls upon you.</b> Deduct <b>20 kr</b> from your debt for your gratitude and loyalty."
-    return base
-
-# /thanks command
-@dp.message(Command("thanks"))
-async def thanks_cmd(msg: Message):
-    text = _compose_blessing(getattr(msg.from_user, "first_name", None))
-    await msg.answer(text)
-
-# Natural language thanks (e.g., thanks/thank you/thx/ty/tack)
-@dp.message(F.text.regexp(re.compile(r"\b(thank\s*you|thanks|thx|ty|tack)\b", re.IGNORECASE)))
-async def thanks_plain(msg: Message):
-    text = _compose_blessing(getattr(msg.from_user, "first_name", None))
-    await msg.answer(text)
-# === end blessings block ===
-
 
 DICE_RE = re.compile(r"^\s*(\d+)\s*[dD]\s*(\d+)\s*$")
 @dp.message(Command("roll"))
@@ -727,7 +655,3 @@ async def on_startup():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
-
-
-
-
