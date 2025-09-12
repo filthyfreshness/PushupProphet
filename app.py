@@ -461,7 +461,7 @@ REBUKES = [
 def _compose_rebuke(user_name: Optional[str]) -> str:
     safe = html.escape(user_name or "traveler")
     base = _sysrand.choice(REBUKES).format(name=safe)
-    # 10% chance of a 10 kr/20 kr penance (your code currently uses 20 kr)
+    # 10% chance of a 20 kr penance
     if _sysrand.random() < 0.10:
         base += "\n\n<b>Edict:</b> Lay <b>20 kr</b> in the pot as penance for disrespect."
     return base
@@ -532,17 +532,16 @@ async def chatid_fallback(msg: Message):
 @dp.message(CommandStart())
 async def start_cmd(msg: Message):
     await msg.answer(
-        "I am the Pushup Prophet! For my loyal subjects, I can:\n"
-        "• /share_wisdom for those who seek knowledge and guidance.\n"
-        "• Roll dice (e.g., /roll 1d5 → 1..5).\n"
-        "• Summon the Dice of Fate with /fate (one roll per person per day).\n\n"
-        "Commands:\n"
-        "/enable_random – start daily random message\n"
-        "/disable_random – stop daily message\n"
-        "/status_random – show whether daily post is enabled\n"
-        "/thanks – receive a blessing (5% favor)\n"
-        "\n"
-        "Remember to always show your gratitude to the Pushup Prophet.\n"
+        "I am the Pushup Prophet. Here is what I can do:\n\n"
+        "• <b>Forgiveness Chain</b>: a daily post at a <i>random time</i> between 07:00–22:00 Stockholm, "
+        "followed by a reminder exactly +1h. Enable with <b>/enable_random</b>, disable with <b>/disable_random</b>, "
+        "and check with <b>/status_random</b>.\n"
+        "• <b>Daily Wisdom</b>: quotes rotate per chat and also send automatically at 07:00. "
+        "Use <b>/share_wisdom</b> or just type <i>share wisdom</i>.\n"
+        "• <b>Dice of Fate</b>: summon with <b>/fate</b> (one roll per person per day).\n"
+        "• <b>Dice</b>: roll standard dice with <b>/roll</b> (e.g., /roll 3d6).\n"
+        "• <b>Blessings</b>: say thanks or use <b>/thanks</b> (5% chance of 20 kr favor).\n\n"
+        "Speak my name (<i>prophet</i> / <i>pushup prophet</i>) and I may answer."
     )
 
 @dp.message(Command("help"))
@@ -552,7 +551,11 @@ async def help_cmd(msg: Message):
 @dp.message(Command("enable_random"))
 async def enable_random_cmd(msg: Message):
     schedule_random_daily(msg.chat.id)
-    await msg.answer("✅ Daily random post enabled for this chat.")
+    await msg.answer(
+        "✅ <b>Forgiveness Chain enabled</b> for this chat.\n"
+        "I will post once per day at a random time between 07:00–22:00 Stockholm, "
+        "then send a follow-up exactly +1 hour later."
+    )
 
 @dp.message(Command("disable_random"))
 async def disable_random_cmd(msg: Message):
@@ -562,14 +565,14 @@ async def disable_random_cmd(msg: Message):
             job.remove()
         except Exception:
             pass
-        await msg.answer("🛑 Daily random post disabled for this chat.")
+        await msg.answer("🛑 <b>Forgiveness Chain disabled</b> for this chat.")
     else:
         await msg.answer("It wasn’t enabled for this chat.")
 
 @dp.message(Command("status_random"))
 async def status_random_cmd(msg: Message):
     enabled = msg.chat.id in random_jobs
-    await msg.answer(f"Status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
+    await msg.answer(f"Forgiveness Chain status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
 
 DICE_RE = re.compile(r"^\s*(\d+)\s*[dD]\s*(\d+)\s*$")
 @dp.message(Command("roll"))
