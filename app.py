@@ -65,7 +65,7 @@ def schedule_random_daily(chat_id: int) -> None:
     async def send_and_reschedule():
         try:
             await bot.send_message(chat_id, DAILY_TEXT)
-            # NEW: follow-up exactly 1 hour later
+            # follow-up exactly 1 hour later
             await asyncio.sleep(60 * 60)
             await bot.send_message(
                 chat_id,
@@ -215,7 +215,6 @@ async def send_daily_quote(chat_id: int):
     q = _next_quote(chat_id)
     if q is None:
         return
-    # Escape for HTML mode to avoid parse errors if quote has <, >, &
     safe = html.escape(q)
     await bot.send_message(chat_id, f"🕖 Daily Wisdom\n{safe}")
 
@@ -335,52 +334,6 @@ def _fate_epic_text(key: str, target_name: Optional[str] = None) -> str:
     }
     return texts.get(key, "The die rolls into shadow.") + f"\n\n<i>{end}</i>"
 
-    end = _sysrand.choice(closers)
-
-    texts = {
-        "miracle": (
-            "✨ <b>The Miracle</b>\n"
-            "The scales tilt toward mercy. Your burden is cleaved in half."
-        ),
-        "shared_burden": (
-            "🤝 <b>Shared Burden</b>\n"
-            "Gift 30 pushups to a random player; let strength travel from hand to hand."
-        ),
-        "trial_form": (
-            "⚔️ <b>Trial of Form</b>\n"
-            "Offer 10 perfect pushups—tempo true, depth honest—and erase 20 kr of debt."
-        ),
-        "command_prophet": (
-            "👑 <b>Command of the Prophet</b>\n"
-            "Name a player. They must choose: 30 pushups or 30 kr. Authority tests friendship."
-        ),
-        "mercy_coin": (
-            "🪙 <b>Mercy Coin</b>\n"
-            "One regular day is pardoned. Do not spend it cheaply."
-        ),
-        "hurricane": (
-            "🌪️ <b>Hurricane of Chaos</b>\n"
-            "Fortune stings and swirls: +10 kr, and a tithe of your weight shifts to another."
-        ),
-        "oath_dawn": (
-            "🌅 <b>Oath of Dawn</b>\n"
-            "Be first to rise tomorrow or pay 30 kr. Dawn reveals the faithful."
-        ),
-        "trial_flesh": (
-            "🔥 <b>Trial of Flesh</b>\n"
-            "Choose today: 100 pushups—or lay 45 kr upon the altar."
-        ),
-        "tribute_blood": (
-            "🩸 <b>Tribute of Blood</b>\n"
-            "The pot demands 50 kr. Pay without grudge, learn without delay."
-        ),
-        "wrath": (
-            "⚡ <b>Prophet’s Wrath</b>\n"
-            "Your debt is doubled. Pride withers; discipline takes its seat."
-        ),
-    }
-    return texts.get(key, "The die rolls into shadow.") + f"\n\n<i>{end}</i>"
-
 # Command to summon the Dice of Fate
 @dp.message(Command("fate", "dice", "dice_of_fate"))
 async def fate_cmd(msg: Message):
@@ -420,7 +373,102 @@ async def fate_roll(cb: CallbackQuery):
 
 # ================== End Dice section ==================
 
-# --------- Handlers ----------
+# ================== Gratitude / Blessings (5% favor) ==================
+
+BLESSINGS = [
+    "🙏 The Prophet inclines his head. Gratitude sharpens strength; walk in favor.",
+    "🌿 Your thanks are received. May your reps be true and your ledger light.",
+    "🕊️ Gratitude oils the gears of discipline. Go steady, with breath like tide.",
+    "🔥 The altar remembers those who bow with thanks. Rise with a lighter heart.",
+    "🌅 Gratitude is dawn for the diligent—carry its light into your sets.",
+    # +10 new variations:
+    "🌾 May your discipline be bread for hungry days; go in quiet strength.",
+    "🛡️ May your joints be guarded and your will unbroken.",
+    "🌊 Breathe like the tide; let steadiness carry you to shore.",
+    "⚖️ Balance effort with wisdom—the floor counts only truth.",
+    "🔔 Your gratitude rings true; let your sets answer the echo.",
+    "🌟 Walk the straight line: truth at the bottom, dignity at the top.",
+    "🍃 Move clean, rest clean—greatness grows in quiet soil.",
+    "⛓️ Keep your promises; links become chains or armor—choose.",
+    "🗡️ Cut through doubt with one honest rep.",
+    "🏛️ Stand tall; your standard is the temple you live in.",
+]
+
+async def _respond_to_thanks(msg: Message):
+    blessing = _sysrand.choice(BLESSINGS)
+    # 5% chance to grant a 20 kr deduction
+    if _sysrand.random() < 0.05:
+        text = (
+            f"{blessing}\n\n"
+            "🪙 <b>Favor of Gratitude</b>\n"
+            "Because you showed loyalty, you may deduct <b>20 kr</b> from your debt."
+        )
+    else:
+        text = blessing
+    await msg.answer(text)
+
+# Commands for thanks
+@dp.message(Command("thanks", "thankyou", "thank", "tack"))
+async def thanks_cmd(msg: Message):
+    await _respond_to_thanks(msg)
+
+# Natural-language thanks (non-commands)
+THANKS_PATTERN = re.compile(r"\b(thanks|thank\s*you|tack(?:\s*så\s*mycket)?)\b", re.IGNORECASE)
+@dp.message(F.text.func(lambda t: isinstance(t, str)
+                        and not t.strip().startswith("/")
+                        and THANKS_PATTERN.search(t)))
+async def thanks_natural(msg: Message):
+    await _respond_to_thanks(msg)
+
+# ================== End Gratitude section ==================
+
+# --- Helpers for sending the next quote ---
+async def _send_next_quote_to_chat(chat_id: int):
+    q = _next_quote(chat_id)
+    if not q:
+        await bot.send_message(chat_id, "No quotes configured yet.")
+        return
+    await bot.send_message(chat_id, html.escape(q))
+
+# Official command: ONLY /share_wisdom (aliases removed)
+@dp.message(Command("share_wisdom"))
+async def share_wisdom_cmd(msg: Message):
+    await _send_next_quote_to_chat(msg.chat.id)
+
+# Natural-language trigger for "share wisdom" (no slash)
+SHARE_WISDOM_NAT = re.compile(r"\bshare\s+wisdom\b", re.IGNORECASE)
+@dp.message(F.text.func(lambda t: isinstance(t, str)
+                        and not t.strip().startswith("/")
+                        and SHARE_WISDOM_NAT.search(t)))
+async def share_wisdom_natural(msg: Message):
+    await _send_next_quote_to_chat(msg.chat.id)
+
+# Fallback for people who type `/share wisdom`
+@dp.message(F.text.func(lambda t: isinstance(t, str) and t.strip().lower().startswith("/share wisdom")))
+async def share_wisdom_space_alias(msg: Message):
+    await _send_next_quote_to_chat(msg.chat.id)
+
+# ==== Prophet Summon Reactions ====
+SUMMON_RESPONSES = [
+    "Did someone summon me?",
+    "A whisper reaches the floor—speak, seeker.",
+    "The air stirs; the Prophet listens.",
+    "You called; discipline answers.",
+    "The Pushup Prophet hears. State your petition.",
+    "The floor remembers every name. What do you ask?",
+    "I rise where I’m named. What truth do you seek?",
+]
+
+SUMMON_PATTERN = re.compile(r"\b(pushup\s*prophet|prophet)\b", re.IGNORECASE)
+@dp.message(F.text.func(lambda t: isinstance(t, str)
+                        and not t.strip().startswith("/")
+                        and SUMMON_PATTERN.search(t)
+                        and not THANKS_PATTERN.search(t)
+                        and not SHARE_WISDOM_NAT.search(t)))
+async def summon_reply(msg: Message):
+    await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
+
+# --------- Other Handlers ----------
 # Primary: works for /chatid and /chatid@pushupprophetbot
 @dp.message(Command("chatid"))
 async def chatid_cmd(msg: Message):
@@ -438,16 +486,16 @@ async def start_cmd(msg: Message):
         "• Post 1 time per day at a random time (07:00–22:00 Stockholm) with our Forgiveness Chain message.\n"
         "• Share a daily quote at 07:00 Stockholm (per group) and rotate through your list randomly without repeats.\n"
         "• Roll dice with /roll (e.g., /roll 1d5 → 1..5).\n"
-        "• Summon the Dice of Fate with /fate (one roll per person per day).\n\n"
+        "• Summon the Dice of Fate with /fate (one roll per person per day).\n"
+        "• Receive your thanks and offer a blessing (/thanks) — with a rare Favor of Gratitude.\n\n"
         "Commands:\n"
         "/share_wisdom – send the next quote now\n"
-        "/wisdom – same as /share_wisdom\n"
-        "/quote – same as /share_wisdom\n"
         "/enable_random – start daily random message\n"
         "/disable_random – stop daily message\n"
         "/status_random – show whether daily post is enabled\n"
         "/roll &lt;pattern&gt; – roll dice (examples: /roll 1d5, /roll 6, /roll 3d6)\n"
         "/fate – summon the Dice of Fate\n"
+        "/thanks – offer gratitude to the Prophet"
     )
 
 @dp.message(Command("help"))
@@ -506,26 +554,7 @@ async def roll_cmd(msg: Message):
 
     return await msg.answer("Usage:\n/roll 1d5  (→ 1..5)\n/roll 6    (→ 1..6)\n/roll 3d6  (→ three 1..6 rolls + sum)")
 
-# --- Helpers for sending the next quote ---
-async def _send_next_quote_to_chat(chat_id: int):
-    q = _next_quote(chat_id)
-    if not q:
-        await bot.send_message(chat_id, "No quotes configured yet.")
-        return
-    await bot.send_message(chat_id, html.escape(q))
-
-# Official command with aliases: /share_wisdom, /wisdom, /quote
-@dp.message(Command("share_wisdom", "wisdom", "quote"))
-async def share_wisdom_cmd(msg: Message):
-    await _send_next_quote_to_chat(msg.chat.id)
-
-# Fallback for people who type `/share wisdom`
-@dp.message(F.text.func(lambda t: isinstance(t, str) and t.strip().lower().startswith("/share wisdom")))
-async def share_wisdom_space_alias(msg: Message):
-    await _send_next_quote_to_chat(msg.chat.id)
-
 # --------- Run bot + web server together ----------
-
 app = FastAPI()
 
 @app.get("/")
