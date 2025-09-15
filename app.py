@@ -17,6 +17,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.job import Job
 from pytz import timezone
 
+# Prevent accidental double-start inside the same process
+_started_polling = False
+
 # --------- Load config ----------
 DOTENV_PATH = Path(__file__).with_name(".env")
 load_dotenv(dotenv_path=DOTENV_PATH)
@@ -510,73 +513,54 @@ async def apology_reply(msg: Message):
     text = _compose_absolution(getattr(msg.from_user, "first_name", None))
     await msg.answer(text)
 
-# === Negativity / insult watcher (EXHAUSTIVE & robust) ===
-# Covers English + Swedish, obfuscations (f*u*c*k / f.u.c.k / fucc / fuxk), and common phrases.
-# We intentionally exclude hate slurs toward protected classes.
+# === Negativity / insult watcher (expanded + normalized) ===
 
-# Core fuzzy building blocks
-FUQ = r"f[\W_]*u[\W_]*c[\W_]*k"
-FUCKISH = rf"(?:{FUQ}(?:ing|er|ed)?|f\*+ck|fu+ck|fucc|fuxk|fck)"
-SHIT = r"s[\W_]*h[\W_]*i[\W_]*t"
-BITCH = r"b[\W_]*i[\W_]*t[\W_]*c[\W_]*h"
-ASSHOLE = r"a[\W_]*s[\W_]*s[\W_]*h[\W_]*o[\W_]*l[\W_]*e"
-CUNT = r"c[\W_]*u[\W_]*n[\W_]*t"
-DICK = r"d[\W_]*i[\W_]*c[\W_]*k"
-PUSSY = r"p[\W_]*u[\W_]*s[\W_]*s[\W_]*y"
-BS = rf"(?:bull[\W_]*{SHIT}|b[\W_]*s\b|bs\b)"
-SUCKS = r"suck(?:s|ing)?"
+def _normalize_text(t: str) -> str:
+    # Drop zero-width and bidi control chars, lower-case
+    t = re.sub(r"[\u200b-\u200f\u202a-\u202e]", "", t or "")
+    return t.lower()
 
-# Mentions of the bot (to pair with insults either order)
-MENTION = r"(?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b|@pushupprophetbot)"
+# Names/mentions that should count as addressing the bot
+MENTION_RE = r"(?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b)"
 
-# Strong standalone phrases (always trigger)
-STRONG = r"(?:"
-STRONG += rf"{FUCKISH}\s*(?:you|u)\b|"                              # fuck you / f u
-STRONG += rf"go[\W_]*{FUQ}[\W_]*yourself|"                          # go fuck yourself
-STRONG += rf"{FUQ}[\W_]*off\b|"                                     # fuck off
-STRONG += rf"shut[\W_]*up\b|"                                       # shut up
-STRONG += rf"\bstfu\b|"                                             # stfu
-STRONG += rf"you[\W_]*{SUCKS}\b|"                                   # you suck / you sucking
-STRONG += rf"piece[\W_]*of[\W_]*{SHIT}\b|"                          # piece of shit
-STRONG += rf"{BS}\b|"                                               # bullshit / b.s. / bs
-STRONG += rf"go[\W_]*to[\W_]*hell\b|"                               # go to hell
-STRONG += rf"drop[\W_]*dead\b|"                                     # drop dead
-STRONG += rf"kill[\W_]*yourself\b|"                                 # kill yourself
-STRONG += r"\bkys\b"                                                # kys
-STRONG += r")"
+# Common insult lexicon (word forms, some obfuscations)
+INSULT_WORDS = (
+    r"(?:"
+    r"fuck(?:ing|er|ed)?|f\*+ck|f\W*u\W*c\W*k|"
+    r"shit|bull\W*sh(?:it|\*?t)|crap|trash|garbage|bs|"
+    r"sucks?|stupid|idiot|moron|dumb(?:ass)?|loser|pathetic|awful|terrible|useless|worthless|annoying|cringe|fraud|fake|clown|nonsense|"
+    r"bitch|ass(?:hole|hat|clown)?|dick(?:head)?|prick|jerk|"
+    r"wank(?:er)?|twat|tosser|dipshit|jackass|motherfucker|mf"
+    r")"
+)
 
-# Single-word/short insults (English + Swedish)
-WORDS = r"(?:"
-WORDS += rf"{FUCKISH}|{SHIT}|{BITCH}|{ASSHOLE}|{CUNT}|{DICK}|{PUSSY}|"
-WORDS += r"crap|trash|garbage|lame|awful|terrible|useless|worthless|annoying|fraud|fake|clown|nonsense|"
-WORDS += r"stupid|idiot|moron|dumb(?:ass)?|loser|sucks?|"
-# Swedish (avoid protected-class slurs)
-WORDS += r"skit|skr(?:a|ä)p|suger|j(?:a|ä)vla|helvete|kuk|fitta|idiot|dum(?:\s*i\s*huvudet)?"
-WORDS += r")"
+# Direct 2nd-person insults (don’t require a prophet mention)
+DIRECT_2P = (
+    r"(?:"
+    r"fuck\s*(?:you|u|ya)|"
+    r"screw\s*you|stfu|shut\s*up|"
+    r"you\s*(?:suck|are\s*(?:stupid|dumb|useless|worthless|annoying|terrible|awful)|"
+    r"idiot|moron|loser|clown|bitch|asshole|prick|jerk|dickhead|wanker|twat)"
+    r")"
+)
 
-# Swedish strong phrases (standalone)
-SWE_STRONG = r"(?:"
-SWE_STRONG += r"dra[\W_]*a(?:̊|a)t[\W_]*helvete\b|"                 # dra åt helvete
-SWE_STRONG += r"h(?:a|å)ll[\W_]*k(?:a|ä)ft(?:en)?\b|"               # håll käften / hall kaften
-SWE_STRONG += r"h(?:a|å)ll[\W_]*truten\b|"                          # håll truten
-SWE_STRONG += r"stick\b|"                                           # stick
-SWE_STRONG += r"f(?:o|ö)rsvinn\b|"                                  # försvinn / forsvinn
-SWE_STRONG += r"dra[\W_]*(?:h(?:a|ä)rifr(?:a|å)n)\b"                # dra härifrån
-SWE_STRONG += r")"
-
-# Final detector:
-#  - mention ± insult within 0–60 chars (either order)
-#  - or any strong phrase (EN/SV) by itself
 INSULT_RE = re.compile(
     rf"""
-    (
-        (?:{MENTION}[\s\S]{{0,60}}(?:{STRONG}|{WORDS}))
+    (?:                                 # 1) Mention + insult (either order)
+        (?:{MENTION_RE}).*?(?:{INSULT_WORDS})
         |
-        (?:(?:{STRONG}|{WORDS})[\s\S]{{0,60}}{MENTION})
-        |
-        {STRONG}
-        |
-        {SWE_STRONG}
+        (?:{INSULT_WORDS}).*?(?:{MENTION_RE})
+    )
+    |
+    (?:{DIRECT_2P})                      # 2) Direct second-person insults
+    |
+    (?:                                 # 3) Strong catch-alls
+        fuck\s*this\s*shit
+        | fuck(?:ing)?\s+bull\W*shit
+        | (?:bull\W*shit|bullsh\*?t)\s*(?:prophet|bot|push\s*up\s*prophet)
+        | (?:garbage|trash|worst)\s*bot
+        | fuck\s*off
+        | go\s*to\s*hell
     )
     """,
     re.IGNORECASE | re.VERBOSE,
@@ -609,12 +593,13 @@ def _compose_rebuke(user_name: Optional[str]) -> str:
     return base
 
 @dp.message(F.text.func(lambda t: isinstance(t, str)
-                        and INSULT_RE.search(t)
+                        and INSULT_RE.search(_normalize_text(t))
                         and not APOLOGY_RE.search(t)))
 async def prophet_insult_rebuke(msg: Message):
     text = _compose_rebuke(getattr(msg.from_user, "first_name", None))
     await msg.answer(text)
 # === end insult watcher ===
+
 
 # --- Helpers for sending the next quote ---
 async def _send_next_quote_to_chat(chat_id: int):
@@ -768,9 +753,15 @@ def health_head():
     return Response(status_code=200)
 
 async def run_bot():
+    global _started_polling
+    if _started_polling:
+        logger.warning("Polling already started; skipping second start.")
+        return
+    _started_polling = True
     scheduler.start()
     logger.info("Scheduler started")
     await dp.start_polling(bot)
+
 
 @app.on_event("startup")
 async def on_startup():
@@ -842,4 +833,5 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
