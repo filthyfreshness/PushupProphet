@@ -510,34 +510,77 @@ async def apology_reply(msg: Message):
     text = _compose_absolution(getattr(msg.from_user, "first_name", None))
     await msg.answer(text)
 
-# === Negativity / insult watcher ===
-INSULT_RE = re.compile(r"""
-(
-    # ---- A) Mention + insult (either order) ----
-    (?:
-        (?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b)
-        .*?
-        (?:\bf\W*u\W*c\W*k\b|\bf\*+ck\b|\bfuck(?:ing|er|ed)?\b|\bbull\W*sh(?:it|\*?t)\b|\bshit\b|\bcrap\b|\btrash\b|\bgarbage\b|\bsucks?\b|\bstupid\b|\bidiot\b|\bmoron\b|\bdumb\b|\bloser\b|\bpathetic\b|\blame\b|\bawful\b|\bterrible\b|\buseless\b|\bworthless\b|\bannoying\b|\bcringe\b|\bfraud\b|\bfake\b|\bclown\b|\bnonsense\b|\bbs\b|\bstfu\b|\bshut\s*up\b|\bgo\s*away\b|\bget\s*lost\b|\bscrew\s*you\b|\b(?:hate|hating)\s+(?:you|this)\b)
+# === Negativity / insult watcher (EXHAUSTIVE & robust) ===
+# Covers English + Swedish, obfuscations (f*u*c*k / f.u.c.k / fucc / fuxk), and common phrases.
+# We intentionally exclude hate slurs toward protected classes.
+
+# Core fuzzy building blocks
+FUQ = r"f[\W_]*u[\W_]*c[\W_]*k"
+FUCKISH = rf"(?:{FUQ}(?:ing|er|ed)?|f\*+ck|fu+ck|fucc|fuxk|fck)"
+SHIT = r"s[\W_]*h[\W_]*i[\W_]*t"
+BITCH = r"b[\W_]*i[\W_]*t[\W_]*c[\W_]*h"
+ASSHOLE = r"a[\W_]*s[\W_]*s[\W_]*h[\W_]*o[\W_]*l[\W_]*e"
+CUNT = r"c[\W_]*u[\W_]*n[\W_]*t"
+DICK = r"d[\W_]*i[\W_]*c[\W_]*k"
+PUSSY = r"p[\W_]*u[\W_]*s[\W_]*s[\W_]*y"
+BS = rf"(?:bull[\W_]*{SHIT}|b[\W_]*s\b|bs\b)"
+SUCKS = r"suck(?:s|ing)?"
+
+# Mentions of the bot (to pair with insults either order)
+MENTION = r"(?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b|@pushupprophetbot)"
+
+# Strong standalone phrases (always trigger)
+STRONG = r"(?:"
+STRONG += rf"{FUCKISH}\s*(?:you|u)\b|"                              # fuck you / f u
+STRONG += rf"go[\W_]*{FUQ}[\W_]*yourself|"                          # go fuck yourself
+STRONG += rf"{FUQ}[\W_]*off\b|"                                     # fuck off
+STRONG += rf"shut[\W_]*up\b|"                                       # shut up
+STRONG += rf"\bstfu\b|"                                             # stfu
+STRONG += rf"you[\W_]*{SUCKS}\b|"                                   # you suck / you sucking
+STRONG += rf"piece[\W_]*of[\W_]*{SHIT}\b|"                          # piece of shit
+STRONG += rf"{BS}\b|"                                               # bullshit / b.s. / bs
+STRONG += rf"go[\W_]*to[\W_]*hell\b|"                               # go to hell
+STRONG += rf"drop[\W_]*dead\b|"                                     # drop dead
+STRONG += rf"kill[\W_]*yourself\b|"                                 # kill yourself
+STRONG += r"\bkys\b"                                                # kys
+STRONG += r")"
+
+# Single-word/short insults (English + Swedish)
+WORDS = r"(?:"
+WORDS += rf"{FUCKISH}|{SHIT}|{BITCH}|{ASSHOLE}|{CUNT}|{DICK}|{PUSSY}|"
+WORDS += r"crap|trash|garbage|lame|awful|terrible|useless|worthless|annoying|fraud|fake|clown|nonsense|"
+WORDS += r"stupid|idiot|moron|dumb(?:ass)?|loser|sucks?|"
+# Swedish (avoid protected-class slurs)
+WORDS += r"skit|skr(?:a|ä)p|suger|j(?:a|ä)vla|helvete|kuk|fitta|idiot|dum(?:\s*i\s*huvudet)?"
+WORDS += r")"
+
+# Swedish strong phrases (standalone)
+SWE_STRONG = r"(?:"
+SWE_STRONG += r"dra[\W_]*a(?:̊|a)t[\W_]*helvete\b|"                 # dra åt helvete
+SWE_STRONG += r"h(?:a|å)ll[\W_]*k(?:a|ä)ft(?:en)?\b|"               # håll käften / hall kaften
+SWE_STRONG += r"h(?:a|å)ll[\W_]*truten\b|"                          # håll truten
+SWE_STRONG += r"stick\b|"                                           # stick
+SWE_STRONG += r"f(?:o|ö)rsvinn\b|"                                  # försvinn / forsvinn
+SWE_STRONG += r"dra[\W_]*(?:h(?:a|ä)rifr(?:a|å)n)\b"                # dra härifrån
+SWE_STRONG += r")"
+
+# Final detector:
+#  - mention ± insult within 0–60 chars (either order)
+#  - or any strong phrase (EN/SV) by itself
+INSULT_RE = re.compile(
+    rf"""
+    (
+        (?:{MENTION}[\s\S]{{0,60}}(?:{STRONG}|{WORDS}))
+        |
+        (?:(?:{STRONG}|{WORDS})[\s\S]{{0,60}}{MENTION})
+        |
+        {STRONG}
+        |
+        {SWE_STRONG}
     )
-    |
-    (?:
-        (?:\bf\W*u\W*c\W*k\b|\bf\*+ck\b|\bfuck(?:ing|er|ed)?\b|\bbull\W*sh(?:it|\*?t)\b|\bshit\b|\bcrap\b|\btrash\b|\bgarbage\b|\bsucks?\b|\bstupid\b|\bidiot\b|\bmoron\b|\bdumb\b|\bloser\b|\bpathetic\b|\blame\b|\bawful\b|\bterrible\b|\buseless\b|\bworthless\b|\bannoying\b|\bcringe\b|\bfraud\b|\bfake\b|\bclown\b|\bnonsense\b|\bbs\b|\bstfu\b|\bshut\s*up\b|\bgo\s*away\b|\bget\s*lost\b|\bscrew\s*you\b|\b(?:hate|hating)\s+(?:you|this)\b)
-        .*?
-        (?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b)
-    )
-    |
-    # ---- B) Strong general phrases (catch-alls) ----
-    \bfuck\s*this\s*shit\b
-    |
-    \bfuck(?:ing)?\s+bull\W*shit\b
-    |
-    \b(?:bull\W*shit|bullsh\*?t)\s*(?:prophet|bot|push\s*up\s*prophet)\b
-    |
-    \b(?:garbage\s*bot|trash\s*bot|worst\s*bot)\b
-    |
-    \b(?:fuck\s*off|go\s*to\s*hell)\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
-""", re.IGNORECASE | re.VERBOSE)
 
 REBUKES = [
     "I hear your anger, {name}. I receive it—and I answer with steadiness.",
@@ -565,10 +608,13 @@ def _compose_rebuke(user_name: Optional[str]) -> str:
         base += "\n\n<b>Edict:</b> Lay <b>20 kr</b> in the pot as penance for disrespect."
     return base
 
-@dp.message(F.text.func(lambda t: isinstance(t, str) and INSULT_RE.search(t) and not APOLOGY_RE.search(t)))
+@dp.message(F.text.func(lambda t: isinstance(t, str)
+                        and INSULT_RE.search(t)
+                        and not APOLOGY_RE.search(t)))
 async def prophet_insult_rebuke(msg: Message):
     text = _compose_rebuke(getattr(msg.from_user, "first_name", None))
     await msg.answer(text)
+# === end insult watcher ===
 
 # --- Helpers for sending the next quote ---
 async def _send_next_quote_to_chat(chat_id: int):
@@ -796,3 +842,4 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
