@@ -195,6 +195,47 @@ async def user_totals(chat_id: int, user_id: int) -> Dict[str, int]:
         )
         return {m: c for (m, c) in rows.all()}
 
+def _dialect_insert():
+    # choose insert dialect for upsert depending on Postgres/SQLite
+    return pg_insert if ASYNC_DB_URL.startswith("postgresql+asyncpg://") else sqlite_insert
+
+async def upsert_username(chat_id: int, user_id: int, first_name: Optional[str], username: Optional[str]) -> None:
+    """Save/refresh a user's display info for this chat (idempotent upsert)."""
+    ins = _dialect_insert()(UserName).values(
+        chat_id=chat_id,
+        user_id=user_id,
+        first_name=(first_name or None),
+        username=(username or None),
+    )
+    stmt = ins.on_conflict_do_update(
+        index_elements=[UserName.chat_id, UserName.user_id],  # composite PK
+        set_={
+            "first_name": ins.excluded.first_name,
+            "username":   ins.excluded.username,
+            "last_seen":  func.now(),
+        },
+    )
+    async with AsyncSessionLocal() as s:
+        await s.execute(stmt)
+        await s.commit()
+
+async def name_for(chat_id: int, user_id: int) -> str:
+    """Return a nice display name for a user in a chat."""
+    async with AsyncSessionLocal() as s:
+        r = await s.execute(
+            select(UserName.first_name, UserName.username)
+            .where(UserName.chat_id == chat_id, UserName.user_id == user_id)
+        )
+        row = r.first()
+        if row:
+            first_name, username = row
+            if first_name:
+                return first_name
+            if username:
+                return f"@{username}"
+    return f"user {user_id}"
+
+
 # ---------------------------------------------------------------
 
 random_jobs: Dict[int, Job] = {}
@@ -524,6 +565,12 @@ THANKS_RE = re.compile(r"\b(thank(?:\s*you)?|thanks|thx|ty|tack(?:\s*så\s*mycke
 @dp.message(F.text.func(lambda t: isinstance(t, str) and not t.strip().startswith("/") and THANKS_RE.search(t)))
 async def thanks_plain(msg: Message):
     try:
+        await upsert_username(
+            msg.chat.id,
+            msg.from_user.id,
+            getattr(msg.from_user, "first_name", None),
+            getattr(msg.from_user, "username", None),
+        )
         await incr_counter(msg.chat.id, msg.from_user.id, "thanks", 1)
     except Exception:
         logger.exception("Failed to log 'thanks' counter")
@@ -577,6 +624,12 @@ def _compose_absolution(user_name: Optional[str]) -> str:
                         and APOLOGY_RE.search(t)))
 async def apology_reply(msg: Message):
     try:
+        await upsert_username(
+            msg.chat.id,
+            msg.from_user.id,
+            getattr(msg.from_user, "first_name", None),
+            getattr(msg.from_user, "username", None),
+        )
         await incr_counter(msg.chat.id, msg.from_user.id, "apology", 1)
     except Exception:
         logger.exception("Failed to log 'apology' counter")
@@ -662,6 +715,12 @@ def _compose_rebuke(user_name: Optional[str]) -> str:
                         and not APOLOGY_RE.search(t)))
 async def prophet_insult_rebuke(msg: Message):
     try:
+        await upsert_username(
+            msg.chat.id,
+            msg.from_user.id,
+            getattr(msg.from_user, "first_name", None),
+            getattr(msg.from_user, "username", None),
+        )
         await incr_counter(msg.chat.id, msg.from_user.id, "insult", 1)
     except Exception:
         logger.exception("Failed to log 'insult' counter")
@@ -755,6 +814,12 @@ SUMMON_PATTERN = re.compile(r"\b(pushup\s*prophet|prophet)\b", re.IGNORECASE)
                         and not APOLOGY_RE.search(t)))
 async def summon_reply(msg: Message):
     try:
+        await upsert_username(
+            msg.chat.id,
+            msg.from_user.id,
+            getattr(msg.from_user, "first_name", None),
+            getattr(msg.from_user, "username", None),
+        )
         await incr_counter(msg.chat.id, msg.from_user.id, "mention", 1)
     except Exception:
         logger.exception("Failed to log 'mention' counter")
@@ -1085,4 +1150,5 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
