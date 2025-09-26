@@ -889,6 +889,7 @@ async def on_startup():
                 continue
             try:
                 chat_id = int(raw)
+
                 # Forgiveness Chain daily random-time window (+1h follow-up)
                 schedule_random_daily(chat_id)
                 logger.info(f"Auto-enabled Forgiveness Chain for chat {chat_id}")
@@ -905,24 +906,22 @@ async def on_startup():
                 )
                 logger.info(f"Scheduled daily quote (07:00) for chat {chat_id}")
 
-
-# Weekly votes every Sunday at 11:00 Stockholm (two messages back-to-back)
-
-scheduler.add_job(
-    send_weekly_vote_prompts,
-    "cron",
-    day_of_week="sun",
-    hour=11,
-    minute=0,
-    args=[chat_id],
-    id=f"weekly_votes_{chat_id}",
-    replace_existing=True,
-)
-logger.info(f"Scheduled weekly votes (Sun 11:00) for chat {chat_id}")
-
+                # Weekly votes every Sunday at 11:00 Stockholm (two messages back-to-back)
+                scheduler.add_job(
+                    send_weekly_vote_prompts,
+                    "cron",
+                    day_of_week="sun",
+                    hour=11,
+                    minute=0,
+                    args=[chat_id],
+                    id=f"weekly_votes_{chat_id}",
+                    replace_existing=True,
+                )
+                logger.info(f"Scheduled weekly votes (Sun 11:00) for chat {chat_id}")
 
             except Exception as e:
                 logger.exception(f"Startup scheduling failed for chat {raw}: {e}")
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -939,6 +938,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
 
 
