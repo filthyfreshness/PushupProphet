@@ -3,7 +3,6 @@ from typing import Dict, Optional, List, Tuple
 from pathlib import Path
 from collections import deque
 
-from fastapi import FastAPI, Response
 import uvicorn
 
 from sqlalchemy import Column, BigInteger, String, Integer, Index, select, event
@@ -19,12 +18,48 @@ from aiogram import F
 from aiogram.enums.parse_mode import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+
+
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.job import Job
 from pytz import timezone
 
 import httpx
+
+from fastapi import FastAPI, Response
+app = FastAPI()
+
+# near the top of the file, after imports
+_SINGLETON_LOCK = Path(".bot-lock")
+
+def _acquire_singleton_lock() -> bool:
+    try:
+        # O_EXCL fails if the file already exists
+        fd = os.open(_SINGLETON_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+
+@app.on_event("startup")
+async def on_startup():
+    if not _acquire_singleton_lock():
+        # Another instance already running in this folder
+        logger.error("Another bot instance seems to be running (.bot-lock exists). Exiting.")
+        raise SystemExit(1)
+    ...
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    ...
+    try:
+        if _SINGLETON_LOCK.exists():
+            _SINGLETON_LOCK.unlink(missing_ok=True)
+    except Exception:
+        pass
+
 
 # Prevent accidental double-start
 _started_polling = False
@@ -72,13 +107,16 @@ def _append_sslmode_if_needed(url: str) -> str:
 def _to_async_url(url: str) -> str:
     if not url:
         return "sqlite+aiosqlite:///./local-dev.db"  # local dev fallback
+    # Normalize scheme to the async driver
     if url.startswith("postgres://"):
         url = "postgresql+asyncpg://" + url[len("postgres://"):]
     elif url.startswith("postgresql://"):
         url = "postgresql+asyncpg://" + url[len("postgresql://"):]
-    if url.startswith("postgresql+asyncpg://"):
-        url = _append_sslmode_if_needed(url)
+    # Strip any accidental query like ?sslmode=require (we set SSL via connect_args)
+    if "?" in url:
+        url = url.split("?", 1)[0]
     return url
+
 
 ASYNC_DB_URL = _to_async_url(DB_URL)
 
@@ -96,7 +134,18 @@ class Counter(Base):
         Index("ix_counters_chat_metric_count", "chat_id", "metric", "count"),
     )
 
-engine = create_async_engine(ASYNC_DB_URL, pool_pre_ping=True)
+import ssl
+ssl_ctx = None
+if ASYNC_DB_URL.startswith("postgresql+asyncpg://"):
+    # Neon requires TLS — create a default SSL context
+    ssl_ctx = ssl.create_default_context()
+
+engine = create_async_engine(
+    ASYNC_DB_URL,
+    pool_pre_ping=True,
+    connect_args={"ssl": ssl_ctx} if ssl_ctx else {},
+)
+
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 # SQLite WAL for better local dev concurrency
@@ -893,7 +942,6 @@ async def ai_catchall(msg: Message):
         logger.exception("AI reply failed")
 
 # --------- Run bot + web server together ----------
-app = FastAPI()
 
 @app.get("/")
 def health():
@@ -903,15 +951,55 @@ def health():
 def health_head():
     return Response(status_code=200)
 
+
 async def run_bot():
     global _started_polling
     if _started_polling:
         logger.warning("Polling already started; skipping second start.")
         return
     _started_polling = True
+
     scheduler.start()
     logger.info("Scheduler started")
-    await dp.start_polling(bot)
+
+    # Defensive: ensure webhook really gone right before polling
+    try:
+        await bot.delete_webhook(drop_pending_updates=True, request_timeout=30)
+    except Exception as e:
+        logger.warning(f"delete_webhook (pre-poll) failed (continuing): {e}")
+
+    # Retry loop around start_polling to survive transient conflicts
+    delays = [0, 1, 3, 5, 10]  # seconds
+    for i, delay in enumerate(delays, start=1):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            logger.info(f"Starting polling (attempt {i})...")
+            # polling_timeout keeps long-polls short so shutdowns are snappier
+            await dp.start_polling(bot, polling_timeout=30)
+            logger.info("Polling finished cleanly.")
+            break
+        except TelegramBadRequest as e:
+            # Typical conflict/error from Bot API
+            msg = str(e)
+            logger.warning(f"start_polling TelegramBadRequest on attempt {i}: {msg}")
+            if "terminated by other getUpdates request" in msg.lower() \
+               or "can't use getupdates method while webhook is active" in msg.lower():
+                # Try to clear webhook and retry
+                try:
+                    await bot.delete_webhook(drop_pending_updates=True, request_timeout=30)
+                except Exception as e2:
+                    logger.warning(f"delete_webhook after conflict failed: {e2}")
+                continue
+            # other 400-level errors: let it bubble to next retry
+            continue
+        except TelegramNetworkError as e:
+            logger.warning(f"Network error on polling attempt {i}: {e}")
+            continue
+        except Exception as e:
+            logger.exception(f"Unexpected polling error on attempt {i}: {e}")
+            continue
+
 
 @app.on_event("startup")
 async def on_startup():
@@ -992,7 +1080,9 @@ async def on_shutdown():
     except Exception:
         pass
 
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    # Run the in-memory app object (works regardless of filename)
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
+    # workers=1 guarantees single process (important for polling)
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
