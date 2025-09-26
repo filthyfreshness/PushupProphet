@@ -7,7 +7,7 @@ from fastapi import FastAPI, Response
 import uvicorn
 
 from aiogram import Bot, Dispatcher
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, PollAnswer
 from aiogram.filters import Command, CommandStart
 from aiogram import F
 from aiogram.enums.parse_mode import ParseMode
@@ -89,10 +89,19 @@ def schedule_random_daily(chat_id: int) -> None:
 # --- Player roster used by Weekly Prophecy AND Dice of Fate ---
 PLAYERS = ["Fresh", "Momo", "Valle", "Tän", "Hampa"]
 
+# Track active polls so we can attribute answers
+# poll_id -> {"kind": "weakest"|"inspiration", "chat_id": int, "options": List[str]}
+POLL_META: Dict[str, Dict] = {}
+
+
 # ===== Weekly votes (non-anonymous) =====
 # In-memory, resets on restarts. Keys: chat_id -> week_key -> { user_id: player_name }
 weakest_votes: Dict[int, Dict[str, Dict[int, str]]] = {}
 inspiration_votes: Dict[int, Dict[str, Dict[int, str]]] = {}
+
+# Poll ID → { kind: 'weakest'|'inspiration', chat_id: int, options: [players] }
+POLL_META: Dict[str, Dict[str, object]] = {}
+
 
 def _week_key_now() -> str:
     """Return ISO week key in Stockholm time, e.g. '2025-W37'."""
@@ -395,20 +404,7 @@ async def fate_roll(cb: CallbackQuery):
     else:
         await cb.message.answer(epic)
 
-@dp.callback_query(F.data.func(lambda d: isinstance(d, str) and d.startswith("vote:")))
-async def handle_weekly_vote(cb: CallbackQuery):
-    # Parse "vote:<kind>:<player>"
-    try:
-        _, kind, player = cb.data.split(":", 2)
-    except Exception:
-        return await cb.answer("Invalid vote.", show_alert=True)
 
-    if kind not in ("weakest", "inspiration"):
-        return await cb.answer("Unknown vote type.", show_alert=True)
-
-    week_key = _week_key_now()
-    chat_id = cb.message.chat.id
-    user_id = cb.from_user.id
 
     # Record the vote (overwrites previous vote by same user this week)
     bucket = weakest_votes if kind == "weakest" else inspiration_votes
@@ -676,21 +672,44 @@ def _build_vote_kb(kind: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def send_weekly_vote_prompts(chat_id: int):
-    # 1) Weakest Link
-    text_w = (
-        "🏷️ <b>The Weakest Link</b>\n"
-        "Cast your vote for who struggled the most this week.\n"
-        "Tap a name below to vote (not anonymous)."
-    )
-    await bot.send_message(chat_id, text_w, reply_markup=_build_vote_kb("weakest"))
+    """
+    Sends two non-anonymous polls back-to-back:
+      1) The Weakest Link
+      2) The Inspiration
+    Records poll metadata so we can capture votes via @dp.poll_answer().
+    """
+    options = list(PLAYERS)  # keep order stable
 
-    # 2) The Inspiration
-    text_i = (
-        "🌟 <b>The Inspiration</b>\n"
-        "Cast your vote for who inspired the circle this week.\n"
-        "Tap a name below to vote (not anonymous)."
+    # 1) Weakest Link (non-anonymous, single choice)
+    msg_w = await bot.send_poll(
+        chat_id=chat_id,
+        question="🏷️ The Weakest Link — Who struggled the most this week?",
+        options=options,
+        is_anonymous=False,
+        allows_multiple_answers=False,
     )
-    await bot.send_message(chat_id, text_i, reply_markup=_build_vote_kb("inspiration"))
+    if msg_w.poll:
+        POLL_META[msg_w.poll.id] = {
+            "kind": "weakest",
+            "chat_id": chat_id,
+            "options": options,
+        }
+
+    # 2) The Inspiration (non-anonymous, single choice)
+    msg_i = await bot.send_poll(
+        chat_id=chat_id,
+        question="🌟 The Inspiration — Who inspired the circle this week?",
+        options=options,
+        is_anonymous=False,
+        allows_multiple_answers=False,
+    )
+    if msg_i.poll:
+        POLL_META[msg_i.poll.id] = {
+            "kind": "inspiration",
+            "chat_id": chat_id,
+            "options": options,
+        }
+
 
 
 # Official command: ONLY /share_wisdom
@@ -778,6 +797,45 @@ async def help_cmd(msg: Message):
 async def vote_now_cmd(msg: Message):
     await send_weekly_vote_prompts(msg.chat.id)
     await msg.answer("🗳️ The weekly vote prompts have been posted.")
+
+@dp.poll_answer()
+async def handle_poll_vote(pa: PollAnswer):
+    poll_id = pa.poll_id
+    meta = POLL_META.get(poll_id)
+    if not meta:
+        return  # unknown/old poll (e.g., after restart)
+
+    option_ids = pa.option_ids or []
+    if not option_ids:
+        return  # user unchecked everything; ignore
+
+    idx = option_ids[0]
+    options = meta["options"]  # type: ignore
+    if idx < 0 or idx >= len(options):
+        return
+
+    player = options[idx]
+    kind = meta["kind"]  # 'weakest' or 'inspiration'
+    chat_id = meta["chat_id"]
+
+    # Record the vote (overwrites previous vote by same user this week)
+    week_key = _week_key_now()
+    user_id = pa.user.id
+    bucket = weakest_votes if kind == "weakest" else inspiration_votes
+    votes_map = _ensure_vote_map(bucket, chat_id, week_key)
+    votes_map[user_id] = player
+
+    voter_name = (pa.user.full_name or pa.user.first_name or pa.user.username or "Someone").strip()
+    safe_voter = html.escape(voter_name)
+    safe_player = html.escape(player)
+    label = "The Weakest Link" if kind == "weakest" else "The Inspiration"
+
+    # Public confirmation in the group (non-anonymous by design)
+    await bot.send_message(
+        chat_id,
+        f"🗳️ <b>{safe_voter}</b> voted <b>{safe_player}</b> as <i>{label}</i>."
+    )
+
 
 @dp.message(Command("enable_random"))
 async def enable_random_cmd(msg: Message):
@@ -938,6 +996,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
 
 
