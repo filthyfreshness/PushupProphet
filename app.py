@@ -9,6 +9,7 @@ from sqlalchemy.orm import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import select, update
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, PollAnswer
@@ -96,12 +97,6 @@ scheduler = AsyncIOScheduler(timezone=TZ)
 # ----------------- Database (Postgres/SQLite) -----------------
 DB_URL = os.getenv("DATABASE_URL", "").strip()
 
-def _append_sslmode_if_needed(url: str) -> str:
-    # For Neon/Railway/etc. ensure TLS; asyncpg honors sslmode in the DSN
-    if "sslmode=" in url:
-        return url
-    sep = "&" if "?" in url else "?"
-    return f"{url}{sep}sslmode=require"
 
 def _to_async_url(url: str) -> str:
     if not url:
@@ -196,11 +191,17 @@ async def incr_counter(chat_id: int, user_id: int, metric: str, delta: int = 1) 
         )
         await session.execute(stmt)
         await session.commit()
-# === names upsert/fetch (PASTE BELOW incr_counter) ===
+
+
+# === Helpers (single, canonical versions) =======================
+
 def _dialect_insert():
+    """Pick the right INSERT helper for Postgres vs SQLite."""
     return pg_insert if _is_pg_url(ASYNC_DB_URL) else sqlite_insert
 
+# ---- user name upsert / lookup ----
 async def upsert_username(chat_id: int, user_id: int, first_name: Optional[str], username: Optional[str]) -> None:
+    """Idempotently save/update a user's display info for this chat."""
     ins = _dialect_insert()(UserName).values(
         chat_id=chat_id,
         user_id=user_id,
@@ -208,111 +209,7 @@ async def upsert_username(chat_id: int, user_id: int, first_name: Optional[str],
         username=username or None,
     )
     stmt = ins.on_conflict_do_update(
-        index_elements=[UserName.chat_id.name, UserName.user_id.name],
-        set_={
-            "first_name": ins.excluded.first_name,
-            "username": ins.excluded.username,
-            "last_seen": func.now(),
-        },
-    )
-    async with AsyncSessionLocal() as s:
-        await s.execute(stmt)
-        await s.commit()
-
-async def name_for(chat_id: int, user_id: int) -> str:
-    async with AsyncSessionLocal() as s:
-        r = await s.execute(
-            select(UserName.first_name, UserName.username)
-            .where(UserName.chat_id == chat_id, UserName.user_id == user_id)
-        )
-        row = r.first()
-        if row:
-            fn, un = row
-            return fn or (f"@{un}" if un else f"user {user_id}")
-        return f"user {user_id}"
-
-# === per-chat AI toggle (PASTE RIGHT AFTER the name helpers) ===
-async def get_ai_enabled(chat_id: int) -> bool:
-    async with AsyncSessionLocal() as s:
-        row = await s.execute(
-            select(ChatSettings.ai_enabled).where(ChatSettings.chat_id == chat_id)
-        )
-        r = row.first()
-        return bool(r[0]) if r else False
-
-async def set_ai_enabled(chat_id: int, enabled: bool) -> None:
-    async with AsyncSessionLocal() as s:
-        exists = await s.execute(select(ChatSettings.chat_id).where(ChatSettings.chat_id == chat_id))
-        if exists.first():
-            await s.execute(
-                update(ChatSettings)
-                .where(ChatSettings.chat_id == chat_id)
-                .values(ai_enabled=enabled)
-            )
-        else:
-            s.add(ChatSettings(chat_id=chat_id, ai_enabled=enabled))
-        await s.commit()
-
-
-# === NEW: helpers to persist AI on/off per chat ===
-from sqlalchemy import select, update  # safe even if already imported above
-
-async def get_ai_enabled(chat_id: int) -> bool:
-    async with AsyncSessionLocal() as s:
-        res = await s.execute(
-            select(ChatSettings.ai_enabled).where(ChatSettings.chat_id == chat_id)
-        )
-        row = res.first()
-        return bool(row[0]) if row else False
-
-async def set_ai_enabled(chat_id: int, enabled: bool) -> None:
-    async with AsyncSessionLocal() as s:
-        # upsert behaviour
-        existing = await s.execute(
-            select(ChatSettings.chat_id).where(ChatSettings.chat_id == chat_id)
-        )
-        if existing.first():
-            await s.execute(
-                update(ChatSettings)
-                .where(ChatSettings.chat_id == chat_id)
-                .set({"ai_enabled": enabled})
-            )
-        else:
-            s.add(ChatSettings(chat_id=chat_id, ai_enabled=enabled))
-        await s.commit()
-
-# Handy read helpers (you'll use these soon)
-async def top_n(chat_id: int, metric: str, n: int = 10) -> List[Tuple[int, int]]:
-    async with AsyncSessionLocal() as s:
-        rows = await s.execute(
-            select(Counter.user_id, Counter.count)
-            .where(Counter.chat_id == chat_id, Counter.metric == metric)
-            .order_by(Counter.count.desc()).limit(n)
-        )
-        return rows.all()
-
-async def user_totals(chat_id: int, user_id: int) -> Dict[str, int]:
-    async with AsyncSessionLocal() as s:
-        rows = await s.execute(
-            select(Counter.metric, Counter.count)
-            .where(Counter.chat_id == chat_id, Counter.user_id == user_id)
-        )
-        return {m: c for (m, c) in rows.all()}
-
-def _dialect_insert():
-    # choose insert dialect for upsert depending on Postgres/SQLite
-    return pg_insert if ASYNC_DB_URL.startswith("postgresql+asyncpg://") else sqlite_insert
-
-async def upsert_username(chat_id: int, user_id: int, first_name: Optional[str], username: Optional[str]) -> None:
-    """Save/refresh a user's display info for this chat (idempotent upsert)."""
-    ins = _dialect_insert()(UserName).values(
-        chat_id=chat_id,
-        user_id=user_id,
-        first_name=(first_name or None),
-        username=(username or None),
-    )
-    stmt = ins.on_conflict_do_update(
-        index_elements=[UserName.chat_id, UserName.user_id],  # composite PK
+        index_elements=[UserName.chat_id.name, UserName.user_id.name],  # composite PK
         set_={
             "first_name": ins.excluded.first_name,
             "username":   ins.excluded.username,
@@ -339,8 +236,47 @@ async def name_for(chat_id: int, user_id: int) -> str:
                 return f"@{username}"
     return f"user {user_id}"
 
+# ---- per-chat AI toggle (uses portable UPSERT) ----
+async def get_ai_enabled(chat_id: int) -> bool:
+    async with AsyncSessionLocal() as s:
+        res = await s.execute(
+            select(ChatSettings.ai_enabled).where(ChatSettings.chat_id == chat_id)
+        )
+        row = res.first()
+        return bool(row[0]) if row else False
 
-# ---------------------------------------------------------------
+async def set_ai_enabled(chat_id: int, enabled: bool) -> None:
+    """Set AI on/off for a chat (UPSERT so it works whether row exists or not)."""
+    ins = _dialect_insert()(ChatSettings).values(chat_id=chat_id, ai_enabled=enabled)
+    stmt = ins.on_conflict_do_update(
+        index_elements=[ChatSettings.chat_id.name],
+        set_={"ai_enabled": enabled},
+    )
+    async with AsyncSessionLocal() as s:
+        await s.execute(stmt)
+        await s.commit()
+
+# ---- handy read helpers ----
+async def top_n(chat_id: int, metric: str, n: int = 10) -> List[Tuple[int, int]]:
+    async with AsyncSessionLocal() as s:
+        rows = await s.execute(
+            select(Counter.user_id, Counter.count)
+            .where(Counter.chat_id == chat_id, Counter.metric == metric)
+            .order_by(Counter.count.desc())
+            .limit(n)
+        )
+        return rows.all()
+
+async def user_totals(chat_id: int, user_id: int) -> Dict[str, int]:
+    async with AsyncSessionLocal() as s:
+        rows = await s.execute(
+            select(Counter.metric, Counter.count)
+            .where(Counter.chat_id == chat_id, Counter.user_id == user_id)
+        )
+        return {m: c for (m, c) in rows.all()}
+
+# ===============================================================
+
 
 random_jobs: Dict[int, Job] = {}
 
@@ -1300,6 +1236,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
