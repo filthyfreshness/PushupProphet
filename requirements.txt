@@ -3,4 +3,8 @@ APScheduler
 python-dotenv
 pytz
 fastapi
+
 uvicorn[standard]
+
+SQLAlchemy>=2.0
+asyncpg>=0.29
