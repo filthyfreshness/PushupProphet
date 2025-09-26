@@ -140,11 +140,6 @@ class ChatSettings(Base):
     # optional: track when last changed
     changed_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    __table_args__ = (
-        # Speeds up: WHERE chat_id=? AND metric=? ORDER BY count DESC
-        Index("ix_counters_chat_metric_count", "chat_id", "metric", "count"),
-    )
-
 import ssl
 ssl_ctx = None
 if ASYNC_DB_URL.startswith("postgresql+asyncpg://"):
@@ -1222,6 +1217,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
