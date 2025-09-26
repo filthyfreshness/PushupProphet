@@ -89,6 +89,22 @@ def schedule_random_daily(chat_id: int) -> None:
 # --- Player roster used by Weekly Prophecy AND Dice of Fate ---
 PLAYERS = ["Fresh", "Momo", "Valle", "Tän", "Hampa"]
 
+# ===== Weekly votes (non-anonymous) =====
+# In-memory, resets on restarts. Keys: chat_id -> week_key -> { user_id: player_name }
+weakest_votes: Dict[int, Dict[str, Dict[int, str]]] = {}
+inspiration_votes: Dict[int, Dict[str, Dict[int, str]]] = {}
+
+def _week_key_now() -> str:
+    """Return ISO week key in Stockholm time, e.g. '2025-W37'."""
+    now = dt.datetime.now(TZ)
+    iso = now.isocalendar()  # (year, week, weekday)
+    return f"{iso.year}-W{iso.week:02d}"
+
+def _ensure_vote_map(bucket: Dict[int, Dict[str, Dict[int, str]]], chat_id: int, week_key: str) -> Dict[int, str]:
+    by_chat = bucket.setdefault(chat_id, {})
+    return by_chat.setdefault(week_key, {})
+
+
 # ================== Quotes rotation (daily 07:00 + /share_wisdom) ==================
 QUOTES = [
     "“Gravity is my quill; with each rep I write strength upon your bones.”",
@@ -379,6 +395,40 @@ async def fate_roll(cb: CallbackQuery):
     else:
         await cb.message.answer(epic)
 
+@dp.callback_query(F.data.func(lambda d: isinstance(d, str) and d.startswith("vote:")))
+async def handle_weekly_vote(cb: CallbackQuery):
+    # Parse "vote:<kind>:<player>"
+    try:
+        _, kind, player = cb.data.split(":", 2)
+    except Exception:
+        return await cb.answer("Invalid vote.", show_alert=True)
+
+    if kind not in ("weakest", "inspiration"):
+        return await cb.answer("Unknown vote type.", show_alert=True)
+
+    week_key = _week_key_now()
+    chat_id = cb.message.chat.id
+    user_id = cb.from_user.id
+
+    # Record the vote (overwrites previous vote by same user this week)
+    bucket = weakest_votes if kind == "weakest" else inspiration_votes
+    votes_map = _ensure_vote_map(bucket, chat_id, week_key)
+    votes_map[user_id] = player
+
+    voter_name = (cb.from_user.full_name or cb.from_user.first_name or cb.from_user.username or "Someone").strip()
+    safe_voter = html.escape(voter_name)
+    safe_player = html.escape(player)
+
+    # Public confirmation (not anonymous)
+    if kind == "weakest":
+        msg = f"🗳️ <b>{safe_voter}</b> voted <b>{safe_player}</b> as <i>The Weakest Link</i>."
+    else:
+        msg = f"🗳️ <b>{safe_voter}</b> voted <b>{safe_player}</b> as <i>The Inspiration</i>."
+
+    await cb.answer("Vote recorded.")
+    await cb.message.answer(msg)
+
+
 # Handle the Hurricane random player selection
 @dp.callback_query(F.data == "hurricane:spin")
 async def hurricane_spin(cb: CallbackQuery):
@@ -609,6 +659,40 @@ async def _send_next_quote_to_chat(chat_id: int):
         return
     await bot.send_message(chat_id, html.escape(q))
 
+def _build_vote_kb(kind: str) -> InlineKeyboardMarkup:
+    """
+    kind: 'weakest' or 'inspiration'
+    callback_data format: vote:<kind>:<player>
+    """
+    buttons = []
+    row = []
+    for i, p in enumerate(PLAYERS, 1):
+        row.append(InlineKeyboardButton(text=p, callback_data=f"vote:{kind}:{p}"))
+        if i % 3 == 0:  # 3 buttons per row feels nice; tweak if you like
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+async def send_weekly_vote_prompts(chat_id: int):
+    # 1) Weakest Link
+    text_w = (
+        "🏷️ <b>The Weakest Link</b>\n"
+        "Cast your vote for who struggled the most this week.\n"
+        "Tap a name below to vote (not anonymous)."
+    )
+    await bot.send_message(chat_id, text_w, reply_markup=_build_vote_kb("weakest"))
+
+    # 2) The Inspiration
+    text_i = (
+        "🌟 <b>The Inspiration</b>\n"
+        "Cast your vote for who inspired the circle this week.\n"
+        "Tap a name below to vote (not anonymous)."
+    )
+    await bot.send_message(chat_id, text_i, reply_markup=_build_vote_kb("inspiration"))
+
+
 # Official command: ONLY /share_wisdom
 @dp.message(Command("share_wisdom"))
 async def share_wisdom_cmd(msg: Message):
@@ -688,6 +772,12 @@ async def start_cmd(msg: Message):
 @dp.message(Command("help"))
 async def help_cmd(msg: Message):
     await start_cmd(msg)
+
+# Trigger both "Inspiration" and "Weakest Link" vote prompts immediately
+@dp.message(Command("vote_now", "weekly_votes", "votes_now"))
+async def vote_now_cmd(msg: Message):
+    await send_weekly_vote_prompts(msg.chat.id)
+    await msg.answer("🗳️ The weekly vote prompts have been posted.")
 
 @dp.message(Command("enable_random"))
 async def enable_random_cmd(msg: Message):
@@ -815,6 +905,22 @@ async def on_startup():
                 )
                 logger.info(f"Scheduled daily quote (07:00) for chat {chat_id}")
 
+
+# Weekly votes every Sunday at 11:00 Stockholm (two messages back-to-back)
+
+scheduler.add_job(
+    send_weekly_vote_prompts,
+    "cron",
+    day_of_week="sun",
+    hour=11,
+    minute=0,
+    args=[chat_id],
+    id=f"weekly_votes_{chat_id}",
+    replace_existing=True,
+)
+logger.info(f"Scheduled weekly votes (Sun 11:00) for chat {chat_id}")
+
+
             except Exception as e:
                 logger.exception(f"Startup scheduling failed for chat {raw}: {e}")
 
@@ -833,5 +939,6 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
 
 
