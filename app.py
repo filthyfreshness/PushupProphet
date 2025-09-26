@@ -1,10 +1,16 @@
 import os, re, asyncio, logging, datetime as dt, random, html
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from pathlib import Path
 from collections import deque
 
 from fastapi import FastAPI, Response
 import uvicorn
+
+from sqlalchemy import Column, BigInteger, String, Integer
+from sqlalchemy.orm import declarative_base
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, PollAnswer
@@ -12,13 +18,17 @@ from aiogram.filters import Command, CommandStart
 from aiogram import F
 from aiogram.enums.parse_mode import ParseMode
 from aiogram.client.default import DefaultBotProperties
+
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.job import Job
 from pytz import timezone
 
+import httpx
+
 # Prevent accidental double-start inside the same process
 _started_polling = False
+BOT_ID: Optional[int] = None
 
 # --------- Load config ----------
 DOTENV_PATH = Path(__file__).with_name(".env")
@@ -30,6 +40,9 @@ if not BOT_TOKEN:
         f"ERROR: BOT_TOKEN missing. Add it as an environment variable on your host "
         f"or to {DOTENV_PATH} locally for testing."
     )
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
 TZ = timezone("Europe/Stockholm")
 DAILY_TEXT = "THE FORGIVENESS CHAIN BEGINS NOW. Lay down excuses and ascend. May the power of Push be with you."
@@ -45,6 +58,55 @@ _sysrand = random.SystemRandom()
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone=TZ)
+
+# ----------------- Database (Postgres/SQLite) -----------------
+DB_URL = os.getenv("DATABASE_URL", "").strip()
+
+def _to_async_url(url: str) -> str:
+    if not url:
+        return "sqlite+aiosqlite:///./local-dev.db"  # local dev fallback
+    if url.startswith("postgres://"):
+        url = "postgresql+asyncpg://" + url[len("postgres://"):]
+    elif url.startswith("postgresql://"):
+        url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+    return url
+
+ASYNC_DB_URL = _to_async_url(DB_URL)
+
+Base = declarative_base()
+
+class Counter(Base):
+    __tablename__ = "counters"
+    chat_id = Column(BigInteger, primary_key=True)
+    user_id = Column(BigInteger, primary_key=True)
+    metric  = Column(String(32), primary_key=True)  # "thanks" | "apology" | "insult" | "mention"
+    count   = Column(Integer, nullable=False, default=0)
+
+engine = create_async_engine(ASYNC_DB_URL, pool_pre_ping=True)
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+def _is_pg_url(async_url: str) -> bool:
+    return async_url.startswith("postgresql+asyncpg://")
+
+async def incr_counter(chat_id: int, user_id: int, metric: str, delta: int = 1) -> None:
+    """Atomic upsert: increase a user metric in a chat."""
+    async with AsyncSessionLocal() as session:
+        dialect_insert = pg_insert if _is_pg_url(ASYNC_DB_URL) else sqlite_insert
+        stmt = dialect_insert(Counter).values(
+            chat_id=chat_id, user_id=user_id, metric=metric, count=delta
+        )
+        # conflict target: composite PK
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[Counter.chat_id.name, Counter.user_id.name, Counter.metric.name],
+            set_={"count": Counter.count + delta},
+        )
+        await session.execute(stmt)
+        await session.commit()
+# ---------------------------------------------------------------
 
 random_jobs: Dict[int, Job] = {}
 
@@ -89,11 +151,6 @@ def schedule_random_daily(chat_id: int) -> None:
 # --- Player roster used by Weekly Prophecy AND Dice of Fate ---
 PLAYERS = ["Fresh", "Momo", "Valle", "Tän", "Hampa"]
 
-# Track active polls so we can attribute answers
-# poll_id -> {"kind": "weakest"|"inspiration", "chat_id": int, "options": List[str]}
-POLL_META: Dict[str, Dict] = {}
-
-
 # ===== Weekly votes (non-anonymous) =====
 # In-memory, resets on restarts. Keys: chat_id -> week_key -> { user_id: player_name }
 weakest_votes: Dict[int, Dict[str, Dict[int, str]]] = {}
@@ -102,17 +159,14 @@ inspiration_votes: Dict[int, Dict[str, Dict[int, str]]] = {}
 # Poll ID → { kind: 'weakest'|'inspiration', chat_id: int, options: [players] }
 POLL_META: Dict[str, Dict[str, object]] = {}
 
-
 def _week_key_now() -> str:
-    """Return ISO week key in Stockholm time, e.g. '2025-W37'."""
     now = dt.datetime.now(TZ)
-    iso = now.isocalendar()  # (year, week, weekday)
+    iso = now.isocalendar()
     return f"{iso.year}-W{iso.week:02d}"
 
 def _ensure_vote_map(bucket: Dict[int, Dict[str, Dict[int, str]]], chat_id: int, week_key: str) -> Dict[int, str]:
     by_chat = bucket.setdefault(chat_id, {})
     return by_chat.setdefault(week_key, {})
-
 
 # ================== Quotes rotation (daily 07:00 + /share_wisdom) ==================
 QUOTES = [
@@ -218,7 +272,6 @@ QUOTES = [
     "“Raise your standards before you raise your reps.”",
 ]
 
-# Per-chat rotation state: each chat_id has a deque of randomized quote indices.
 _quote_rotation: Dict[int, deque] = {}
 
 def _init_quote_rotation(chat_id: int) -> None:
@@ -248,18 +301,17 @@ async def send_daily_quote(chat_id: int):
 
 # ================== DICE OF FATE ==================
 
-# New weights (sum to 100)
 FATE_WEIGHTS = [
-    ("miracle",         3),  # 3%
-    ("mercy_coin",      6),  # 6%
-    ("trial_form",     10),  # 10%
-    ("command_prophet",10),  # 10%
-    ("giver",          12),  # 12%  (renamed from shared_burden)
-    ("hurricane",      10),  # 10%
-    ("oath_dawn",      16),  # 16%
-    ("trial_flesh",    15),  # 15%
-    ("tribute_blood",  15),  # 15%
-    ("wrath",           3),  # 3%
+    ("miracle",         3),
+    ("mercy_coin",      6),
+    ("trial_form",     10),
+    ("command_prophet",10),
+    ("giver",          12),
+    ("hurricane",      10),
+    ("oath_dawn",      16),
+    ("trial_flesh",    15),
+    ("tribute_blood",  15),
+    ("wrath",           3),
 ]
 
 def _pick_fate_key() -> str:
@@ -282,7 +334,6 @@ FATE_RULES_TEXT = (
     "(3%) — ⚡ <b>Prophet’s Wrath</b> — Double your debt"
 )
 
-# Per-chat in-memory limiter: {chat_id: (date, set(user_id))}
 _fate_rolls: Dict[int, tuple[dt.date, set[int]]] = {}
 
 def _today_stockholm_date() -> dt.date:
@@ -311,7 +362,6 @@ def _fate_epic_text(key: str, target_name: Optional[str] = None) -> str:
         "The wind keeps the tally; choose well.",
     ]
     end = _sysrand.choice(closers)
-
     texts = {
         "miracle": (
             "✨ <b>The Miracle</b>\n"
@@ -360,7 +410,6 @@ def _fate_epic_text(key: str, target_name: Optional[str] = None) -> str:
     }
     return texts.get(key, "The die rolls into shadow.") + f"\n\n<i>{end}</i>"
 
-# --- /fate command & flow ---
 @dp.message(Command("fate", "dice", "dice_of_fate"))
 async def fate_cmd(msg: Message):
     await msg.answer("“You dare summon the Dice of Fate. The air trembles with judgment.”")
@@ -386,17 +435,14 @@ async def fate_roll(cb: CallbackQuery):
     _fate_mark_rolled(chat_id, user_id)
     fate_key = _pick_fate_key()
 
-    # If the fate is The Giver, pick a random player from roster
     target = None
     if fate_key == "giver":
         target = _sysrand.choice(PLAYERS) if PLAYERS else None
 
     epic = _fate_epic_text(fate_key, target_name=target)
-
-    await cb.answer()  # stop the inline-button spinner
+    await cb.answer()
 
     if fate_key == "hurricane":
-        # Add a button to select a random player for the 10% shift
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="🎯 Select random player", callback_data="hurricane:spin")
         ]])
@@ -404,31 +450,8 @@ async def fate_roll(cb: CallbackQuery):
     else:
         await cb.message.answer(epic)
 
-
-
-    # Record the vote (overwrites previous vote by same user this week)
-    bucket = weakest_votes if kind == "weakest" else inspiration_votes
-    votes_map = _ensure_vote_map(bucket, chat_id, week_key)
-    votes_map[user_id] = player
-
-    voter_name = (cb.from_user.full_name or cb.from_user.first_name or cb.from_user.username or "Someone").strip()
-    safe_voter = html.escape(voter_name)
-    safe_player = html.escape(player)
-
-    # Public confirmation (not anonymous)
-    if kind == "weakest":
-        msg = f"🗳️ <b>{safe_voter}</b> voted <b>{safe_player}</b> as <i>The Weakest Link</i>."
-    else:
-        msg = f"🗳️ <b>{safe_voter}</b> voted <b>{safe_player}</b> as <i>The Inspiration</i>."
-
-    await cb.answer("Vote recorded.")
-    await cb.message.answer(msg)
-
-
-# Handle the Hurricane random player selection
 @dp.callback_query(F.data == "hurricane:spin")
 async def hurricane_spin(cb: CallbackQuery):
-    # Try to avoid picking the invoker themself if their first_name matches a PLAYERS entry.
     invoker = (cb.from_user.first_name or "").strip()
     candidates = [p for p in PLAYERS if p.lower() != invoker.lower()] or PLAYERS
     if not candidates:
@@ -441,11 +464,11 @@ async def hurricane_spin(cb: CallbackQuery):
         f"Shift <b>10%</b> of your debt to them. Order is restored."
     )
 
-# Natural-language trigger to summon the Dice of Fate (no slash)
 FATE_SUMMON_RE = re.compile(
     r"\b(?:dice\s+of\s+fate|summon(?:\s+the)?\s+dice(?:\s+of\s+fate)?|fate\s+dice|roll\s+the\s+dice\s+of\s+fate)\b",
     re.IGNORECASE
 )
+
 @dp.message(F.text.func(lambda t: isinstance(t, str)
                         and not t.strip().startswith("/")
                         and FATE_SUMMON_RE.search(t)))
@@ -457,7 +480,7 @@ async def fate_natural(msg: Message):
     await msg.answer("“You dare summon the Dice of Fate. The air trembles with judgment.”")
     await msg.answer(FATE_RULES_TEXT, reply_markup=kb)
 
-# ================== Gratitude / Blessings (5% favor, anti-abuse) ==================
+# ================== Gratitude / Blessings ==================
 BLESSINGS = [
     "Your thanks is heard, {name}. May your shoulders carry light burdens and your will grow heavy with resolve.",
     "Gratitude received, {name}. Walk with steady breath; strength will meet you there.",
@@ -479,12 +502,10 @@ BLESSINGS = [
 def _compose_blessing(user_name: Optional[str]) -> str:
     safe = html.escape(user_name or "friend")
     base = _sysrand.choice(BLESSINGS).format(name=safe)
-    # 5% chance of a small gift
     if _sysrand.random() < 0.05:
         base += "\n\n🪙 <b>Favor of Gratitude</b> — Deduct <b>20 kr</b> from your debt for your loyalty."
     return base
 
-# --- Anti-abuse limiter for gratitude (per-user, per-day) ---
 _gratitude_uses: Dict[int, tuple[dt.date, int]] = {}
 
 def _gratitude_inc_and_get(user_id: int) -> int:
@@ -504,10 +525,15 @@ def _compose_gratitude_penalty(user_name: Optional[str]) -> str:
         f"<b>Edict:</b> Lay <b>10 kr</b> in the pot and return with a steadier heart."
     )
 
-# Natural-language thanks (thanks/thank you/thx/ty/tack/tack så mycket)
 THANKS_RE = re.compile(r"\b(thank(?:\s*you)?|thanks|thx|ty|tack(?:\s*så\s*mycket)?)\b", re.IGNORECASE)
+
 @dp.message(F.text.func(lambda t: isinstance(t, str) and not t.strip().startswith("/") and THANKS_RE.search(t)))
 async def thanks_plain(msg: Message):
+    try:
+        await incr_counter(msg.chat.id, msg.from_user.id, "thanks", 1)
+    except Exception:
+        logger.exception("Failed to log 'thanks' counter")
+
     attempts = _gratitude_inc_and_get(msg.from_user.id)
     name = getattr(msg.from_user, "first_name", None)
     if attempts > 5:
@@ -515,7 +541,7 @@ async def thanks_plain(msg: Message):
     else:
         await msg.answer(_compose_blessing(name))
 
-# ================== Apologies / Absolution (kind but stern) ==================
+# ================== Apologies / Absolution ==================
 APOLOGY_RE = re.compile(
     r"\b("
     r"sorry|i\s*(?:am|’m|'m)\s*sorry|i\s*apolog(?:ise|ize)|apologies|apology|"
@@ -556,20 +582,21 @@ def _compose_absolution(user_name: Optional[str]) -> str:
                         and not t.strip().startswith("/")
                         and APOLOGY_RE.search(t)))
 async def apology_reply(msg: Message):
+    try:
+        await incr_counter(msg.chat.id, msg.from_user.id, "apology", 1)
+    except Exception:
+        logger.exception("Failed to log 'apology' counter")
+
     text = _compose_absolution(getattr(msg.from_user, "first_name", None))
     await msg.answer(text)
 
-# === Negativity / insult watcher (expanded + normalized) ===
-
+# === Negativity / insult watcher ===
 def _normalize_text(t: str) -> str:
-    # Drop zero-width and bidi control chars, lower-case
     t = re.sub(r"[\u200b-\u200f\u202a-\u202e]", "", t or "")
     return t.lower()
 
-# Names/mentions that should count as addressing the bot
 MENTION_RE = r"(?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b)"
 
-# Common insult lexicon (word forms, some obfuscations)
 INSULT_WORDS = (
     r"(?:"
     r"fuck(?:ing|er|ed)?|f\*+ck|f\W*u\W*c\W*k|"
@@ -580,7 +607,6 @@ INSULT_WORDS = (
     r")"
 )
 
-# Direct 2nd-person insults (don’t require a prophet mention)
 DIRECT_2P = (
     r"(?:"
     r"fuck\s*(?:you|u|ya)|"
@@ -592,15 +618,15 @@ DIRECT_2P = (
 
 INSULT_RE = re.compile(
     rf"""
-    (?:                                 # 1) Mention + insult (either order)
+    (?:
         (?:{MENTION_RE}).*?(?:{INSULT_WORDS})
         |
         (?:{INSULT_WORDS}).*?(?:{MENTION_RE})
     )
     |
-    (?:{DIRECT_2P})                      # 2) Direct second-person insults
+    (?:{DIRECT_2P})
     |
-    (?:                                 # 3) Strong catch-alls
+    (?:
         fuck\s*this\s*shit
         | fuck(?:ing)?\s+bull\W*shit
         | (?:bull\W*shit|bullsh\*?t)\s*(?:prophet|bot|push\s*up\s*prophet)
@@ -633,7 +659,6 @@ REBUKES = [
 def _compose_rebuke(user_name: Optional[str]) -> str:
     safe = html.escape(user_name or "traveler")
     base = _sysrand.choice(REBUKES).format(name=safe)
-    # 10% chance of a 20 kr penance
     if _sysrand.random() < 0.10:
         base += "\n\n<b>Edict:</b> Lay <b>20 kr</b> in the pot as penance for disrespect."
     return base
@@ -642,10 +667,12 @@ def _compose_rebuke(user_name: Optional[str]) -> str:
                         and INSULT_RE.search(_normalize_text(t))
                         and not APOLOGY_RE.search(t)))
 async def prophet_insult_rebuke(msg: Message):
+    try:
+        await incr_counter(msg.chat.id, msg.from_user.id, "insult", 1)
+    except Exception:
+        logger.exception("Failed to log 'insult' counter")
     text = _compose_rebuke(getattr(msg.from_user, "first_name", None))
     await msg.answer(text)
-# === end insult watcher ===
-
 
 # --- Helpers for sending the next quote ---
 async def _send_next_quote_to_chat(chat_id: int):
@@ -656,31 +683,16 @@ async def _send_next_quote_to_chat(chat_id: int):
     await bot.send_message(chat_id, html.escape(q))
 
 def _build_vote_kb(kind: str) -> InlineKeyboardMarkup:
-    """
-    kind: 'weakest' or 'inspiration'
-    callback_data format: vote:<kind>:<player>
-    """
-    buttons = []
-    row = []
+    buttons, row = [], []
     for i, p in enumerate(PLAYERS, 1):
         row.append(InlineKeyboardButton(text=p, callback_data=f"vote:{kind}:{p}"))
-        if i % 3 == 0:  # 3 buttons per row feels nice; tweak if you like
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
+        if i % 3 == 0:
+            buttons.append(row); row = []
+    if row: buttons.append(row)
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def send_weekly_vote_prompts(chat_id: int):
-    """
-    Sends two non-anonymous polls back-to-back:
-      1) The Weakest Link
-      2) The Inspiration
-    Records poll metadata so we can capture votes via @dp.poll_answer().
-    """
-    options = list(PLAYERS)  # keep order stable
-
-    # 1) Weakest Link (non-anonymous, single choice)
+    options = list(PLAYERS)
     msg_w = await bot.send_poll(
         chat_id=chat_id,
         question="🏷️ The Weakest Link — Who struggled the most this week?",
@@ -689,13 +701,8 @@ async def send_weekly_vote_prompts(chat_id: int):
         allows_multiple_answers=False,
     )
     if msg_w.poll:
-        POLL_META[msg_w.poll.id] = {
-            "kind": "weakest",
-            "chat_id": chat_id,
-            "options": options,
-        }
+        POLL_META[msg_w.poll.id] = {"kind": "weakest", "chat_id": chat_id, "options": options}
 
-    # 2) The Inspiration (non-anonymous, single choice)
     msg_i = await bot.send_poll(
         chat_id=chat_id,
         question="🌟 The Inspiration — Who inspired the circle this week?",
@@ -704,20 +711,12 @@ async def send_weekly_vote_prompts(chat_id: int):
         allows_multiple_answers=False,
     )
     if msg_i.poll:
-        POLL_META[msg_i.poll.id] = {
-            "kind": "inspiration",
-            "chat_id": chat_id,
-            "options": options,
-        }
+        POLL_META[msg_i.poll.id] = {"kind": "inspiration", "chat_id": chat_id, "options": options}
 
-
-
-# Official command: ONLY /share_wisdom
 @dp.message(Command("share_wisdom"))
 async def share_wisdom_cmd(msg: Message):
     await _send_next_quote_to_chat(msg.chat.id)
 
-# Natural-language trigger for asking wisdom (no slash)
 _WISDOM_PATTERNS = [
     r"\bshare\s+wisdom\b",
     r"\bgive\s+(?:me\s+)?wisdom\b",
@@ -738,7 +737,6 @@ def _matches_wisdom_nat(t: str) -> bool:
 async def share_wisdom_natural(msg: Message):
     await _send_next_quote_to_chat(msg.chat.id)
 
-# Fallback for people who type `/share wisdom`
 @dp.message(F.text.func(lambda t: isinstance(t, str) and t.strip().lower().startswith("/share wisdom")))
 async def share_wisdom_space_alias(msg: Message):
     await _send_next_quote_to_chat(msg.chat.id)
@@ -754,6 +752,7 @@ SUMMON_RESPONSES = [
     "I rise where I’m named. What truth do you seek?",
 ]
 SUMMON_PATTERN = re.compile(r"\b(pushup\s*prophet|prophet)\b", re.IGNORECASE)
+
 @dp.message(F.text.func(lambda t: isinstance(t, str)
                         and not t.strip().startswith("/")
                         and SUMMON_PATTERN.search(t)
@@ -761,15 +760,17 @@ SUMMON_PATTERN = re.compile(r"\b(pushup\s*prophet|prophet)\b", re.IGNORECASE)
                         and not _matches_wisdom_nat(t)
                         and not APOLOGY_RE.search(t)))
 async def summon_reply(msg: Message):
+    try:
+        await incr_counter(msg.chat.id, msg.from_user.id, "mention", 1)
+    except Exception:
+        logger.exception("Failed to log 'mention' counter")
     await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
 
 # --------- Other Handlers ----------
-# Primary: works for /chatid and /chatid@pushupprophetbot
 @dp.message(Command("chatid"))
 async def chatid_cmd(msg: Message):
     await msg.answer(f"Chat ID: <code>{msg.chat.id}</code>")
 
-# Fallback: catches odd variations like trailing spaces, mentions, etc.
 @dp.message(F.text.func(lambda t: isinstance(t, str) and t.strip().lower().startswith(("/chatid", "/chatid@"))))
 async def chatid_fallback(msg: Message):
     await msg.answer(f"Chat ID: <code>{msg.chat.id}</code>")
@@ -792,7 +793,6 @@ async def start_cmd(msg: Message):
 async def help_cmd(msg: Message):
     await start_cmd(msg)
 
-# Trigger both "Inspiration" and "Weakest Link" vote prompts immediately
 @dp.message(Command("vote_now", "weekly_votes", "votes_now"))
 async def vote_now_cmd(msg: Message):
     await send_weekly_vote_prompts(msg.chat.id)
@@ -803,22 +803,17 @@ async def handle_poll_vote(pa: PollAnswer):
     poll_id = pa.poll_id
     meta = POLL_META.get(poll_id)
     if not meta:
-        return  # unknown/old poll (e.g., after restart)
-
+        return
     option_ids = pa.option_ids or []
     if not option_ids:
-        return  # user unchecked everything; ignore
-
+        return
     idx = option_ids[0]
-    options = meta["options"]  # type: ignore
+    options: List[str] = meta["options"]  # type: ignore
     if idx < 0 or idx >= len(options):
         return
-
     player = options[idx]
-    kind = meta["kind"]  # 'weakest' or 'inspiration'
+    kind = meta["kind"]            # 'weakest' or 'inspiration'
     chat_id = meta["chat_id"]
-
-    # Record the vote (overwrites previous vote by same user this week)
     week_key = _week_key_now()
     user_id = pa.user.id
     bucket = weakest_votes if kind == "weakest" else inspiration_votes
@@ -829,13 +824,7 @@ async def handle_poll_vote(pa: PollAnswer):
     safe_voter = html.escape(voter_name)
     safe_player = html.escape(player)
     label = "The Weakest Link" if kind == "weakest" else "The Inspiration"
-
-    # Public confirmation in the group (non-anonymous by design)
-    await bot.send_message(
-        chat_id,
-        f"🗳️ <b>{safe_voter}</b> voted <b>{safe_player}</b> as <i>{label}</i>."
-    )
-
+    await bot.send_message(chat_id, f"🗳️ <b>{safe_voter}</b> voted <b>{safe_player}</b> as <i>{label}</i>.")
 
 @dp.message(Command("enable_random"))
 async def enable_random_cmd(msg: Message):
@@ -846,10 +835,8 @@ async def enable_random_cmd(msg: Message):
 async def disable_random_cmd(msg: Message):
     job = random_jobs.pop(msg.chat.id, None)
     if job:
-        try:
-            job.remove()
-        except Exception:
-            pass
+        try: job.remove()
+        except Exception: pass
         await msg.answer("🛑 Forgiveness Chain disabled for this chat.")
     else:
         await msg.answer("It wasn’t enabled for this chat.")
@@ -875,8 +862,7 @@ async def roll_cmd(msg: Message):
 
     m = DICE_RE.match(arg)
     if m:
-        count = int(m.group(1))
-        sides = int(m.group(2))
+        count = int(m.group(1)); sides = int(m.group(2))
         if count < 1 or sides < 1:
             return await msg.answer("Use positive integers, e.g., /roll 1d5")
         if count == 1:
@@ -888,6 +874,82 @@ async def roll_cmd(msg: Message):
         return await msg.answer(f"🎲 {count}d{sides} → [{rolls_str}]  |  Sum: <b>{total}</b>")
 
     return await msg.answer("Usage:\n/roll 1d5  (→ 1..5)\n/roll 6    (→ 1..6)\n/roll 3d6  (→ three 1..6 rolls + sum)")
+
+# --------- Minimal AI Layer ---------
+PROPHET_SYSTEM = (
+    "You are the Pushup Prophet: wise, concise, kind but stern, poetic but practical. "
+    "Keep replies short for group chat. Offer form cues, consistency rituals, and supportive accountability. "
+    "Avoid medical claims. Stay on-topic; if off-topic, gently steer back to training, habits, or group rituals."
+)
+
+# simple per-user cooldown (seconds)
+_AI_COOLDOWN_S = int(os.getenv("AI_COOLDOWN_S", "15"))
+_last_ai_reply_at: Dict[int, float] = {}
+
+def _cooldown_ok(user_id: int) -> bool:
+    now = dt.datetime.now().timestamp()
+    last = _last_ai_reply_at.get(user_id, 0.0)
+    if now - last >= _AI_COOLDOWN_S:
+        _last_ai_reply_at[user_id] = now
+        return True
+    return False
+
+async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL) -> str:
+    if not OPENAI_API_KEY:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                json={
+                    "model": model,
+                    "messages": [{"role": "system", "content": system}] + messages,
+                    "temperature": 0.6,
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+            return (data["choices"][0]["message"]["content"] or "").strip()
+    except Exception as e:
+        logger.warning(f"AI call failed: {e}")
+        return ""
+
+def should_ai_reply(msg: Message) -> bool:
+    t = (msg.text or "").strip()
+    if not t:
+        return False
+    if t.startswith("/"):
+        return False
+    # Skip if any of these have their own handlers (avoid double replies)
+    if THANKS_RE.search(t) or APOLOGY_RE.search(t) or INSULT_RE.search(_normalize_text(t)) \
+       or FATE_SUMMON_RE.search(t) or _matches_wisdom_nat(t):
+        return False
+    # True if mentioning the Prophet explicitly or replying to the bot
+    if SUMMON_PATTERN.search(t):
+        return True
+    if msg.reply_to_message and msg.reply_to_message.from_user and BOT_ID and msg.reply_to_message.from_user.id == BOT_ID:
+        return True
+    # Small chance for general help words
+    if re.search(r"\b(help|advice|how do i|what should i)\b", t, re.IGNORECASE) and _sysrand.random() < 0.07:
+        return True
+    return False
+
+@dp.message(F.text)
+async def ai_catchall(msg: Message):
+    try:
+        if not should_ai_reply(msg):
+            return
+        if not _cooldown_ok(msg.from_user.id):
+            return
+        name = getattr(msg.from_user, "first_name", "") or (msg.from_user.username or "friend")
+        user_text = msg.text or ""
+        messages = [{"role": "user", "content": f"{name}: {user_text}"}]
+        reply = await ai_reply(PROPHET_SYSTEM, messages)
+        if reply:
+            await msg.answer(reply)
+    except Exception:
+        logger.exception("AI reply failed")
 
 # --------- Run bot + web server together ----------
 app = FastAPI()
@@ -910,14 +972,14 @@ async def run_bot():
     logger.info("Scheduler started")
     await dp.start_polling(bot)
 
-
 @app.on_event("startup")
 async def on_startup():
-    # Identify the bot and log it early
+    global BOT_ID
     try:
         me = await bot.get_me()
+        BOT_ID = me.id
         logger.info(f"Bot authorized: @{me.username} (id={me.id})")
-    except Exception as e:
+    except Exception:
         logger.exception("get_me failed. Is BOT_TOKEN correct?")
         raise
 
@@ -936,9 +998,17 @@ async def on_startup():
     else:
         logger.error("Could not clear webhook after multiple attempts. Polling may not receive updates.")
 
+    # --- DB init ---
+    try:
+        await init_db()
+        logger.info("Database initialized and ready.")
+    except Exception:
+        logger.exception("Database init failed.")
+        raise
+
     asyncio.create_task(run_bot())  # start Telegram bot loop
 
-    # Auto-enable daily schedule for groups listed in env var
+    # Auto-enable schedules for groups
     ids = os.getenv("GROUP_CHAT_IDS", "").strip()
     if ids:
         for raw in ids.split(","):
@@ -947,39 +1017,24 @@ async def on_startup():
                 continue
             try:
                 chat_id = int(raw)
-
-                # Forgiveness Chain daily random-time window (+1h follow-up)
                 schedule_random_daily(chat_id)
                 logger.info(f"Auto-enabled Forgiveness Chain for chat {chat_id}")
 
-                # Daily quotes at 07:00 Stockholm
                 scheduler.add_job(
-                    send_daily_quote,
-                    "cron",
-                    hour=7,
-                    minute=0,
-                    args=[chat_id],
-                    id=f"daily_quote_{chat_id}",
-                    replace_existing=True,
+                    send_daily_quote, "cron",
+                    hour=7, minute=0, args=[chat_id],
+                    id=f"daily_quote_{chat_id}", replace_existing=True,
                 )
                 logger.info(f"Scheduled daily quote (07:00) for chat {chat_id}")
 
-                # Weekly votes every Sunday at 11:00 Stockholm (two messages back-to-back)
                 scheduler.add_job(
-                    send_weekly_vote_prompts,
-                    "cron",
-                    day_of_week="sun",
-                    hour=11,
-                    minute=0,
-                    args=[chat_id],
-                    id=f"weekly_votes_{chat_id}",
-                    replace_existing=True,
+                    send_weekly_vote_prompts, "cron",
+                    day_of_week="sun", hour=11, minute=0, args=[chat_id],
+                    id=f"weekly_votes_{chat_id}", replace_existing=True,
                 )
                 logger.info(f"Scheduled weekly votes (Sun 11:00) for chat {chat_id}")
-
             except Exception as e:
                 logger.exception(f"Startup scheduling failed for chat {raw}: {e}")
-
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -991,13 +1046,11 @@ async def on_shutdown():
         await bot.session.close()
     except Exception:
         pass
+    try:
+        await engine.dispose()
+    except Exception:
+        pass
 
-# If you want to run locally:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
-
-
-
-
-
