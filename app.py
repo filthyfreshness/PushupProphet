@@ -129,6 +129,17 @@ class Counter(Base):
     metric  = Column(String(32), primary_key=True)  # "thanks" | "apology" | "insult" | "mention"
     count   = Column(Integer, nullable=False, default=0)
 
+# === NEW: per-chat AI toggle settings ===
+from sqlalchemy import Boolean  # (import is safe even if already present)
+from sqlalchemy import DateTime, func  # harmless if already imported elsewhere
+
+class ChatSettings(Base):
+    __tablename__ = "chat_settings"
+    chat_id   = Column(BigInteger, primary_key=True)
+    ai_enabled = Column(Boolean, nullable=False, default=False)
+    # optional: track when last changed
+    changed_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
     __table_args__ = (
         # Speeds up: WHERE chat_id=? AND metric=? ORDER BY count DESC
         Index("ix_counters_chat_metric_count", "chat_id", "metric", "count"),
@@ -176,6 +187,33 @@ async def incr_counter(chat_id: int, user_id: int, metric: str, delta: int = 1) 
         )
         await session.execute(stmt)
         await session.commit()
+
+# === NEW: helpers to persist AI on/off per chat ===
+from sqlalchemy import select, update  # safe even if already imported above
+
+async def get_ai_enabled(chat_id: int) -> bool:
+    async with AsyncSessionLocal() as s:
+        res = await s.execute(
+            select(ChatSettings.ai_enabled).where(ChatSettings.chat_id == chat_id)
+        )
+        row = res.first()
+        return bool(row[0]) if row else False
+
+async def set_ai_enabled(chat_id: int, enabled: bool) -> None:
+    async with AsyncSessionLocal() as s:
+        # upsert behaviour
+        existing = await s.execute(
+            select(ChatSettings.chat_id).where(ChatSettings.chat_id == chat_id)
+        )
+        if existing.first():
+            await s.execute(
+                update(ChatSettings)
+                .where(ChatSettings.chat_id == chat_id)
+                .set({"ai_enabled": enabled})
+            )
+        else:
+            s.add(ChatSettings(chat_id=chat_id, ai_enabled=enabled))
+        await s.commit()
 
 # Handy read helpers (you'll use these soon)
 async def top_n(chat_id: int, metric: str, n: int = 10) -> List[Tuple[int, int]]:
@@ -856,6 +894,22 @@ async def start_cmd(msg: Message):
 async def help_cmd(msg: Message):
     await start_cmd(msg)
 
+# === NEW: AI control commands ===
+@dp.message(Command("enable_ai"))
+async def enable_ai_cmd(msg: Message):
+    await set_ai_enabled(msg.chat.id, True)
+    await msg.answer("🤖 AI replies enabled for this chat.")
+
+@dp.message(Command("disable_ai"))
+async def disable_ai_cmd(msg: Message):
+    await set_ai_enabled(msg.chat.id, False)
+    await msg.answer("🛑 AI replies disabled for this chat.")
+
+@dp.message(Command("ai_status"))
+async def ai_status_cmd(msg: Message):
+    enabled = await get_ai_enabled(msg.chat.id)
+    await msg.answer(f"AI status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
+
 @dp.message(Command("vote_now", "weekly_votes", "votes_now"))
 async def vote_now_cmd(msg: Message):
     await send_weekly_vote_prompts(msg.chat.id)
@@ -992,19 +1046,25 @@ def should_ai_reply(msg: Message) -> bool:
 @dp.message(F.text)
 async def ai_catchall(msg: Message):
     try:
+        # Only reply if AI is enabled for this chat
+        if not await get_ai_enabled(msg.chat.id):
+            return
+
         if not should_ai_reply(msg):
             return
         if not _cooldown_ok(msg.from_user.id):
             return
+
         name = getattr(msg.from_user, "first_name", "") or (msg.from_user.username or "friend")
         user_text = msg.text or ""
         messages = [{"role": "user", "content": f"{name}: {user_text}"}]
         reply = await ai_reply(PROPHET_SYSTEM, messages)
         if reply:
-            # IMPORTANT: Avoid HTML parsing for model output
-            await msg.answer(reply, parse_mode=None)
+            # IMPORTANT: send as plain text to avoid HTML/Markdown parsing issues
+            await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
     except Exception:
         logger.exception("AI reply failed")
+
 
 # --------- Run bot + web server together ----------
 
@@ -1150,5 +1210,6 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
