@@ -749,21 +749,28 @@ def _compose_rebuke(user_name: Optional[str]) -> str:
     return base
 
 @dp.message(F.text.func(lambda t: isinstance(t, str)
-                        and INSULT_RE.search(_normalize_text(t))
+                        and not t.strip().startswith("/")
+                        and SUMMON_PATTERN.search(t)
+                        and not THANKS_RE.search(t)
+                        and not _matches_wisdom_nat(t)
                         and not APOLOGY_RE.search(t)))
-async def prophet_insult_rebuke(msg: Message):
+async def summon_reply(msg: Message):
+    # If AI is enabled for this chat, let the AI catch-all handle it instead of canned lines
+    if await get_ai_enabled(msg.chat.id):
+        # still count the mention metric
+        try:
+            await incr_counter(msg.chat.id, msg.from_user.id, "mention", 1)
+        except Exception:
+            logger.exception("Failed to log 'mention' counter")
+        return
+
+    # (AI disabled) → keep old behavior
     try:
-        await upsert_username(
-            msg.chat.id,
-            msg.from_user.id,
-            getattr(msg.from_user, "first_name", None),
-            getattr(msg.from_user, "username", None),
-        )
-        await incr_counter(msg.chat.id, msg.from_user.id, "insult", 1)
+        await incr_counter(msg.chat.id, msg.from_user.id, "mention", 1)
     except Exception:
-        logger.exception("Failed to log 'insult' counter")
-    text = _compose_rebuke(getattr(msg.from_user, "first_name", None))
-    await msg.answer(text)
+        logger.exception("Failed to log 'mention' counter")
+    await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
+
 
 # --- Helpers for sending the next quote ---
 async def _send_next_quote_to_chat(chat_id: int):
@@ -907,6 +914,11 @@ async def disable_ai_cmd(msg: Message):
 
 @dp.message(Command("ai_status"))
 async def ai_status_cmd(msg: Message):
+    enabled = await get_ai_enabled(msg.chat.id)
+    await msg.answer(f"AI status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
+
+@dp.message(F.text.func(lambda t: isinstance(t, str) and t.strip().lower().startswith(("/ai_status", "/ai_status@"))))
+async def ai_status_fallback(msg: Message):
     enabled = await get_ai_enabled(msg.chat.id)
     await msg.answer(f"AI status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
 
@@ -1210,6 +1222,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
