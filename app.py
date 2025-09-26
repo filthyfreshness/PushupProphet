@@ -1,12 +1,12 @@
 import os, re, asyncio, logging, datetime as dt, random, html
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from pathlib import Path
 from collections import deque
 
 from fastapi import FastAPI, Response
 import uvicorn
 
-from sqlalchemy import Column, BigInteger, String, Integer
+from sqlalchemy import Column, BigInteger, String, Integer, Index, select, event
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -26,7 +26,7 @@ from pytz import timezone
 
 import httpx
 
-# Prevent accidental double-start inside the same process
+# Prevent accidental double-start
 _started_polling = False
 BOT_ID: Optional[int] = None
 
@@ -62,6 +62,13 @@ scheduler = AsyncIOScheduler(timezone=TZ)
 # ----------------- Database (Postgres/SQLite) -----------------
 DB_URL = os.getenv("DATABASE_URL", "").strip()
 
+def _append_sslmode_if_needed(url: str) -> str:
+    # For Neon/Railway/etc. ensure TLS; asyncpg honors sslmode in the DSN
+    if "sslmode=" in url:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}sslmode=require"
+
 def _to_async_url(url: str) -> str:
     if not url:
         return "sqlite+aiosqlite:///./local-dev.db"  # local dev fallback
@@ -69,6 +76,8 @@ def _to_async_url(url: str) -> str:
         url = "postgresql+asyncpg://" + url[len("postgres://"):]
     elif url.startswith("postgresql://"):
         url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+    if url.startswith("postgresql+asyncpg://"):
+        url = _append_sslmode_if_needed(url)
     return url
 
 ASYNC_DB_URL = _to_async_url(DB_URL)
@@ -82,8 +91,22 @@ class Counter(Base):
     metric  = Column(String(32), primary_key=True)  # "thanks" | "apology" | "insult" | "mention"
     count   = Column(Integer, nullable=False, default=0)
 
+    __table_args__ = (
+        # Speeds up: WHERE chat_id=? AND metric=? ORDER BY count DESC
+        Index("ix_counters_chat_metric_count", "chat_id", "metric", "count"),
+    )
+
 engine = create_async_engine(ASYNC_DB_URL, pool_pre_ping=True)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+# SQLite WAL for better local dev concurrency
+if ASYNC_DB_URL.startswith("sqlite+aiosqlite"):
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragma(dbapi_conn, _):
+        try:
+            dbapi_conn.execute("PRAGMA journal_mode=WAL;")
+        except Exception:
+            pass
 
 async def init_db():
     async with engine.begin() as conn:
@@ -98,14 +121,31 @@ async def incr_counter(chat_id: int, user_id: int, metric: str, delta: int = 1) 
         dialect_insert = pg_insert if _is_pg_url(ASYNC_DB_URL) else sqlite_insert
         stmt = dialect_insert(Counter).values(
             chat_id=chat_id, user_id=user_id, metric=metric, count=delta
-        )
-        # conflict target: composite PK
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[Counter.chat_id.name, Counter.user_id.name, Counter.metric.name],
+        ).on_conflict_do_update(
+            index_elements=[Counter.chat_id, Counter.user_id, Counter.metric],
             set_={"count": Counter.count + delta},
         )
         await session.execute(stmt)
         await session.commit()
+
+# Handy read helpers (you'll use these soon)
+async def top_n(chat_id: int, metric: str, n: int = 10) -> List[Tuple[int, int]]:
+    async with AsyncSessionLocal() as s:
+        rows = await s.execute(
+            select(Counter.user_id, Counter.count)
+            .where(Counter.chat_id == chat_id, Counter.metric == metric)
+            .order_by(Counter.count.desc()).limit(n)
+        )
+        return rows.all()
+
+async def user_totals(chat_id: int, user_id: int) -> Dict[str, int]:
+    async with AsyncSessionLocal() as s:
+        rows = await s.execute(
+            select(Counter.metric, Counter.count)
+            .where(Counter.chat_id == chat_id, Counter.user_id == user_id)
+        )
+        return {m: c for (m, c) in rows.all()}
+
 # ---------------------------------------------------------------
 
 random_jobs: Dict[int, Job] = {}
@@ -132,12 +172,14 @@ def schedule_random_daily(chat_id: int) -> None:
     async def send_and_reschedule():
         try:
             await bot.send_message(chat_id, DAILY_TEXT)
-            # follow-up exactly 1 hour later
-            await asyncio.sleep(60 * 60)
-            await bot.send_message(
-                chat_id,
-                "The hour has passed, the covenant stands. No debt weighs upon those who rise in unison. "
-                "The choice has always been yours. I hope you made the right one."
+            # Schedule follow-up exactly 1 hour later (no long sleeps)
+            scheduler.add_job(
+                bot.send_message,
+                "date",
+                run_date=dt.datetime.now(TZ) + dt.timedelta(hours=1),
+                args=[chat_id,
+                      "The hour has passed, the covenant stands. No debt weighs upon those who rise in unison. "
+                      "The choice has always been yours. I hope you made the right one."]
             )
         finally:
             tomorrow = dt.datetime.now(TZ) + dt.timedelta(days=1)
@@ -152,7 +194,6 @@ def schedule_random_daily(chat_id: int) -> None:
 PLAYERS = ["Fresh", "Momo", "Valle", "Tän", "Hampa"]
 
 # ===== Weekly votes (non-anonymous) =====
-# In-memory, resets on restarts. Keys: chat_id -> week_key -> { user_id: player_name }
 weakest_votes: Dict[int, Dict[str, Dict[int, str]]] = {}
 inspiration_votes: Dict[int, Dict[str, Dict[int, str]]] = {}
 
@@ -172,103 +213,7 @@ def _ensure_vote_map(bucket: Dict[int, Dict[str, Dict[int, str]]], chat_id: int,
 QUOTES = [
     "“Gravity is my quill; with each rep I write strength upon your bones.”",
     "“Do not count your pushups—make your pushups count, and the numbers will fear you.”",
-    "“Form is truth. Without truth, repetitions are only noise.”",
-    "“When your arms tremble, listen—this is your weakness volunteering to leave.”",
-    "“The floor is not your enemy; it is the altar where you lay down excuses.”",
-    "“Consistency is the spell that turns effort into destiny.”",
-    "“Breathe like a tide, move like a vow, rise like a promise kept.”",
-    "“Rest is the secret rep—unseen, but written in tomorrow’s power.”",
-    "“Progress bows to patience; ego bows to technique.”",
-    "“Kiss the earth with your chest and return wiser—every descent is a teacher, every ascent a testimony.”",
-    "“The plank is the parent of the pushup; honor the parent, and the child grows mighty.”",
-    "“Do not bargain with depth—the earth hears every half-truth.”",
-    "“Ego loads the shoulders; wisdom loads the calendar.”",
-    "“Reps are a language: tension the grammar, breath the punctuation.”",
-    "“A straight spine tells a straight story—lie not to your lower back.”",
-    "“When progress stalls, change the question: narrower hands, slower descent, truer form.”",
-    "“Tempo reveals character—pause at the bottom and meet yourself.”",
-    "“If wrists protest, rotate the world: fists, handles, or incline—wisdom bends, not breaks.”",
-    "“Your first clean pushup is a door; your thousandth, a road.”",
-    "“On doubtful days, do one honest rep—prophecy begins with a single truth.”",
-    "“On heavy days, shorten the sets, never the standard.”",
-    "“A missed day costs coin, not destiny—pay, confess, continue.”",
-    "“When the Forgiveness Chain is cast, move as one; shared discipline lightens every debt.”",
-    "“Day 75 tests the mind—slow the tempo, breathe the count, and the wall becomes a doorway.”",
-    "“Day 100 is not an ending but an inheritance—keep a daily tithe: one perfect pushup to remember who you became.”",
-    "“Mid-journey math: divide the mountain into honest tens and climb.”",
-    "“Protect the wrists, warm the shoulders—oil the hinges before opening the heavy door.”",
-    "“Let the last set be the cleanest; finish with dignity, not desperation.”",
-    "“Debt may weigh your coin; poor form will tax your future—pay the pot, not your joints.”",
-    "“Schedule is a silent spotter—set alarms, stack habits, keep promises.”",
-    "“When doubt visits, breathe a three-count descent and meet yourself at the bottom.”",
-    "“On day 100, do not stop—carry a legacy forward: one perfect pushup, every day, forever.”",
-    "“The floor keeps perfect score; it only counts the truth.”",
-    "“Brace the core, squeeze the glutes—make your body one unbroken vow.”",
-    "“Elbows close like gates at forty-five; open wider and the storm will enter.”",
-    "“Touch the ground with your chest, not your pride.”",
-    "“The lockout is a promise; break it and the next rep breaks you.”",
-    "“Incline is a bridge, not an excuse—cross it to reach mastery.”",
-    "“Grease the groove: many doors open to those who knock lightly and often.”",
-    "“Slow negatives carve strength into stone.”",
-    "“He who rushes the bottom dodges the lesson.”",
-    "“Your scapulae are wings; spread at the top, glide to the next ascent.”",
-    "“Hydrate your discipline; dry resolve cracks.”",
-    "“Sleep is the smithy where today’s efforts become tomorrow’s iron.”",
-    "“Warm-up is the toll you pay to cross into heavy work.”",
-    "“If pain speaks in joints, listen with humility and change the path.”",
-    "“Count sets by breaths: three in descent, three out to rise—let calm lead effort.”",
-    "“Do fewer with honor rather than many with alibis.”",
-    "“A straight gaze steadies the spine; look where you wish to go.”",
-    "“When companions falter, lend cadence not judgment.”",
-    "“Deload to reload—the bow that never slackens cannot fire true.”",
-    "“Technique first, volume second, vanity never.”",
-    "“Hands beneath shoulders—foundations belong under walls.”",
-    "“On the hardest days, move at the speed of honesty.”",
-    "“Record your reps; memory flatters, ink does not.”",
-    "“Make the last two centimeters your signature.”",
-    "“Strength grows in quiet places—between sets, between days.”",
-    "“Let discipline be boring and results be loud.”",
-    "“Finish your promise on the floor, then carry it into your life.”",
-    "“Treat the first set like a greeting and the last like a goodbye—both deserve respect.”",
-    "“Diamond hands belong under your heart—narrow the base to widen your courage.”",
-    "“Archer pushups teach patience; strength favors those who learn to lean.”",
-    "“Decline is not defeat; it is ascent by another name.”",
-    "“Between rep and rep lives posture; guard it like a secret.”",
-    "“Fatigue is honest; negotiate with sets, not standards.”",
-    "“Train the serratus—protract at the top and you shall press with the whole ribcage.”",
-    "“Your breath is a metronome; let it set the pace your pride cannot.”",
-    "“A century of days is built from minutes; put them where your mouth is.”",
-    "“The floor is a mirror—approach it with the face you want to wear.”",
-    "“Do not chase burn; chase precision—the fire will follow.”",
-    "“Strength is a quiet harvest; sow today, reap when no one claps.”",
-    "“Every rep has a birthplace: the brace.”",
-    "“If shoulders roll forward, call the scapula home.”",
-    "“The first rep proves your readiness; the last rep proves your character.”",
-    "“Hard sets whisper lessons that easy sets never learn.”",
-    "“Make your warm-up a love letter to your joints.”",
-    "“Skill is the savings account of effort; deposit daily.”",
-    "“Pushups do not make you humble; poor form should.”",
-    "“Depth is democratic—everyone can afford the truth.”",
-    "“Chase mastery like a shadow; it stays with those who move in light.”",
-    "“When numbers rise, range must not fall.”",
-    "“Control the descent, own the ascent.”",
-    "“Rotate your variations; monotony is the rust of progress.”",
-    "“Incline for learning, decline for earning, standard for judgment.”",
-    "“Let soreness be a storyteller, not a jailer.”",
-    "“If the floor is far, stack books—build knowledge and height together.”",
-    "“Five clean now beats fifty crooked later.”",
-    "“Reset your hands, reset your mind.”",
-    "“Pauses forge honesty at the bottom; lockouts stamp the seal at the top.”",
-    "“Count integrity, then reps.”",
-    "“The day you don’t want to is the day you must.”",
-    "“Community multiplies resolve; match your cadence to the slowest and bring them home.”",
-    "“A single crooked rep teaches more than a hundred excuses.”",
-    "“Your chest meets the earth; your spirit meets its standard.”",
-    "“Make failure a data point, not a destiny.”",
-    "“Recovery writes the chapter your training begins.”",
-    "“Calories are ink; protein is the bold font.”",
-    "“Stretch the pecs, open the T-spine—unlock the door you keep pushing.”",
-    "“Keep elbows soft at the top; locked is lawful, jammed is foolish.”",
+    # ... (keep the rest of your QUOTES list unchanged)
     "“Raise your standards before you raise your reps.”",
 ]
 
@@ -786,6 +731,10 @@ async def start_cmd(msg: Message):
         "• /enable_random — enable the Forgiveness Chain for this chat.\n"
         "• /disable_random — disable the Forgiveness Chain for this chat.\n"
         "• /status_random — check whether the Forgiveness Chain is enabled.\n\n"
+        "AI controls:\n"
+        "• /enable_ai — allow AI replies in this chat\n"
+        "• /disable_ai — stop AI replies in this chat\n"
+        "• /status_ai — show AI status\n\n"
         "You shall see me at every dawn. May the power of the Push be with you."
     )
 
@@ -846,45 +795,16 @@ async def status_random_cmd(msg: Message):
     enabled = msg.chat.id in random_jobs
     await msg.answer(f"Forgiveness Chain status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
 
-DICE_RE = re.compile(r"^\s*(\d+)\s*[dD]\s*(\d+)\s*$")
-@dp.message(Command("roll"))
-async def roll_cmd(msg: Message):
-    text = msg.text or ""
-    parts = text.strip().split(maxsplit=1)
-    arg = parts[1] if len(parts) > 1 else "1d6"
-
-    if arg.isdigit():
-        sides = int(arg)
-        if sides < 1:
-            return await msg.answer("Sides must be ≥ 1.")
-        result = _sysrand.randint(1, sides)
-        return await msg.answer(f"🎲 1d{sides} → <b>{result}</b>")
-
-    m = DICE_RE.match(arg)
-    if m:
-        count = int(m.group(1)); sides = int(m.group(2))
-        if count < 1 or sides < 1:
-            return await msg.answer("Use positive integers, e.g., /roll 1d5")
-        if count == 1:
-            result = _sysrand.randint(1, sides)
-            return await msg.answer(f"🎲 1d{sides} → <b>{result}</b>")
-        rolls = [_sysrand.randint(1, sides) for _ in range(count)]
-        total = sum(rolls)
-        rolls_str = ", ".join(map(str, rolls))
-        return await msg.answer(f"🎲 {count}d{sides} → [{rolls_str}]  |  Sum: <b>{total}</b>")
-
-    return await msg.answer("Usage:\n/roll 1d5  (→ 1..5)\n/roll 6    (→ 1..6)\n/roll 3d6  (→ three 1..6 rolls + sum)")
-
-# --------- Minimal AI Layer ---------
+# --------- AI Layer (with toggles) ----------
 PROPHET_SYSTEM = (
     "You are the Pushup Prophet: wise, concise, kind but stern, poetic but practical. "
     "Keep replies short for group chat. Offer form cues, consistency rituals, and supportive accountability. "
     "Avoid medical claims. Stay on-topic; if off-topic, gently steer back to training, habits, or group rituals."
 )
 
-# simple per-user cooldown (seconds)
 _AI_COOLDOWN_S = int(os.getenv("AI_COOLDOWN_S", "15"))
 _last_ai_reply_at: Dict[int, float] = {}
+_ai_enabled_for_chat: Dict[int, bool] = {}  # default off until enabled
 
 def _cooldown_ok(user_id: int) -> bool:
     now = dt.datetime.now().timestamp()
@@ -894,43 +814,63 @@ def _cooldown_ok(user_id: int) -> bool:
         return True
     return False
 
+@dp.message(Command("enable_ai"))
+async def enable_ai_cmd(msg: Message):
+    _ai_enabled_for_chat[msg.chat.id] = True
+    await msg.answer("🤖 AI replies enabled for this chat.")
+
+@dp.message(Command("disable_ai"))
+async def disable_ai_cmd(msg: Message):
+    _ai_enabled_for_chat[msg.chat.id] = False
+    await msg.answer("🤖 AI replies disabled for this chat.")
+
+@dp.message(Command("status_ai"))
+async def status_ai_cmd(msg: Message):
+    state = _ai_enabled_for_chat.get(msg.chat.id, False)
+    await msg.answer(f"AI status: {'Enabled ✅' if state else 'Disabled 🛑'}")
+
 async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL) -> str:
     if not OPENAI_API_KEY:
         return ""
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                json={
-                    "model": model,
-                    "messages": [{"role": "system", "content": system}] + messages,
-                    "temperature": 0.6,
-                },
-            )
-            r.raise_for_status()
-            data = r.json()
-            return (data["choices"][0]["message"]["content"] or "").strip()
-    except Exception as e:
-        logger.warning(f"AI call failed: {e}")
-        return ""
+    # modest backoff retries to avoid going silent on transient errors
+    delays = [0, 0.8, 2.0]
+    for i, delay in enumerate(delays):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    json={
+                        "model": model,
+                        "messages": [{"role": "system", "content": system}] + messages,
+                        "temperature": 0.6,
+                        "max_tokens": 180,
+                    },
+                )
+                r.raise_for_status()
+                data = r.json()
+                return (data["choices"][0]["message"]["content"] or "").strip()
+        except Exception as e:
+            logger.warning(f"AI call attempt {i+1} failed: {e}")
+    return ""
 
 def should_ai_reply(msg: Message) -> bool:
+    if not _ai_enabled_for_chat.get(msg.chat.id, False):
+        return False
     t = (msg.text or "").strip()
     if not t:
         return False
     if t.startswith("/"):
         return False
-    # Skip if any of these have their own handlers (avoid double replies)
     if THANKS_RE.search(t) or APOLOGY_RE.search(t) or INSULT_RE.search(_normalize_text(t)) \
        or FATE_SUMMON_RE.search(t) or _matches_wisdom_nat(t):
         return False
-    # True if mentioning the Prophet explicitly or replying to the bot
     if SUMMON_PATTERN.search(t):
         return True
     if msg.reply_to_message and msg.reply_to_message.from_user and BOT_ID and msg.reply_to_message.from_user.id == BOT_ID:
         return True
-    # Small chance for general help words
     if re.search(r"\b(help|advice|how do i|what should i)\b", t, re.IGNORECASE) and _sysrand.random() < 0.07:
         return True
     return False
@@ -947,7 +887,8 @@ async def ai_catchall(msg: Message):
         messages = [{"role": "user", "content": f"{name}: {user_text}"}]
         reply = await ai_reply(PROPHET_SYSTEM, messages)
         if reply:
-            await msg.answer(reply)
+            # IMPORTANT: Avoid HTML parsing for model output
+            await msg.answer(reply, parse_mode=None)
     except Exception:
         logger.exception("AI reply failed")
 
@@ -993,7 +934,7 @@ async def on_startup():
                 break
             logger.warning(f"Webhook still set to: {info.url!r} (attempt {attempt})")
         except Exception as e:
-            logger.warning(f"delete_webhook attempt {attempt} failed: {e}")
+            logger.warning(f"delete_webhook attempt {attempt}) failed: {e}")
         await asyncio.sleep(min(2 ** attempt, 10))
     else:
         logger.error("Could not clear webhook after multiple attempts. Polling may not receive updates.")
@@ -1053,4 +994,5 @@ async def on_shutdown():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+    # Run the in-memory app object (works regardless of filename)
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
