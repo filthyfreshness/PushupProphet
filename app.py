@@ -145,6 +145,19 @@ class ChatSettings(Base):
     ai_enabled = Column(Boolean, nullable=False, default=False)
     changed_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
+# --- Scheduled messages (DM or chat messages) ---
+class ScheduledMessage(Base):
+    __tablename__ = "scheduled_messages"
+
+    id        = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id   = Column(BigInteger, nullable=False)   # where to post (chat or user)
+    user_id   = Column(BigInteger, nullable=False)   # who scheduled it (for ownership)
+    text      = Column(String(4096), nullable=False) # message body
+    run_at    = Column(DateTime(timezone=True), nullable=False)  # when to send (UTC)
+    status    = Column(String(16), nullable=False, default="pending")  # pending|sent|canceled
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 # ================== Private admin scheduling (DB-backed) ==================
 @dp.message(Command("schedule_once"))
 async def schedule_once_cmd(msg: Message):
@@ -730,6 +743,56 @@ async def user_totals(chat_id: int, user_id: int) -> Dict[str, int]:
             .where(Counter.chat_id == chat_id, Counter.user_id == user_id)
         )
         return {m: c for (m, c) in rows.all()}
+
+# ===== Scheduled message helpers =====
+
+async def _deliver_scheduled_message(msg_id: int):
+    """Send one scheduled message and mark it sent."""
+    async with AsyncSessionLocal() as s:
+        row = await s.get(ScheduledMessage, msg_id)
+        if not row or row.status != "pending":
+            return
+        try:
+            # Send to the target chat
+            await bot.send_message(row.chat_id, row.text)
+            row.status = "sent"
+            await s.commit()
+        except Exception:
+            logger.exception("Failed sending scheduled message id=%s", msg_id)
+
+async def load_and_schedule_pending():
+    """Load future/pending messages from DB and (re)schedule them."""
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    # include a small look-back so near-startup items aren’t missed
+    lookback = now_utc - dt.timedelta(minutes=10)
+
+    async with AsyncSessionLocal() as s:
+        res = await s.execute(
+            select(ScheduledMessage.id, ScheduledMessage.run_at)
+            .where(
+                ScheduledMessage.status == "pending",
+                ScheduledMessage.run_at >= lookback
+            )
+        )
+        rows = res.all()
+
+    count = 0
+    for msg_id, run_at in rows:
+        try:
+            scheduler.add_job(
+                _deliver_scheduled_message,
+                "date",
+                run_date=run_at,   # must be timezone-aware (UTC recommended)
+                args=[msg_id],
+                id=f"sch_{msg_id}",
+                replace_existing=True,
+            )
+            count += 1
+        except Exception:
+            logger.exception("Failed to schedule message id=%s", msg_id)
+
+    logger.info("Scheduled %d pending messages from DB.", count)
+
 
 # ---- Admin & privacy helpers ----
 _ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()}
@@ -2072,6 +2135,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
