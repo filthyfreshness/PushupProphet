@@ -876,10 +876,18 @@ async def summon_reply(msg: Message):
         logger.exception("Failed to log 'mention' counter")
 
     if await get_ai_enabled(msg.chat.id):
-        logger.info(f"[SUMMON] AI enabled -> letting catchall handle")
+        logger.info("[SUMMON] AI enabled -> calling AI directly from summon handler")
+        name = getattr(msg.from_user, "first_name", "") or (msg.from_user.username or "friend")
+        user_text = msg.text or ""
+        messages = [{"role": "user", "content": f"{name}: {user_text}"}]
+        reply = await ai_reply(PROPHET_SYSTEM, messages)
+        if reply:
+            await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
+        else:
+            logger.warning("[SUMMON] AI returned empty; falling back to canned reply")
+            await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
         return
 
-    await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
 
 
 
@@ -1035,7 +1043,6 @@ PROPHET_SYSTEM = (
 
 _AI_COOLDOWN_S = int(os.getenv("AI_COOLDOWN_S", "15"))
 _last_ai_reply_at: Dict[int, float] = {}
-_ai_enabled_for_chat: Dict[int, bool] = {}  # default off until enabled
 
 def _cooldown_ok(user_id: int) -> bool:
     now = dt.datetime.now().timestamp()
@@ -1059,11 +1066,6 @@ async def disable_ai_cmd(msg: Message):
     logger.info(f"[AI TOGGLE] chat={msg.chat.id} set False -> now {enabled}")
     await msg.answer("🛑 AI replies disabled for this chat.")
 
-
-@dp.message(Command("status_ai"))
-async def status_ai_cmd(msg: Message):
-    state = _ai_enabled_for_chat.get(msg.chat.id, False)
-    await msg.answer(f"AI status: {'Enabled ✅' if state else 'Disabled 🛑'}")
 
 async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL) -> str:
     if not OPENAI_API_KEY:
@@ -1092,24 +1094,34 @@ async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL)
             logger.warning(f"AI call attempt {i+1} failed: {e}")
     return ""
 
-def should_ai_reply(msg: Message) -> bool:
-    if not _ai_enabled_for_chat.get(msg.chat.id, False):
+async def should_ai_reply(msg: Message) -> bool:
+    # 1) Check persisted setting
+    if not await get_ai_enabled(msg.chat.id):
         return False
+
+    # 2) Basic guards
     t = (msg.text or "").strip()
-    if not t:
+    if not t or t.startswith("/"):
         return False
-    if t.startswith("/"):
-        return False
+
+    # 3) Skip if other themed handlers should answer
     if THANKS_RE.search(t) or APOLOGY_RE.search(t) or INSULT_RE.search(_normalize_text(t)) \
        or FATE_SUMMON_RE.search(t) or _matches_wisdom_nat(t):
         return False
+
+    # 4) Triggers
     if SUMMON_PATTERN.search(t):
         return True
-    if msg.reply_to_message and msg.reply_to_message.from_user and BOT_ID and msg.reply_to_message.from_user.id == BOT_ID:
+    if (msg.reply_to_message
+        and msg.reply_to_message.from_user
+        and BOT_ID
+        and msg.reply_to_message.from_user.id == BOT_ID):
         return True
     if re.search(r"\b(help|advice|how do i|what should i)\b", t, re.IGNORECASE) and _sysrand.random() < 0.07:
         return True
+
     return False
+
 
 
 # --------- Run bot + web server together ----------
@@ -1249,7 +1261,7 @@ async def ai_catchall(msg: Message):
             logger.info("[AI] disabled for this chat")
             return
 
-        if not should_ai_reply(msg):
+        if not await should_ai_reply(msg):
             logger.info("[AI] should_ai_reply = False (not a trigger)")
             return
 
@@ -1293,6 +1305,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
