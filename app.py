@@ -1,122 +1,102 @@
-import os, re, asyncio, logging, datetime as dt, random, html
-from typing import Dict, Optional, List, Tuple
+# main.py
+# Pushup Prophet — clean, single-source-of-truth version
+# ------------------------------------------------------
+# Fixes implemented:
+# 1) DB model == code (Option A: status column only: pending|sent|canceled)
+# 2) DB-backed scheduler only (removed all in-memory duplicates)
+# 3) No undefined helpers; job IDs are consistent (sch_{id})
+# 4) should_ai_reply() is synchronous (and not awaited)
+# 5) Single on_startup/on_shutdown; consistent imports; extra comments
+# 6) Safer OpenAI call with retries; Responses API by default
+
+import os
+import re
+import ssl
+import html
+import asyncio
+import logging
+import random
+import datetime as dt
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, Optional, List, Tuple
 from collections import deque
 
+import httpx
 import uvicorn
-from sqlalchemy import Column, BigInteger, String, Integer, Boolean, DateTime, Index, select, update, func, event
+from fastapi import FastAPI, Response
+
+from dotenv import load_dotenv
+from pytz import timezone
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, PollAnswer
+from aiogram.filters import Command, CommandStart
+from aiogram.enums.parse_mode import ParseMode
+from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+
+from sqlalchemy import (
+    Column, BigInteger, String, Integer, Boolean, DateTime, Index, select, update, func, event
+)
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy import select, update
 
-from aiogram import Bot, Dispatcher
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, PollAnswer
-from aiogram.filters import Command, CommandStart
-from aiogram import F
-from aiogram.enums.parse_mode import ParseMode
-from aiogram.client.default import DefaultBotProperties
+# ------------------------ App & config ------------------------
 
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
-
-
-from dotenv import load_dotenv
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.job import Job
-from pytz import timezone
-
-import httpx
-
-from fastapi import FastAPI, Response
 app = FastAPI()
+logger = logging.getLogger("pushup-prophet")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 
-# near the top of the file, after imports
-_SINGLETON_LOCK = Path(".bot-lock")
-
-def _acquire_singleton_lock() -> bool:
-    try:
-        # O_EXCL fails if the file already exists
-        fd = os.open(_SINGLETON_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(fd)
-        return True
-    except FileExistsError:
-        return False
-
-@app.on_event("startup")
-async def on_startup():
-    if not _acquire_singleton_lock():
-        # Another instance already running in this folder
-        logger.error("Another bot instance seems to be running (.bot-lock exists). Exiting.")
-        raise SystemExit(1)
-    ...
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    ...
-    try:
-        if _SINGLETON_LOCK.exists():
-            _SINGLETON_LOCK.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-
-# Prevent accidental double-start
-_started_polling = False
-BOT_ID: Optional[int] = None
-
-# --------- Load config ----------
 DOTENV_PATH = Path(__file__).with_name(".env")
 load_dotenv(dotenv_path=DOTENV_PATH)
 
-BOT_TOKEN: Optional[str] = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise SystemExit(
-        f"ERROR: BOT_TOKEN missing. Add it as an environment variable on your host "
-        f"or to {DOTENV_PATH} locally for testing."
-    )
+    raise SystemExit("ERROR: BOT_TOKEN missing (env / .env).")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.6"))
 
 TZ = timezone("Europe/Stockholm")
-DAILY_TEXT = "THE FORGIVENESS CHAIN BEGINS NOW. Lay down excuses and ascend. May the power of Push be with you."
-WINDOW_START = 7   # 07:00
-WINDOW_END = 22    # 22:00 (inclusive)
-
-# --------- Bot setup ----------
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
-logger = logging.getLogger("pushup-prophet")
-
 _sysrand = random.SystemRandom()
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone=TZ)
 
-# ----------------- Database (Postgres/SQLite) -----------------
-DB_URL = os.getenv("DATABASE_URL", "").strip()
+# Admins & defaults
+_ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()}
+_DEFAULT_TARGET_CHAT = int(os.getenv("ADMIN_DEFAULT_CHAT_ID", "0") or "0")
 
+# Random daily message window (for your chain message feature)
+DAILY_TEXT = "THE FORGIVENESS CHAIN BEGINS NOW. Lay down excuses and ascend. May the power of Push be with you."
+WINDOW_START = 7
+WINDOW_END = 22
+
+# Bot ID cache
+BOT_ID: Optional[int] = None
+
+# ------------------------ Database ---------------------------
+
+DB_URL = os.getenv("DATABASE_URL", "").strip()
 
 def _to_async_url(url: str) -> str:
     if not url:
-        return "sqlite+aiosqlite:///./local-dev.db"  # local dev fallback
-    # Normalize scheme to the async driver
+        return "sqlite+aiosqlite:///./local-dev.db"
     if url.startswith("postgres://"):
         url = "postgresql+asyncpg://" + url[len("postgres://"):]
     elif url.startswith("postgresql://"):
         url = "postgresql+asyncpg://" + url[len("postgresql://"):]
-    # Strip any accidental query like ?sslmode=require (we set SSL via connect_args)
     if "?" in url:
         url = url.split("?", 1)[0]
     return url
 
-
 ASYNC_DB_URL = _to_async_url(DB_URL)
-
-# ========== MODELS ==========
-from sqlalchemy import Column, BigInteger, String, Integer, Boolean, DateTime, Index
-from sqlalchemy import func
 
 Base = declarative_base()
 
@@ -126,17 +106,14 @@ class Counter(Base):
     user_id = Column(BigInteger, primary_key=True)
     metric  = Column(String(32), primary_key=True)  # "thanks" | "apology" | "insult" | "mention"
     count   = Column(Integer, nullable=False, default=0)
-
-    __table_args__ = (
-        Index("ix_counters_chat_metric_count", "chat_id", "metric", "count"),
-    )
+    __table_args__ = (Index("ix_counters_chat_metric_count", "chat_id", "metric", "count"),)
 
 class UserName(Base):
     __tablename__ = "user_names"
     chat_id    = Column(BigInteger, primary_key=True)
     user_id    = Column(BigInteger, primary_key=True)
     first_name = Column(String(128), nullable=True)
-    username   = Column(String(128), nullable=True)  # without '@'
+    username   = Column(String(128), nullable=True)
     last_seen  = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 class ChatSettings(Base):
@@ -145,290 +122,28 @@ class ChatSettings(Base):
     ai_enabled = Column(Boolean, nullable=False, default=False)
     changed_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-# --- Scheduled messages (DM or chat messages) ---
 class ScheduledMessage(Base):
     __tablename__ = "scheduled_messages"
-
-    id        = Column(Integer, primary_key=True, autoincrement=True)
-    chat_id   = Column(BigInteger, nullable=False)   # where to post (chat or user)
-    user_id   = Column(BigInteger, nullable=False)   # who scheduled it (for ownership)
-    text      = Column(String(4096), nullable=False) # message body
-    run_at    = Column(DateTime(timezone=True), nullable=False)  # when to send (UTC)
-    status    = Column(String(16), nullable=False, default="pending")  # pending|sent|canceled
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id    = Column(BigInteger, nullable=False)                # where to post
+    user_id    = Column(BigInteger, nullable=False)                # who scheduled it
+    text       = Column(String(4096), nullable=False)
+    run_at     = Column(DateTime(timezone=True), nullable=False)   # when to send (UTC or aware)
+    status     = Column(String(16), nullable=False, default="pending")  # pending|sent|canceled
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+def _is_pg_url(async_url: str) -> bool:
+    return async_url.startswith("postgresql+asyncpg://")
 
-# ================== Private admin scheduling (DB-backed) ==================
-@dp.message(Command("schedule_once"))
-async def schedule_once_cmd(msg: Message):
-    if not _is_admin(msg.from_user.id):
-        return
-
-    # Keep it private: if used in a group, delete the command quickly
-    if not _is_private_chat(msg):
-        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
-        try:
-            m = await msg.answer("Use this command in a private chat with me.")
-            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
-        except Exception:
-            pass
-        return
-
-    # Parse:
-    # A) /schedule_once 2025-10-01 18:30 | Message text
-    # B) /schedule_once -1001234567890 2025-10-01 18:30 | Message text
-    raw = re.sub(r"^/schedule_once(@\w+)?\s*", "", (msg.text or ""), flags=re.IGNORECASE).strip()
-    if "|" not in raw:
-        return await msg.answer(
-            "Usage:\n"
-            "/schedule_once 2025-10-01 18:30 | Your message\n"
-            "or\n"
-            "/schedule_once -1001234567890 2025-10-01 18:30 | Your message"
-        )
-
-    left, text = [p.strip() for p in raw.split("|", 1)]
-    parts = left.split()
-
-    if parts and parts[0].lstrip("-").isdigit() and len(parts) >= 3:
-        target_chat_id = int(parts[0])
-        when_part = " ".join(parts[1:3])
-    else:
-        target_chat_id = _DEFAULT_TARGET_CHAT
-        when_part = " ".join(parts[:2]) if len(parts) >= 2 else ""
-
-    if not target_chat_id:
-        return await msg.answer("No target chat set. Define ADMIN_DEFAULT_CHAT_ID in .env or pass chat id explicitly.")
-
-    try:
-        dt_local = dt.datetime.strptime(when_part, "%Y-%m-%d %H:%M")
-        run_at_local = TZ.localize(dt_local)
-        run_at_utc = run_at_local.astimezone(dt.timezone.utc)
-    except Exception:
-        return await msg.answer("Time must be YYYY-MM-DD HH:MM (Stockholm).")
-
-    if not text:
-        return await msg.answer("Message text cannot be empty.")
-
-    # Insert row then schedule
-    async with AsyncSessionLocal() as s:
-        row = ScheduledMessage(
-            chat_id=target_chat_id,
-            text=text,
-            created_by=msg.from_user.id,
-            run_at_utc=run_at_utc,
-            delivered=False,
-            canceled=False,
-        )
-        s.add(row)
-        await s.commit()
-        await s.refresh(row)  # get auto id
-
-    _schedule_job_for_row(row)
-
-    human_when = run_at_local.strftime('%Y-%m-%d %H:%M %Z')
-    await msg.answer(f"✅ Scheduled #{row.id} → {target_chat_id} at {human_when}.")
-
-
-@dp.message(Command("schedule_many"))
-async def schedule_many_cmd(msg: Message):
-    if not _is_admin(msg.from_user.id):
-        return
-
-    if not _is_private_chat(msg):
-        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
-        try:
-            m = await msg.answer("Use this command in a private chat with me.")
-            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
-        except Exception:
-            pass
-        return
-
-    body = re.sub(r"^/schedule_many(@\w+)?\s*", "", (msg.text or ""), flags=re.IGNORECASE).strip()
-    if not body:
-        return await msg.answer(
-            "Paste multiple lines after the command, for example:\n"
-            "/schedule_many\n"
-            "2025-10-02 07:00 | Morning: receipts decide truth.\n"
-            "-1001234567890 2025-10-05 20:30 | Night check-in (explicit target)."
-        )
-
-    ok, bad = [], []
-    rows_to_add: List[ScheduledMessage] = []
-
-    for line in body.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "|" not in line:
-            bad.append((line, "Missing '|'"))
-            continue
-
-        left, text = [p.strip() for p in line.split("|", 1)]
-        parts = left.split()
-
-        if parts and parts[0].lstrip("-").isdigit() and len(parts) >= 3:
-            target_chat_id = int(parts[0])
-            when_part = " ".join(parts[1:3])
-        else:
-            target_chat_id = _DEFAULT_TARGET_CHAT
-            when_part = " ".join(parts[:2]) if len(parts) >= 2 else ""
-
-        if not target_chat_id:
-            bad.append((line, "No default target chat configured"))
-            continue
-
-        try:
-            dt_local = dt.datetime.strptime(when_part, "%Y-%m-%d %H:%M")
-            run_at_local = TZ.localize(dt_local)
-            run_at_utc = run_at_local.astimezone(dt.timezone.utc)
-        except Exception:
-            bad.append((line, "Bad time (YYYY-MM-DD HH:MM)"))
-            continue
-
-        if not text:
-            bad.append((line, "Empty message"))
-            continue
-
-        rows_to_add.append(ScheduledMessage(
-            chat_id=target_chat_id,
-            text=text,
-            created_by=msg.from_user.id,
-            run_at_utc=run_at_utc,
-            delivered=False,
-            canceled=False,
-        ))
-        ok.append((target_chat_id, run_at_local, text))
-
-    created_ids = []
-    if rows_to_add:
-        async with AsyncSessionLocal() as s:
-            s.add_all(rows_to_add)
-            await s.commit()
-            # refresh to get IDs
-            for r in rows_to_add:
-                await s.refresh(r)
-                created_ids.append(r.id)
-
-    # schedule them
-    for r in rows_to_add:
-        _schedule_job_for_row(r)
-
-    reply = []
-    if ok:
-        reply.append("✅ Scheduled:")
-        for (chat, when_local, txt), sid in zip(ok, created_ids):
-            reply.append(f"  • #{sid} → {chat} — {when_local.strftime('%Y-%m-%d %H:%M %Z')} — {txt[:60]}")
-    if bad:
-        reply.append("\n⚠️ Skipped:")
-        for line, reason in bad:
-            reply.append(f"  • {line}  ← {reason}")
-    await msg.answer("\n".join(reply) if reply else "Nothing parsed.")
-
-
-@dp.message(Command("schedule_list"))
-async def schedule_list_cmd(msg: Message):
-    if not _is_admin(msg.from_user.id):
-        return
-    if not _is_private_chat(msg):
-        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
-        try:
-            m = await msg.answer("Use in private chat.")
-            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
-        except Exception:
-            pass
-        return
-
-    # optional chat filter: /schedule_list -1001234567890
-    parts = (msg.text or "").split()
-    chat_filter = None
-    if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
-        chat_filter = int(parts[1])
-
-    async with AsyncSessionLocal() as s:
-        q = select(ScheduledMessage).where(
-            ScheduledMessage.canceled.is_(False),
-            ScheduledMessage.delivered.is_(False),
-        )
-        if chat_filter is not None:
-            q = q.where(ScheduledMessage.chat_id == chat_filter)
-        q = q.order_by(ScheduledMessage.run_at_utc.asc())
-        res = await s.execute(q)
-        rows = res.scalars().all()
-
-    if not rows:
-        return await msg.answer("No pending schedules." + (f" (filtered by {chat_filter})" if chat_filter else ""))
-
-    lines = ["Pending schedules:"]
-    for r in rows:
-        when_local = r.run_at_utc.astimezone(TZ)
-        lines.append(f"  • #{r.id} → {r.chat_id} — {when_local.strftime('%Y-%m-%d %H:%M %Z')} — {r.text[:70]}")
-    await msg.answer("\n".join(lines))
-
-
-@dp.message(Command("schedule_cancel"))
-async def schedule_cancel_cmd(msg: Message):
-    if not _is_admin(msg.from_user.id):
-        return
-    if not _is_private_chat(msg):
-        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
-        try:
-            m = await msg.answer("Use in private chat.")
-            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
-        except Exception:
-            pass
-        return
-
-    parts = (msg.text or "").split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        return await msg.answer("Usage:\n/schedule_cancel <id>")
-
-    try:
-        sid = int(parts[1].strip())
-    except ValueError:
-        return await msg.answer("ID must be an integer.")
-
-    async with AsyncSessionLocal() as s:
-        r = await s.execute(select(ScheduledMessage).where(ScheduledMessage.id == sid))
-        row = r.scalar_one_or_none()
-        if not row or row.delivered or row.canceled:
-            return await msg.answer("No such pending id (maybe already delivered/canceled).")
-
-        # mark canceled in DB
-        await s.execute(
-            update(ScheduledMessage)
-            .where(ScheduledMessage.id == sid)
-            .values(canceled=True)
-        )
-        await s.commit()
-
-    # Remove in-memory job if present
-    try:
-        scheduler.remove_job(_job_id_for(sid))
-    except Exception:
-        pass
-
-    await msg.answer(f"🗑️ Canceled #{sid}.")
-
-
-# ============================
-
-from sqlalchemy import event  # ⬅️ add this import if not already present
-
-import ssl
-ssl_ctx = None
-if ASYNC_DB_URL.startswith("postgresql+asyncpg://"):
-    # Neon requires TLS — create a default SSL context
-    ssl_ctx = ssl.create_default_context()
-
+ssl_ctx = ssl.create_default_context() if _is_pg_url(ASYNC_DB_URL) else None
 engine = create_async_engine(
     ASYNC_DB_URL,
     pool_pre_ping=True,
     connect_args={"ssl": ssl_ctx} if ssl_ctx else {},
 )
-
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
-# SQLite WAL for better local dev concurrency
+# SQLite: enable WAL for better concurrency
 if ASYNC_DB_URL.startswith("sqlite+aiosqlite"):
     @event.listens_for(engine.sync_engine, "connect")
     def _set_sqlite_pragma(dbapi_conn, _):
@@ -437,323 +152,65 @@ if ASYNC_DB_URL.startswith("sqlite+aiosqlite"):
         except Exception:
             pass
 
+def _dialect_insert():
+    return pg_insert if _is_pg_url(ASYNC_DB_URL) else sqlite_insert
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-def _is_pg_url(async_url: str) -> bool:
-    return async_url.startswith("postgresql+asyncpg://")
+# ------------------------ DB helpers -------------------------
 
 async def incr_counter(chat_id: int, user_id: int, metric: str, delta: int = 1) -> None:
-    """Atomic upsert: increase a user metric in a chat."""
-    async with AsyncSessionLocal() as session:
-        dialect_insert = pg_insert if _is_pg_url(ASYNC_DB_URL) else sqlite_insert
-        stmt = dialect_insert(Counter).values(
-            chat_id=chat_id, user_id=user_id, metric=metric, count=delta
-        ).on_conflict_do_update(
-            # ✅ use column names for portability
-            index_elements=[Counter.chat_id.name, Counter.user_id.name, Counter.metric.name],
-            set_={"count": Counter.count + delta},
-        )
-        await session.execute(stmt)
-        await session.commit()
-
-
-# === Helpers (single, canonical versions) =======================
-
-def _dialect_insert():
-    """Pick the right INSERT helper for Postgres vs SQLite."""
-    return pg_insert if _is_pg_url(ASYNC_DB_URL) else sqlite_insert
-
-# ---- user name upsert / lookup ----
-async def upsert_username(chat_id: int, user_id: int, first_name: Optional[str], username: Optional[str]) -> None:
-    """Idempotently save/update a user's display info for this chat."""
-    ins = _dialect_insert()(UserName).values(
-        chat_id=chat_id,
-        user_id=user_id,
-        first_name=first_name or None,
-        username=username or None,
+    ins = _dialect_insert()(Counter).values(
+        chat_id=chat_id, user_id=user_id, metric=metric, count=delta
     )
     stmt = ins.on_conflict_do_update(
-        index_elements=[UserName.chat_id.name, UserName.user_id.name],  # composite PK
-        set_={
-            "first_name": ins.excluded.first_name,
-            "username":   ins.excluded.username,
-            "last_seen":  func.now(),
-        },
+        index_elements=[Counter.chat_id.name, Counter.user_id.name, Counter.metric.name],
+        set_={"count": Counter.count + delta},
     )
     async with AsyncSessionLocal() as s:
         await s.execute(stmt)
         await s.commit()
 
-async def name_for(chat_id: int, user_id: int) -> str:
-    """Return a nice display name for a user in a chat."""
+async def upsert_username(chat_id: int, user_id: int, first_name: Optional[str], username: Optional[str]) -> None:
+    ins = _dialect_insert()(UserName).values(
+        chat_id=chat_id, user_id=user_id,
+        first_name=first_name or None, username=username or None
+    )
+    stmt = ins.on_conflict_do_update(
+        index_elements=[UserName.chat_id.name, UserName.user_id.name],
+        set_={"first_name": ins.excluded.first_name, "username": ins.excluded.username, "last_seen": func.now()},
+    )
     async with AsyncSessionLocal() as s:
-        r = await s.execute(
-            select(UserName.first_name, UserName.username)
-            .where(UserName.chat_id == chat_id, UserName.user_id == user_id)
-        )
-        row = r.first()
-        if row:
-            first_name, username = row
-            if first_name:
-                return first_name
-            if username:
-                return f"@{username}"
-    return f"user {user_id}"
+        await s.execute(stmt)
+        await s.commit()
 
-# ---- per-chat AI toggle (uses portable UPSERT) ----
 async def get_ai_enabled(chat_id: int) -> bool:
     async with AsyncSessionLocal() as s:
-        res = await s.execute(
-            select(ChatSettings.ai_enabled).where(ChatSettings.chat_id == chat_id)
-        )
+        res = await s.execute(select(ChatSettings.ai_enabled).where(ChatSettings.chat_id == chat_id))
         row = res.first()
         return bool(row[0]) if row else False
 
 async def set_ai_enabled(chat_id: int, enabled: bool) -> None:
-    """Set AI on/off for a chat (UPSERT so it works whether row exists or not)."""
     ins = _dialect_insert()(ChatSettings).values(chat_id=chat_id, ai_enabled=enabled)
-    stmt = ins.on_conflict_do_update(
-        index_elements=[ChatSettings.chat_id.name],
-        set_={"ai_enabled": enabled},
-    )
+    stmt = ins.on_conflict_do_update(index_elements=[ChatSettings.chat_id.name], set_={"ai_enabled": enabled})
     async with AsyncSessionLocal() as s:
         await s.execute(stmt)
         await s.commit()
 
-# ---- handy read helpers ----
-async def top_n(chat_id: int, metric: str, n: int = 10) -> List[Tuple[int, int]]:
-    async with AsyncSessionLocal() as s:
-        rows = await s.execute(
-            select(Counter.user_id, Counter.count)
-            .where(Counter.chat_id == chat_id, Counter.metric == metric)
-            .order_by(Counter.count.desc())
-            .limit(n)
-        )
-        return rows.all()
+# ------------------------ Scheduler (DB-backed) ---------------
 
-# ================== Private admin scheduling ==================
-@dp.message(Command("schedule_once"))
-async def schedule_once_cmd(msg: Message):
-    if not _is_admin(msg.from_user.id):
-        return
-
-    # If someone runs it in a group: delete the command so nothing leaks
-    if not _is_private_chat(msg):
-        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
-        try:
-            m = await msg.answer("Use this command in a private chat with me.")
-            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
-        except Exception:
-            pass
-        return
-
-    # Parse:
-    # A) DM default target:  /schedule_once 2025-10-01 18:30 | Message text
-    # B) Explicit target:    /schedule_once -1001234567890 2025-10-01 18:30 | Message text
-    raw = re.sub(r"^/schedule_once(@\w+)?\s*", "", (msg.text or ""), flags=re.IGNORECASE).strip()
-    if "|" not in raw:
-        return await msg.answer(
-            "Usage:\n"
-            "/schedule_once 2025-10-01 18:30 | Your message\n"
-            "or\n"
-            "/schedule_once -1001234567890 2025-10-01 18:30 | Your message"
-        )
-
-    left, text = [p.strip() for p in raw.split("|", 1)]
-    parts = left.split()
-
-    # optional explicit chat id
-    if parts and parts[0].lstrip("-").isdigit() and len(parts) >= 3:
-        target_chat_id = int(parts[0])
-        when_part = " ".join(parts[1:3])
-    else:
-        target_chat_id = _DEFAULT_TARGET_CHAT
-        when_part = " ".join(parts[:2]) if len(parts) >= 2 else ""
-
-    if not target_chat_id:
-        return await msg.answer("No target chat set. Define ADMIN_DEFAULT_CHAT_ID in .env or pass chat id explicitly.")
-
-    try:
-        dt_local = dt.datetime.strptime(when_part, "%Y-%m-%d %H:%M")
-        run_at = TZ.localize(dt_local)
-    except Exception:
-        return await msg.answer("Time must be YYYY-MM-DD HH:MM (Stockholm).")
-
-    if not text:
-        return await msg.answer("Message text cannot be empty.")
-
-    # schedule
-    sched_id = _next_id()
-    job = scheduler.add_job(
-        _deliver_scheduled, "date",
-        run_date=run_at,
-        args=[target_chat_id, text]
-    )
-    _scheduled[sched_id] = _SchedInfo(job.id, target_chat_id, run_at, text)
-
-    await msg.answer(f"✅ Scheduled #{sched_id} → {target_chat_id} at {run_at.strftime('%Y-%m-%d %H:%M %Z')}.")
-
-@dp.message(Command("schedule_many"))
-async def schedule_many_cmd(msg: Message):
-    if not _is_admin(msg.from_user.id):
-        return
-
-    if not _is_private_chat(msg):
-        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
-        try:
-            m = await msg.answer("Use this command in a private chat with me.")
-            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
-        except Exception:
-            pass
-        return
-
-    body = re.sub(r"^/schedule_many(@\w+)?\s*", "", (msg.text or ""), flags=re.IGNORECASE).strip()
-    if not body:
-        return await msg.answer(
-            "Paste multiple lines after the command, for example:\n"
-            "/schedule_many\n"
-            "2025-10-02 07:00 | Morning: receipts decide truth.\n"
-            "-1001234567890 2025-10-05 20:30 | Night check-in (explicit target)."
-        )
-
-    ok, bad = [], []
-    for line in body.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "|" not in line:
-            bad.append((line, "Missing '|'"))
-            continue
-
-        left, text = [p.strip() for p in line.split("|", 1)]
-        parts = left.split()
-
-        # optional target
-        if parts and parts[0].lstrip("-").isdigit() and len(parts) >= 3:
-            target_chat_id = int(parts[0])
-            when_part = " ".join(parts[1:3])
-        else:
-            target_chat_id = _DEFAULT_TARGET_CHAT
-            when_part = " ".join(parts[:2]) if len(parts) >= 2 else ""
-
-        if not target_chat_id:
-            bad.append((line, "No default target chat configured"))
-            continue
-
-        try:
-            dt_local = dt.datetime.strptime(when_part, "%Y-%m-%d %H:%M")
-            run_at = TZ.localize(dt_local)
-        except Exception:
-            bad.append((line, "Bad time (YYYY-MM-DD HH:MM)"))
-            continue
-
-        if not text:
-            bad.append((line, "Empty message"))
-            continue
-
-        sched_id = _next_id()
-        job = scheduler.add_job(
-            _deliver_scheduled, "date",
-            run_date=run_at,
-            args=[target_chat_id, text]
-        )
-        _scheduled[sched_id] = _SchedInfo(job.id, target_chat_id, run_at, text)
-        ok.append((sched_id, target_chat_id, run_at, text))
-
-    reply = []
-    if ok:
-        reply.append("✅ Scheduled:")
-        for sid, chat, when, txt in ok:
-            reply.append(f"  • #{sid} → {chat} — {when.strftime('%Y-%m-%d %H:%M %Z')} — {txt[:60]}")
-    if bad:
-        reply.append("\n⚠️ Skipped:")
-        for line, reason in bad:
-            reply.append(f"  • {line}  ← {reason}")
-    await msg.answer("\n".join(reply) if reply else "Nothing parsed.")
-
-@dp.message(Command("schedule_list"))
-async def schedule_list_cmd(msg: Message):
-    if not _is_admin(msg.from_user.id):
-        return
-    if not _is_private_chat(msg):
-        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
-        try:
-            m = await msg.answer("Use in private chat.")
-            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
-        except Exception:
-            pass
-        return
-
-    # optional chat filter: /schedule_list -1001234567890
-    parts = (msg.text or "").split()
-    chat_filter = None
-    if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
-        chat_filter = int(parts[1])
-
-    items = []
-    for sid, info in sorted(_scheduled.items(), key=lambda kv: kv[1].run_at):
-        if chat_filter is not None and info.chat_id != chat_filter:
-            continue
-        items.append(f"#{sid} → {info.chat_id} — {info.run_at.astimezone(TZ).strftime('%Y-%m-%d %H:%M %Z')} — {info.text[:70]}")
-
-    if not items:
-        return await msg.answer("No pending in-memory schedules." + (f" (filtered by {chat_filter})" if chat_filter else ""))
-
-    await msg.answer("Pending schedules:\n" + "\n".join(items))
-
-@dp.message(Command("schedule_cancel"))
-async def schedule_cancel_cmd(msg: Message):
-    if not _is_admin(msg.from_user.id):
-        return
-    if not _is_private_chat(msg):
-        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
-        try:
-            m = await msg.answer("Use in private chat.")
-            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
-        except Exception:
-            pass
-        return
-
-    parts = (msg.text or "").split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        return await msg.answer("Usage:\n/schedule_cancel <id>")
-
-    try:
-        sid = int(parts[1].strip())
-    except ValueError:
-        return await msg.answer("ID must be an integer.")
-
-    info = _scheduled.pop(sid, None)
-    if not info:
-        return await msg.answer("No such id (or already delivered).")
-
-    try:
-        scheduler.remove_job(info.job_id)
-    except Exception:
-        pass
-
-    await msg.answer(f"🗑️ Canceled #{sid}.")
-
-async def user_totals(chat_id: int, user_id: int) -> Dict[str, int]:
-    async with AsyncSessionLocal() as s:
-        rows = await s.execute(
-            select(Counter.metric, Counter.count)
-            .where(Counter.chat_id == chat_id, Counter.user_id == user_id)
-        )
-        return {m: c for (m, c) in rows.all()}
-
-# ===== Scheduled message helpers =====
+def _job_id_for(msg_id: int) -> str:
+    return f"sch_{msg_id}"
 
 async def _deliver_scheduled_message(msg_id: int):
-    """Send one scheduled message and mark it sent."""
+    """Send one scheduled message and mark it sent (idempotent)."""
     async with AsyncSessionLocal() as s:
         row = await s.get(ScheduledMessage, msg_id)
         if not row or row.status != "pending":
             return
         try:
-            # Send to the target chat
             await bot.send_message(row.chat_id, row.text)
             row.status = "sent"
             await s.commit()
@@ -761,18 +218,14 @@ async def _deliver_scheduled_message(msg_id: int):
             logger.exception("Failed sending scheduled message id=%s", msg_id)
 
 async def load_and_schedule_pending():
-    """Load future/pending messages from DB and (re)schedule them."""
+    """Reschedule all pending future jobs from DB (on startup)."""
     now_utc = dt.datetime.now(dt.timezone.utc)
-    # include a small look-back so near-startup items aren’t missed
-    lookback = now_utc - dt.timedelta(minutes=10)
+    lookback = now_utc - dt.timedelta(minutes=10)  # safety cushion
 
     async with AsyncSessionLocal() as s:
         res = await s.execute(
             select(ScheduledMessage.id, ScheduledMessage.run_at)
-            .where(
-                ScheduledMessage.status == "pending",
-                ScheduledMessage.run_at >= lookback
-            )
+            .where(ScheduledMessage.status == "pending", ScheduledMessage.run_at >= lookback)
         )
         rows = res.all()
 
@@ -780,12 +233,8 @@ async def load_and_schedule_pending():
     for msg_id, run_at in rows:
         try:
             scheduler.add_job(
-                _deliver_scheduled_message,
-                "date",
-                run_date=run_at,   # must be timezone-aware (UTC recommended)
-                args=[msg_id],
-                id=f"sch_{msg_id}",
-                replace_existing=True,
+                _deliver_scheduled_message, "date",
+                run_date=run_at, args=[msg_id], id=_job_id_for(msg_id), replace_existing=True
             )
             count += 1
         except Exception:
@@ -793,13 +242,10 @@ async def load_and_schedule_pending():
 
     logger.info("Scheduled %d pending messages from DB.", count)
 
+# ------------------------ Utilities --------------------------
 
-# ---- Admin & privacy helpers ----
-_ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()}
-_DEFAULT_TARGET_CHAT = int(os.getenv("ADMIN_DEFAULT_CHAT_ID", "0") or "0")
-
-def _is_admin(user_id: int) -> bool:
-    return user_id in _ADMIN_IDS
+def _is_admin(user_id: int) -> bool: return user_id in _ADMIN_IDS
+def _is_private_chat(msg: Message) -> bool: return getattr(msg.chat, "type", "") == "private"
 
 async def _delete_soon(chat_id: int, message_id: int, delay: float = 2.0):
     try:
@@ -808,1018 +254,17 @@ async def _delete_soon(chat_id: int, message_id: int, delay: float = 2.0):
     except Exception:
         pass
 
-def _is_private_chat(msg: Message) -> bool:
-    # aiogram v3: "private", "group", "supergroup", "channel"
-    return getattr(msg.chat, "type", "") == "private"
-# ---- In-memory scheduled jobs (lost on restart) ----
-# We keep a small registry so you can /schedule_list and /schedule_cancel
-from dataclasses import dataclass
+# ------------------------ AI layer ---------------------------
 
-@dataclass
-class _SchedInfo:
-    job_id: str
-    chat_id: int
-    run_at: dt.datetime
-    text: str
-
-_scheduled: Dict[int, _SchedInfo] = {}      # key: internal numeric id we assign
-_next_sched_id = 1
-
-def _next_id() -> int:
-    global _next_sched_id
-    v = _next_sched_id
-    _next_sched_id += 1
-    return v
-
-async def _deliver_scheduled(chat_id: int, text: str):
-    try:
-        await bot.send_message(chat_id, text)
-    except Exception:
-        logger.exception("Deliver scheduled message failed")
-
-# ===============================================================
-
-
-random_jobs: Dict[int, Job] = {}
-
-def next_random_time(now: dt.datetime) -> dt.datetime:
-    hour = _sysrand.randint(WINDOW_START, WINDOW_END)
-    minute = _sysrand.randint(0, 59)
-    run_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if run_at <= now:
-        run_at += dt.timedelta(days=1)
-    return run_at
-
-def schedule_random_daily(chat_id: int) -> None:
-    old = random_jobs.get(chat_id)
-    if old:
-        try:
-            old.remove()
-        except Exception:
-            pass
-
-    now = dt.datetime.now(TZ)
-    run_at = next_random_time(now)
-
-    async def send_and_reschedule():
-        try:
-            await bot.send_message(chat_id, DAILY_TEXT)
-            # Schedule follow-up exactly 1 hour later (no long sleeps)
-            scheduler.add_job(
-                bot.send_message,
-                "date",
-                run_date=dt.datetime.now(TZ) + dt.timedelta(hours=1),
-                args=[chat_id,
-                      "The hour has passed, the covenant stands. No debt weighs upon those who rise in unison. "
-                      "The choice has always been yours. I hope you made the right one."]
-            )
-        finally:
-            tomorrow = dt.datetime.now(TZ) + dt.timedelta(days=1)
-            next_run = next_random_time(tomorrow)
-            new_job = scheduler.add_job(send_and_reschedule, "date", run_date=next_run)
-            random_jobs[chat_id] = new_job
-
-    job = scheduler.add_job(send_and_reschedule, "date", run_date=run_at)
-    random_jobs[chat_id] = job
-
-# --- Player roster used by Weekly Prophecy AND Dice of Fate ---
-PLAYERS = ["Fresh", "Momo", "Valle", "Tän", "Hampa"]
-
-# ===== Weekly votes (non-anonymous) =====
-weakest_votes: Dict[int, Dict[str, Dict[int, str]]] = {}
-inspiration_votes: Dict[int, Dict[str, Dict[int, str]]] = {}
-
-# Poll ID → { kind: 'weakest'|'inspiration', chat_id: int, options: [players] }
-POLL_META: Dict[str, Dict[str, object]] = {}
-
-def _week_key_now() -> str:
-    now = dt.datetime.now(TZ)
-    iso = now.isocalendar()
-    return f"{iso.year}-W{iso.week:02d}"
-
-def _ensure_vote_map(bucket: Dict[int, Dict[str, Dict[int, str]]], chat_id: int, week_key: str) -> Dict[int, str]:
-    by_chat = bucket.setdefault(chat_id, {})
-    return by_chat.setdefault(week_key, {})
-
-# ================== Quotes rotation (daily 07:00 + /share_wisdom) ==================
-QUOTES = [
-    "“Gravity is my quill; with each rep I write strength upon your bones.”",
-    "“Do not count your pushups—make your pushups count, and the numbers will fear you.”",
-    # ... (keep the rest of your QUOTES list unchanged)
-    "“Raise your standards before you raise your reps.”",
-]
-
-_quote_rotation: Dict[int, deque] = {}
-
-def _init_quote_rotation(chat_id: int) -> None:
-    if not QUOTES:
-        _quote_rotation[chat_id] = deque()
-        return
-    order = list(range(len(QUOTES)))
-    _sysrand.shuffle(order)
-    _quote_rotation[chat_id] = deque(order)
-
-def _next_quote(chat_id: int) -> Optional[str]:
-    if not QUOTES:
-        return None
-    dq = _quote_rotation.get(chat_id)
-    if dq is None or not dq:
-        _init_quote_rotation(chat_id)
-        dq = _quote_rotation[chat_id]
-    idx = dq.popleft()
-    return QUOTES[idx]
-
-async def send_daily_quote(chat_id: int):
-    q = _next_quote(chat_id)
-    if q is None:
-        return
-    safe = html.escape(q)
-    await bot.send_message(chat_id, f"🕖 Daily Wisdom\n{safe}")
-
-# ================== DICE OF FATE ==================
-
-FATE_WEIGHTS = [
-    ("miracle",         3),
-    ("mercy_coin",      6),
-    ("trial_form",     10),
-    ("command_prophet",10),
-    ("giver",          12),
-    ("hurricane",      10),
-    ("oath_dawn",      16),
-    ("trial_flesh",    15),
-    ("tribute_blood",  15),
-    ("wrath",           3),
-]
-
-def _pick_fate_key() -> str:
-    keys = [k for k, _ in FATE_WEIGHTS]
-    weights = [w for _, w in FATE_WEIGHTS]
-    return _sysrand.choices(keys, weights=weights, k=1)[0]
-
-FATE_RULES_TEXT = (
-    "<b>Dice of Fate</b>\n\n"
-    "(3%) — ✨ <b>The Miracle</b> — Halve your debt\n"
-    "(6%) — 🪙 <b>Mercy Coin</b> — Skip one regular pushup day\n"
-    "(10%) — ⚔️ <b>Trial of Form</b> — Do 10 perfect pushups → erase 20 kr of debt\n"
-    "(10%) — 👑 <b>Command of the Prophet</b> — Pick a player: He does 30 pushups or 30 kr\n"
-    "(12%) — 🤝 <b>The Giver</b> — Give away 40 of your daily pushups to a random player\n"
-    "\n"
-    "(10%) — 🌪️ <b>Hurricane of Chaos</b> — Pay 10 kr; shift 10% of your debt to random player\n"
-    "(16%) — 🌅 <b>Oath of Dawn</b> — Be first tomorrow or pay 30 kr\n"
-    "(15%) — 🔥 <b>Trial of Flesh</b> — 100 pushups today or +45 kr\n"
-    "(15%) — 🩸 <b>Tribute of Blood</b> — Pay 50 kr\n"
-    "(3%) — ⚡ <b>Prophet’s Wrath</b> — Double your debt"
-)
-
-_fate_rolls: Dict[int, tuple[dt.date, set[int]]] = {}
-
-def _today_stockholm_date() -> dt.date:
-    return dt.datetime.now(TZ).date()
-
-def _fate_reset_if_new_day(chat_id: int):
-    today = _today_stockholm_date()
-    state = _fate_rolls.get(chat_id)
-    if not state or state[0] != today:
-        _fate_rolls[chat_id] = (today, set())
-
-def _fate_has_rolled_today(chat_id: int, user_id: int) -> bool:
-    _fate_reset_if_new_day(chat_id)
-    return user_id in _fate_rolls[chat_id][1]
-
-def _fate_mark_rolled(chat_id: int, user_id: int):
-    _fate_reset_if_new_day(chat_id)
-    _fate_rolls[chat_id][1].add(user_id)
-
-def _fate_epic_text(key: str, target_name: Optional[str] = None) -> str:
-    closers = [
-        "Thus it is spoken—walk wisely.",
-        "So decrees the Prophet—bear the mark with honor.",
-        "The die grows silent; let your deeds answer.",
-        "The seal is set; may your will not waver.",
-        "The wind keeps the tally; choose well.",
-    ]
-    end = _sysrand.choice(closers)
-    texts = {
-        "miracle": (
-            "✨ <b>The Miracle</b>\n"
-            "The scales tilt toward mercy. Your burden is cleaved in half."
-        ),
-        "giver": (
-            "🤝 <b>The Giver</b>\n"
-            + (
-                f"Give away <b>40</b> of your daily pushups to <b>{html.escape(target_name)}</b>. Strength shared is strength multiplied."
-                if target_name else
-                "Give away <b>40</b> of your daily pushups to a random player. Strength shared is strength multiplied."
-            )
-        ),
-        "trial_form": (
-            "⚔️ <b>Trial of Form</b>\n"
-            "Offer <b>10</b> perfect pushups—tempo true, depth honest—and erase <b>20 kr</b> of debt."
-        ),
-        "command_prophet": (
-            "👑 <b>Command of the Prophet</b>\n"
-            "Pick a player: he does <b>30</b> pushups or pays <b>30 kr</b>. Authority tests friendship."
-        ),
-        "mercy_coin": (
-            "🪙 <b>Mercy Coin</b>\n"
-            "One regular day is pardoned. Do not spend it cheaply."
-        ),
-        "hurricane": (
-            "🌪️ <b>Hurricane of Chaos</b>\n"
-            "Pay <b>10 kr</b>; then shift <b>10%</b> of your debt to a random player."
-        ),
-        "oath_dawn": (
-            "🌅 <b>Oath of Dawn</b>\n"
-            "Be first to rise tomorrow or pay <b>30 kr</b>. Dawn reveals the faithful."
-        ),
-        "trial_flesh": (
-            "🔥 <b>Trial of Flesh</b>\n"
-            "Choose today: <b>100</b> pushups—or lay <b>45 kr</b> upon the altar."
-        ),
-        "tribute_blood": (
-            "🩸 <b>Tribute of Blood</b>\n"
-            "The pot demands <b>50 kr</b>. Pay without grudge, learn without delay."
-        ),
-        "wrath": (
-            "⚡ <b>Prophet’s Wrath</b>\n"
-            "Your debt is doubled. Pride withers; discipline takes its seat."
-        ),
-    }
-    return texts.get(key, "The die rolls into shadow.") + f"\n\n<i>{end}</i>"
-
-@dp.message(Command("fate", "dice", "dice_of_fate"))
-async def fate_cmd(msg: Message):
-    await msg.answer("“You dare summon the Dice of Fate. The air trembles with judgment.”")
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Roll the Dice 🎲", callback_data="fate:roll"),
-        InlineKeyboardButton(text="Cancel", callback_data="fate:cancel"),
-    ]])
-    await msg.answer(FATE_RULES_TEXT, reply_markup=kb)
-
-@dp.callback_query(F.data == "fate:cancel")
-async def fate_cancel(cb: CallbackQuery):
-    await cb.answer("The Dice return to their slumber.")
-    await cb.message.answer("The Dice close their eyes. Another day, perhaps.")
-
-@dp.callback_query(F.data == "fate:roll")
-async def fate_roll(cb: CallbackQuery):
-    chat_id = cb.message.chat.id
-    user_id = cb.from_user.id
-
-    if _fate_has_rolled_today(chat_id, user_id):
-        return await cb.answer("You have already rolled today. Return with the next dawn.", show_alert=True)
-
-    _fate_mark_rolled(chat_id, user_id)
-    fate_key = _pick_fate_key()
-
-    target = None
-    if fate_key == "giver":
-        target = _sysrand.choice(PLAYERS) if PLAYERS else None
-
-    epic = _fate_epic_text(fate_key, target_name=target)
-    await cb.answer()
-
-    if fate_key == "hurricane":
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🎯 Select random player", callback_data="hurricane:spin")
-        ]])
-        await cb.message.answer(epic, reply_markup=kb)
-    else:
-        await cb.message.answer(epic)
-
-@dp.callback_query(F.data == "hurricane:spin")
-async def hurricane_spin(cb: CallbackQuery):
-    invoker = (cb.from_user.first_name or "").strip()
-    candidates = [p for p in PLAYERS if p.lower() != invoker.lower()] or PLAYERS
-    if not candidates:
-        await cb.answer("No players configured.", show_alert=True)
-        return
-    target = _sysrand.choice(candidates)
-    await cb.answer()
-    await cb.message.answer(
-        f"🎯 The storm chooses: <b>{html.escape(target)}</b>.\n"
-        f"Shift <b>10%</b> of your debt to them. Order is restored."
-    )
-
-FATE_SUMMON_RE = re.compile(
-    r"\b(?:dice\s+of\s+fate|summon(?:\s+the)?\s+dice(?:\s+of\s+fate)?|fate\s+dice|roll\s+the\s+dice\s+of\s+fate)\b",
-    re.IGNORECASE
-)
-
-@dp.message(F.text.func(lambda t: isinstance(t, str)
-                        and not t.strip().startswith("/")
-                        and FATE_SUMMON_RE.search(t)))
-async def fate_natural(msg: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Roll the Dice 🎲", callback_data="fate:roll"),
-        InlineKeyboardButton(text="Cancel", callback_data="fate:cancel"),
-    ]])
-    await msg.answer("“You dare summon the Dice of Fate. The air trembles with judgment.”")
-    await msg.answer(FATE_RULES_TEXT, reply_markup=kb)
-
-# ================== Gratitude / Blessings ==================
-BLESSINGS = [
-    "Your thanks is heard, {name}. May your shoulders carry light burdens and your will grow heavy with resolve.",
-    "Gratitude received, {name}. Walk with steady breath; strength will meet you there.",
-    "I accept your thanks, {name}. May your form be honest and your progress inevitable.",
-    "Your gratitude is a good omen, {name}. Rise clean, descend wiser.",
-    "I hear you, {name}. Let patience be your spotter and discipline your crown.",
-    "Thanks received, {name}. May the floor count only truths from your chest.",
-    "Your words land true, {name}. Let calm lead effort and effort shape destiny.",
-    "I accept this tribute of thanks, {name}. May your last rep be your cleanest.",
-    "Gratitude noted, {name}. Keep the vow; the vow will keep you.",
-    "I receive your thanks, {name}. Temper the ego, sharpen the technique.",
-    "Your thanks rings clear, {name}. May rest write tomorrow’s strength into your bones.",
-    "Heard and held, {name}. Let the first push greet the day, and the last bless your night.",
-    "I take your thanks, {name}. Let honesty be your range and courage your tempo.",
-    "Your gratitude strengthens the circle, {name}. Share cadence; arrive together.",
-    "Acknowledged, {name}. May your spine stay straight and your standard even straighter.",
-]
-
-def _compose_blessing(user_name: Optional[str]) -> str:
-    safe = html.escape(user_name or "friend")
-    base = _sysrand.choice(BLESSINGS).format(name=safe)
-    if _sysrand.random() < 0.05:
-        base += "\n\n🪙 <b>Favor of Gratitude</b> — Deduct <b>20 kr</b> from your debt for your loyalty."
-    return base
-
-_gratitude_uses: Dict[int, tuple[dt.date, int]] = {}
-
-def _gratitude_inc_and_get(user_id: int) -> int:
-    today = _today_stockholm_date()
-    state = _gratitude_uses.get(user_id)
-    if not state or state[0] != today:
-        _gratitude_uses[user_id] = (today, 0)
-    count = _gratitude_uses[user_id][1] + 1
-    _gratitude_uses[user_id] = (today, count)
-    return count
-
-def _compose_gratitude_penalty(user_name: Optional[str]) -> str:
-    safe = html.escape(user_name or "friend")
-    return (
-        f"Your gratitude pours too freely today, {safe}. The floor is not fooled by sugar on the tongue.\n"
-        f"Let your deeds do the thanking.\n\n"
-        f"<b>Edict:</b> Lay <b>10 kr</b> in the pot and return with a steadier heart."
-    )
-
-THANKS_RE = re.compile(r"\b(thank(?:\s*you)?|thanks|thx|ty|tack(?:\s*så\s*mycket)?)\b", re.IGNORECASE)
-
-@dp.message(F.text.func(lambda t: isinstance(t, str) and not t.strip().startswith("/") and THANKS_RE.search(t)))
-async def thanks_plain(msg: Message):
-    try:
-        # NEW: store/display name for this user in this chat
-        await upsert_username(
-            msg.chat.id,
-            msg.from_user.id,
-            getattr(msg.from_user, "first_name", None),
-            getattr(msg.from_user, "username", None),
-        )
-        # existing: increment the counter
-        await incr_counter(msg.chat.id, msg.from_user.id, "thanks", 1)
-    except Exception:
-        logger.exception("Failed to log 'thanks' counter")
-
-    attempts = _gratitude_inc_and_get(msg.from_user.id)
-    name = getattr(msg.from_user, "first_name", None)
-    if attempts > 5:
-        await msg.answer(_compose_gratitude_penalty(name))
-    else:
-        await msg.answer(_compose_blessing(name))
-
-
-# ================== Apologies / Absolution ==================
-APOLOGY_RE = re.compile(
-    r"\b("
-    r"sorry|i\s*(?:am|’m|'m)\s*sorry|i\s*apolog(?:ise|ize)|apologies|apology|"
-    r"my\s*bad|my\s*fault|i\s*was\s*wrong|didn'?t\s*mean|forgive\s*me|"
-    r"förlåt|ursäkta|jag\s*är\s*ledsen|ber\s*om\s*ursäkt|mitt\s*fel"
-    r")\b",
-    re.IGNORECASE
-)
-
-APOLOGY_RESPONSES = [
-    "Your apology is received, {name}. Mercy given; standard unchanged—meet it.",
-    "I accept your apology, {name}. Make it right in form and in habit.",
-    "Apology taken in, {name}. Rise cleaner; let your next set speak.",
-    "Heard and accepted, {name}. Forgiveness is a door—walk through with discipline.",
-    "I receive this apology, {name}. No excuses; only better repetitions.",
-    "Acknowledged, {name}. The slate is lighter; the bar is not.",
-    "Your apology lands true, {name}. Now let consistency seal it.",
-    "Accepted, {name}. Pay with honesty at the bottom and patience at the top.",
-    "I grant you grace, {name}. Earn it in the quiet work.",
-    "Apology noted, {name}. The floor keeps score—answer it.",
-    "I hear contrition, {name}. Return to the standard; leave the drama.",
-    "Received, {name}. Forgiveness is given; trust is trained.",
-    "Your apology is accounted for, {name}. Now do the next right rep.",
-    "I accept and remember, {name}. Let this be a turn, not a tale.",
-    "Grace extends to you, {name}. Guard your form; guard your word.",
-    "Apology accepted, {name}. Show me steadiness—louder than talk.",
-    "Your regret is clear, {name}. Set your spine; set your course.",
-    "I receive your apology, {name}. Be exact; be early; be better.",
-    "Pardon granted, {name}. Debt remains to effort—pay it daily.",
-    "Your apology is welcomed, {name}. Let discipline finish what remorse began.",
-]
-
-def _compose_absolution(user_name: Optional[str]) -> str:
-    safe = html.escape(user_name or "friend")
-    return _sysrand.choice(APOLOGY_RESPONSES).format(name=safe)
-
-@dp.message(F.text.func(lambda t: isinstance(t, str)
-                        and not t.strip().startswith("/")
-                        and APOLOGY_RE.search(t)))
-
-
-async def apology_reply(msg: Message):
-    try:
-        # NEW: store/display name
-        await upsert_username(
-            msg.chat.id,
-            msg.from_user.id,
-            getattr(msg.from_user, "first_name", None),
-            getattr(msg.from_user, "username", None),
-        )
-        # existing: increment counter
-        await incr_counter(msg.chat.id, msg.from_user.id, "apology", 1)
-    except Exception:
-        logger.exception("Failed to log 'apology' counter")
-
-    text = _compose_absolution(getattr(msg.from_user, "first_name", None))
-    await msg.answer(text)
-
-
-# === Negativity / insult watcher ===
-def _normalize_text(t: str) -> str:
-    t = re.sub(r"[\u200b-\u200f\u202a-\u202e]", "", t or "")
-    return t.lower()
-
-MENTION_RE = r"(?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b)"
-
-INSULT_WORDS = (
-    r"(?:"
-    r"fuck(?:ing|er|ed)?|f\*+ck|f\W*u\W*c\W*k|"
-    r"shit|bull\W*sh(?:it|\*?t)|crap|trash|garbage|bs|"
-    r"sucks?|stupid|idiot|moron|dumb(?:ass)?|loser|pathetic|awful|terrible|useless|worthless|annoying|cringe|fraud|fake|clown|nonsense|"
-    r"bitch|ass(?:hole|hat|clown)?|dick(?:head)?|prick|jerk|"
-    r"wank(?:er)?|twat|tosser|dipshit|jackass|motherfucker|mf"
-    r")"
-)
-
-DIRECT_2P = (
-    r"(?:"
-    r"fuck\s*(?:you|u|ya)|"
-    r"screw\s*you|stfu|shut\s*up|"
-    r"you\s*(?:suck|are\s*(?:stupid|dumb|useless|worthless|annoying|terrible|awful)|"
-    r"idiot|moron|loser|clown|bitch|asshole|prick|jerk|dickhead|wanker|twat)"
-    r")"
-)
-
-INSULT_RE = re.compile(
-    rf"""
-    (?:
-        (?:{MENTION_RE}).*?(?:{INSULT_WORDS})
-        |
-        (?:{INSULT_WORDS}).*?(?:{MENTION_RE})
-    )
-    |
-    (?:{DIRECT_2P})
-    |
-    (?:
-        fuck\s*this\s*shit
-        | fuck(?:ing)?\s+bull\W*shit
-        | (?:bull\W*shit|bullsh\*?t)\s*(?:prophet|bot|push\s*up\s*prophet)
-        | (?:garbage|trash|worst)\s*bot
-        | fuck\s*off
-        | go\s*to\s*hell
-    )
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-REBUKES = [
-    "I hear your anger, {name}. I receive it—and I answer with steadiness.",
-    "Your words land, {name}. I take them in, and I remain your witness.",
-    "I receive your sting, {name}. May your breath be longer than your temper.",
-    "Noted, {name}. Your voice is heard; let your form speak next.",
-    "Heard, {name}. I accept your heat—discipline will cool it.",
-    "I accept your edge, {name}. The floor counts truth; so do I.",
-    "Taken in, {name}. Let us turn sharp words into clean reps.",
-    "Received, {name}. I stand; may your resolve stand with me.",
-    "Your message is clear, {name}. Let patience be clearer.",
-    "Understood, {name}. I acknowledge you—and call you higher.",
-    "I hear you, {name}. I do not flinch; I invite you back to the work.",
-    "Acknowledged, {name}. Strength listens, then answers with action.",
-    "Your frustration is seen, {name}. I hold it, and I hold the standard.",
-    "I take your words, {name}. I will still meet you at the floor.",
-    "Message received, {name}. Let your next rep say more than this one.",
-]
-
-def _compose_rebuke(user_name: Optional[str]) -> str:
-    safe = html.escape(user_name or "traveler")
-    base = _sysrand.choice(REBUKES).format(name=safe)
-    if _sysrand.random() < 0.10:
-        base += "\n\n<b>Edict:</b> Lay <b>20 kr</b> in the pot as penance for disrespect."
-    return base
-
-@dp.message(F.text.func(lambda t: isinstance(t, str)
-                        and INSULT_RE.search(_normalize_text(t))
-                        and not APOLOGY_RE.search(t)))
-async def prophet_insult_rebuke(msg: Message):
-    try:
-        # store/display name
-        await upsert_username(
-            msg.chat.id,
-            msg.from_user.id,
-            getattr(msg.from_user, "first_name", None),
-            getattr(msg.from_user, "username", None),
-        )
-        # increment the 'insult' metric
-        await incr_counter(msg.chat.id, msg.from_user.id, "insult", 1)
-    except Exception:
-        logger.exception("Failed to log 'insult' counter")
-
-    text = _compose_rebuke(getattr(msg.from_user, "first_name", None))
-    await msg.answer(text)
-
-# --- Helpers for sending the next quote ---
-async def _send_next_quote_to_chat(chat_id: int):
-    q = _next_quote(chat_id)
-    if not q:
-        await bot.send_message(chat_id, "No quotes configured yet.")
-        return
-    await bot.send_message(chat_id, html.escape(q))
-
-def _build_vote_kb(kind: str) -> InlineKeyboardMarkup:
-    buttons, row = [], []
-    for i, p in enumerate(PLAYERS, 1):
-        row.append(InlineKeyboardButton(text=p, callback_data=f"vote:{kind}:{p}"))
-        if i % 3 == 0:
-            buttons.append(row); row = []
-    if row: buttons.append(row)
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-async def send_weekly_vote_prompts(chat_id: int):
-    options = list(PLAYERS)
-    msg_w = await bot.send_poll(
-        chat_id=chat_id,
-        question="🏷️ The Weakest Link — Who struggled the most this week?",
-        options=options,
-        is_anonymous=False,
-        allows_multiple_answers=False,
-    )
-    if msg_w.poll:
-        POLL_META[msg_w.poll.id] = {"kind": "weakest", "chat_id": chat_id, "options": options}
-
-    msg_i = await bot.send_poll(
-        chat_id=chat_id,
-        question="🌟 The Inspiration — Who inspired the circle this week?",
-        options=options,
-        is_anonymous=False,
-        allows_multiple_answers=False,
-    )
-    if msg_i.poll:
-        POLL_META[msg_i.poll.id] = {"kind": "inspiration", "chat_id": chat_id, "options": options}
-
-@dp.message(Command("share_wisdom"))
-async def share_wisdom_cmd(msg: Message):
-    await _send_next_quote_to_chat(msg.chat.id)
-
-_WISDOM_PATTERNS = [
-    r"\bshare\s+wisdom\b",
-    r"\bgive\s+(?:me\s+)?wisdom\b",
-    r"\bsay\s+(?:something\s+)?wise\b",
-    r"\bwisdom\s+please\b",
-    r"\bteach\s+me\b",
-    r"\bi\s+seek\s+wisdom\b",
-    r"\bprophet[,!\s]*\s*(?:share|give|drop)\s+(?:some\s+)?wisdom\b",
-    r"\bdrop\s+(?:some\s+)?wisdom\b",
-]
-_WISDOM_RES = [re.compile(p, re.IGNORECASE) for p in _WISDOM_PATTERNS]
-def _matches_wisdom_nat(t: str) -> bool:
-    return any(rx.search(t) for rx in _WISDOM_RES)
-
-@dp.message(F.text.func(lambda t: isinstance(t, str)
-                        and not t.strip().startswith("/")
-                        and _matches_wisdom_nat(t)))
-async def share_wisdom_natural(msg: Message):
-    await _send_next_quote_to_chat(msg.chat.id)
-
-@dp.message(F.text.func(lambda t: isinstance(t, str) and t.strip().lower().startswith("/share wisdom")))
-async def share_wisdom_space_alias(msg: Message):
-    await _send_next_quote_to_chat(msg.chat.id)
-
-# ==== Prophet Summon Reactions ====
-SUMMON_RESPONSES = [
-    "Did someone summon me?",
-    "A whisper reaches the floor—speak, seeker.",
-    "The air stirs; the Prophet listens.",
-    "You called; discipline answers.",
-    "The Pushup Prophet hears. State your petition.",
-    "The floor remembers every name. What do you ask?",
-    "I rise where I’m named. What truth do you seek?",
-]
-SUMMON_PATTERN = re.compile(r"\b(pushup\s*prophet|prophet)\b", re.IGNORECASE)
-
-@dp.message(F.text.func(lambda t: isinstance(t, str)
-                        and not t.strip().startswith("/")
-                        and SUMMON_PATTERN.search(t)
-                        and not THANKS_RE.search(t)
-                        and not _matches_wisdom_nat(t)
-                        and not APOLOGY_RE.search(t)))
-async def summon_reply(msg: Message):
-    logger.info(f"[SUMMON] got mention in chat={msg.chat.id} text={msg.text!r}")
-    try:
-        await upsert_username(
-            msg.chat.id, msg.from_user.id,
-            getattr(msg.from_user, "first_name", None),
-            getattr(msg.from_user, "username", None),
-        )
-        await incr_counter(msg.chat.id, msg.from_user.id, "mention", 1)
-    except Exception:
-        logger.exception("Failed to log 'mention' counter")
-
-    if await get_ai_enabled(msg.chat.id):
-        logger.info("[SUMMON] AI enabled -> calling AI directly from summon handler")
-        name = getattr(msg.from_user, "first_name", "") or (msg.from_user.username or "friend")
-        user_text = msg.text or ""
-        messages = [{"role": "user", "content": f"{name}: {user_text}"}]
-        reply = await ai_reply(PROPHET_SYSTEM, messages)
-        if reply:
-            await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
-        else:
-            logger.warning("[SUMMON] AI returned empty; falling back to canned reply")
-            await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
-        return
-
-
-
-
-# --------- Other Handlers ----------
-
-
-
-@dp.message(Command("ai_ping"))
-async def ai_ping_cmd(msg: Message):
-    reply = await ai_reply(PROPHET_SYSTEM, [
-        {"role": "user", "content": "Give me one crisp pushup cue."}
-    ])
-    if reply:
-        await msg.answer(f"AI OK:\n{reply}", disable_web_page_preview=True, parse_mode=None)
-    else:
-        await msg.answer("AI call failed. Check server logs and OPENAI_API_KEY/OPENAI_MODEL.")
-
-
-@dp.message(Command("chatid"))
-async def chatid_cmd(msg: Message):
-    await msg.answer(f"Chat ID: <code>{msg.chat.id}</code>")
-
-@dp.message(F.text.func(lambda t: isinstance(t, str) and t.strip().lower().startswith(("/chatid", "/chatid@"))))
-async def chatid_fallback(msg: Message):
-    await msg.answer(f"Chat ID: <code>{msg.chat.id}</code>")
-
-
-@dp.message(CommandStart())
-async def start_cmd(msg: Message):
-    await msg.answer(
-        "I am the Pushup Prophet.\n\n"
-        "What I can do for you:\n"
-        "• Ask for wisdom and I shall give.\n"
-        "• Summon the Dice of Fate (one roll per person per day).\n\n"
-        "Be aware of the Forgiveness Chain:\n"
-        "• /enable_random — enable the Forgiveness Chain for this chat.\n"
-        "• /disable_random — disable the Forgiveness Chain for this chat.\n"
-        "• /status_random — check whether the Forgiveness Chain is enabled.\n\n"
-        "AI controls:\n"
-        "• /enable_ai — allow AI replies in this chat\n"
-        "• /disable_ai — stop AI replies in this chat\n"
-        "• /status_ai — show AI status\n\n"
-        "You shall see me at every dawn. May the power of the Push be with you."
-    )
-
-@dp.message(Command("help"))
-async def help_cmd(msg: Message):
-    await start_cmd(msg)
-
-# === NEW: AI control commands ===
-@dp.message(Command("ai_status"))
-async def ai_status_cmd(msg: Message):
-    enabled = await get_ai_enabled(msg.chat.id)
-    await msg.answer(f"AI status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
-
-@dp.message(Command("enable_ai"))
-async def enable_ai_cmd(msg: Message):
-    await set_ai_enabled(msg.chat.id, True)
-    enabled = await get_ai_enabled(msg.chat.id)
-    logger.info(f"[AI TOGGLE] chat={msg.chat.id} set True -> now {enabled}")
-    await msg.answer("🤖 AI replies enabled for this chat.")
-
-@dp.message(Command("disable_ai"))
-async def disable_ai_cmd(msg: Message):
-    await set_ai_enabled(msg.chat.id, False)
-    enabled = await get_ai_enabled(msg.chat.id)
-    logger.info(f"[AI TOGGLE] chat={msg.chat.id} set False -> now {enabled}")
-    await msg.answer("🛑 AI replies disabled for this chat.")
-
-@dp.message(Command("ai_debug"))
-async def ai_debug_cmd(msg: Message):
-    chat_id = msg.chat.id
-    try:
-        async with AsyncSessionLocal() as s:
-            res = await s.execute(
-                select(ChatSettings.chat_id, ChatSettings.ai_enabled, ChatSettings.changed_at)
-                .where(ChatSettings.chat_id == chat_id)
-            )
-            row = res.first()
-        enabled = await get_ai_enabled(chat_id)
-        await msg.answer(
-            "AI debug\n"
-            f"chat_id: {chat_id}\n"
-            f"get_ai_enabled(): {enabled}\n"
-            f"row: {row if row else 'NO ROW'}"
-        )
-    except Exception as e:
-        logger.exception("ai_debug failed")
-        await msg.answer(f"ai_debug failed: {e!r}")
-
-
-@dp.message(Command("vote_now", "weekly_votes", "votes_now"))
-async def vote_now_cmd(msg: Message):
-    await send_weekly_vote_prompts(msg.chat.id)
-    await msg.answer("🗳️ The weekly vote prompts have been posted.")
-
-@dp.poll_answer()
-async def handle_poll_vote(pa: PollAnswer):
-    poll_id = pa.poll_id
-    meta = POLL_META.get(poll_id)
-    if not meta:
-        return
-    option_ids = pa.option_ids or []
-    if not option_ids:
-        return
-    idx = option_ids[0]
-    options: List[str] = meta["options"]  # type: ignore
-    if idx < 0 or idx >= len(options):
-        return
-    player = options[idx]
-    kind = meta["kind"]            # 'weakest' or 'inspiration'
-    chat_id = meta["chat_id"]
-    week_key = _week_key_now()
-    user_id = pa.user.id
-    bucket = weakest_votes if kind == "weakest" else inspiration_votes
-    votes_map = _ensure_vote_map(bucket, chat_id, week_key)
-    votes_map[user_id] = player
-
-    voter_name = (pa.user.full_name or pa.user.first_name or pa.user.username or "Someone").strip()
-    safe_voter = html.escape(voter_name)
-    safe_player = html.escape(player)
-    label = "The Weakest Link" if kind == "weakest" else "The Inspiration"
-    await bot.send_message(chat_id, f"🗳️ <b>{safe_voter}</b> voted <b>{safe_player}</b> as <i>{label}</i>.")
-
-@dp.message(Command("enable_random"))
-async def enable_random_cmd(msg: Message):
-    schedule_random_daily(msg.chat.id)
-    await msg.answer("✅ Forgiveness Chain enabled for this chat. I will announce once per day between 07:00–22:00 Stockholm, then follow up 1 hour later.")
-
-@dp.message(Command("disable_random"))
-async def disable_random_cmd(msg: Message):
-    job = random_jobs.pop(msg.chat.id, None)
-    if job:
-        try: job.remove()
-        except Exception: pass
-        await msg.answer("🛑 Forgiveness Chain disabled for this chat.")
-    else:
-        await msg.answer("It wasn’t enabled for this chat.")
-
-@dp.message(Command("status_random"))
-async def status_random_cmd(msg: Message):
-    enabled = msg.chat.id in random_jobs
-    await msg.answer(f"Forgiveness Chain status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
-
-# ================== Private admin scheduling ==================
-@dp.message(Command("schedule_once"))
-async def schedule_once_cmd(msg: Message):
-    if not _is_admin(msg.from_user.id):
-        return
-
-    # If someone runs it in a group: delete the command so nothing leaks
-    if not _is_private_chat(msg):
-        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
-        try:
-            m = await msg.answer("Use this command in a private chat with me.")
-            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
-        except Exception:
-            pass
-        return
-
-    # Parse:
-    # A) DM default target:  /schedule_once 2025-10-01 18:30 | Message text
-    # B) Explicit target:    /schedule_once -1001234567890 2025-10-01 18:30 | Message text
-    raw = re.sub(r"^/schedule_once(@\w+)?\s*", "", (msg.text or ""), flags=re.IGNORECASE).strip()
-    if "|" not in raw:
-        return await msg.answer(
-            "Usage:\n"
-            "/schedule_once 2025-10-01 18:30 | Your message\n"
-            "or\n"
-            "/schedule_once -1001234567890 2025-10-01 18:30 | Your message"
-        )
-
-    left, text = [p.strip() for p in raw.split("|", 1)]
-    parts = left.split()
-
-    # optional explicit chat id
-    if parts and parts[0].lstrip("-").isdigit() and len(parts) >= 3:
-        target_chat_id = int(parts[0])
-        when_part = " ".join(parts[1:3])
-    else:
-        target_chat_id = _DEFAULT_TARGET_CHAT
-        when_part = " ".join(parts[:2]) if len(parts) >= 2 else ""
-
-    if not target_chat_id:
-        return await msg.answer("No target chat set. Define ADMIN_DEFAULT_CHAT_ID in .env or pass chat id explicitly.")
-
-    try:
-        dt_local = dt.datetime.strptime(when_part, "%Y-%m-%d %H:%M")
-        run_at = TZ.localize(dt_local)
-    except Exception:
-        return await msg.answer("Time must be YYYY-MM-DD HH:MM (Stockholm).")
-
-    if not text:
-        return await msg.answer("Message text cannot be empty.")
-
-    # schedule
-    sched_id = _next_id()
-    job = scheduler.add_job(
-        _deliver_scheduled, "date",
-        run_date=run_at,
-        args=[target_chat_id, text]
-    )
-    _scheduled[sched_id] = _SchedInfo(job.id, target_chat_id, run_at, text)
-
-    await msg.answer(f"✅ Scheduled #{sched_id} → {target_chat_id} at {run_at.strftime('%Y-%m-%d %H:%M %Z')}.")
-
-@dp.message(Command("schedule_many"))
-async def schedule_many_cmd(msg: Message):
-    if not _is_admin(msg.from_user.id):
-        return
-
-    if not _is_private_chat(msg):
-        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
-        try:
-            m = await msg.answer("Use this command in a private chat with me.")
-            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
-        except Exception:
-            pass
-        return
-
-    body = re.sub(r"^/schedule_many(@\w+)?\s*", "", (msg.text or ""), flags=re.IGNORECASE).strip()
-    if not body:
-        return await msg.answer(
-            "Paste multiple lines after the command, for example:\n"
-            "/schedule_many\n"
-            "2025-10-02 07:00 | Morning: receipts decide truth.\n"
-            "-1001234567890 2025-10-05 20:30 | Night check-in (explicit target)."
-        )
-
-    ok, bad = [], []
-    for line in body.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "|" not in line:
-            bad.append((line, "Missing '|'"))
-            continue
-
-        left, text = [p.strip() for p in line.split("|", 1)]
-        parts = left.split()
-
-        # optional target
-        if parts and parts[0].lstrip("-").isdigit() and len(parts) >= 3:
-            target_chat_id = int(parts[0])
-            when_part = " ".join(parts[1:3])
-        else:
-            target_chat_id = _DEFAULT_TARGET_CHAT
-            when_part = " ".join(parts[:2]) if len(parts) >= 2 else ""
-
-        if not target_chat_id:
-            bad.append((line, "No default target chat configured"))
-            continue
-
-        try:
-            dt_local = dt.datetime.strptime(when_part, "%Y-%m-%d %H:%M")
-            run_at = TZ.localize(dt_local)
-        except Exception:
-            bad.append((line, "Bad time (YYYY-MM-DD HH:MM)"))
-            continue
-
-        if not text:
-            bad.append((line, "Empty message"))
-            continue
-
-        sched_id = _next_id()
-        job = scheduler.add_job(
-            _deliver_scheduled, "date",
-            run_date=run_at,
-            args=[target_chat_id, text]
-        )
-        _scheduled[sched_id] = _SchedInfo(job.id, target_chat_id, run_at, text)
-        ok.append((sched_id, target_chat_id, run_at, text))
-
-    reply = []
-    if ok:
-        reply.append("✅ Scheduled:")
-        for sid, chat, when, txt in ok:
-            reply.append(f"  • #{sid} → {chat} — {when.strftime('%Y-%m-%d %H:%M %Z')} — {txt[:60]}")
-    if bad:
-        reply.append("\n⚠️ Skipped:")
-        for line, reason in bad:
-            reply.append(f"  • {line}  ← {reason}")
-    await msg.answer("\n".join(reply) if reply else "Nothing parsed.")
-
-@dp.message(Command("schedule_list"))
-async def schedule_list_cmd(msg: Message):
-    if not _is_admin(msg.from_user.id):
-        return
-    if not _is_private_chat(msg):
-        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
-        try:
-            m = await msg.answer("Use in private chat.")
-            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
-        except Exception:
-            pass
-        return
-
-    # optional chat filter: /schedule_list -1001234567890
-    parts = (msg.text or "").split()
-    chat_filter = None
-    if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
-        chat_filter = int(parts[1])
-
-    items = []
-    for sid, info in sorted(_scheduled.items(), key=lambda kv: kv[1].run_at):
-        if chat_filter is not None and info.chat_id != chat_filter:
-            continue
-        items.append(f"#{sid} → {info.chat_id} — {info.run_at.astimezone(TZ).strftime('%Y-%m-%d %H:%M %Z')} — {info.text[:70]}")
-
-    if not items:
-        return await msg.answer("No pending in-memory schedules." + (f" (filtered by {chat_filter})" if chat_filter else ""))
-
-    await msg.answer("Pending schedules:\n" + "\n".join(items))
-
-@dp.message(Command("schedule_cancel"))
-async def schedule_cancel_cmd(msg: Message):
-    if not _is_admin(msg.from_user.id):
-        return
-    if not _is_private_chat(msg):
-        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
-        try:
-            m = await msg.answer("Use in private chat.")
-            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
-        except Exception:
-            pass
-        return
-
-    parts = (msg.text or "").split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        return await msg.answer("Usage:\n/schedule_cancel <id>")
-
-    try:
-        sid = int(parts[1].strip())
-    except ValueError:
-        return await msg.answer("ID must be an integer.")
-
-    info = _scheduled.pop(sid, None)
-    if not info:
-        return await msg.answer("No such id (or already delivered).")
-
-    try:
-        scheduler.remove_job(info.job_id)
-    except Exception:
-        pass
-
-    await msg.answer(f"🗑️ Canceled #{sid}.")
-
-
-# --------- AI Layer (with toggles) ----------
 DEFAULT_PROPHET_SYSTEM = (
     "You are the Pushup Prophet: wise, concise, kind but stern, poetic but practical. "
     "Keep replies short for group chat. Offer form cues, consistency rituals, and supportive accountability. "
     "Avoid medical claims. Stay on-topic; if off-topic, gently steer back to training, habits, or group rituals."
 )
-
 PROPHET_SYSTEM = os.getenv("OPENAI_SYSTEM_PROMPT", DEFAULT_PROPHET_SYSTEM).replace("\\n", "\n")
-
-# NEW: append Roast Mode block (if provided)
 ROAST_BLOCK = os.getenv("OPENAI_ROAST_BLOCK", "").replace("\\n", "\n")
 if ROAST_BLOCK:
     PROPHET_SYSTEM = f"{PROPHET_SYSTEM}\n\n{ROAST_BLOCK}"
-
-OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.6"))
-spice = os.getenv("OPENAI_ROAST_SPICE", "medium").lower()
-if spice == "low":
-    OPENAI_TEMPERATURE = min(OPENAI_TEMPERATURE, 0.5)
-elif spice == "high":
-    OPENAI_TEMPERATURE = max(OPENAI_TEMPERATURE, 0.8)
-
-
 
 _AI_COOLDOWN_S = int(os.getenv("AI_COOLDOWN_S", "15"))
 _last_ai_reply_at: Dict[int, float] = {}
@@ -1832,25 +277,8 @@ def _cooldown_ok(user_id: int) -> bool:
         return True
     return False
 
-@dp.message(Command("enable_ai"))
-async def enable_ai_cmd(msg: Message):
-    await set_ai_enabled(msg.chat.id, True)
-    enabled = await get_ai_enabled(msg.chat.id)
-    logger.info(f"[AI TOGGLE] chat={msg.chat.id} set True -> now {enabled}")
-    await msg.answer("🤖 AI replies enabled for this chat.")
-
-@dp.message(Command("disable_ai"))
-async def disable_ai_cmd(msg: Message):
-    await set_ai_enabled(msg.chat.id, False)
-    enabled = await get_ai_enabled(msg.chat.id)
-    logger.info(f"[AI TOGGLE] chat={msg.chat.id} set False -> now {enabled}")
-    await msg.answer("🛑 AI replies disabled for this chat.")
-
 async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL) -> str:
-    """
-    Uses OpenAI Responses API (works great with project keys: sk-proj-...).
-    We pass the same chat-style messages under 'input'.
-    """
+    """OpenAI Responses API with simple retry; returns text ('' on failure)."""
     if not OPENAI_API_KEY:
         return ""
     delays = [0, 0.8, 2.0]
@@ -1861,259 +289,476 @@ async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL)
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.post(
                     "https://api.openai.com/v1/responses",
-                    headers={
-                        "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    },
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
                     json={
                         "model": model,
                         "input": [{"role": "system", "content": system}] + messages,
-                        "temperature": 0.6,
-                        "max_output_tokens": 180
+                        "temperature": OPENAI_TEMPERATURE,
+                        "max_output_tokens": 180,
                     },
                 )
                 r.raise_for_status()
                 data = r.json()
-                # extract the text output
-                # (Responses API returns a list of "output" items; we take the first text chunk)
+                # Extract first text chunk
                 for item in data.get("output", []):
                     if item.get("type") == "message":
-                        parts = item.get("content", [])
-                        for p in parts:
+                        for p in item.get("content", []):
                             if p.get("type") == "output_text":
                                 txt = (p.get("text") or "").strip()
                                 if txt:
                                     return txt
-                # fallback if "output" not present, try top-level "text"
-                txt = (data.get("text", {}).get("value") if isinstance(data.get("text"), dict) else None) or ""
-                return txt.strip()
+                # Fallback for alternate shapes
+                txt = ""
+                if isinstance(data.get("text"), dict):
+                    txt = (data.get("text", {}).get("value") or "").strip()
+                elif isinstance(data.get("text"), str):
+                    txt = data["text"].strip()
+                return txt
         except Exception as e:
-            logger.warning(f"AI call attempt {i+1} failed: {e}")
+            logger.warning(f"[AI] attempt {i+1} failed: {e}")
     return ""
 
+# Triggers and patterns
+def _normalize_text(t: str) -> str:
+    t = re.sub(r"[\u200b-\u200f\u202a-\u202e]", "", t or "")
+    return t.lower()
 
-    delays = [0, 0.8, 2.0]
-    for i, delay in enumerate(delays):
-        if delay:
-            await asyncio.sleep(delay)
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                payload = {
-                    "model": model,
-                    "messages": [{"role": "system", "content": system}] + messages,
-                    "temperature": 0.6,
-                    "max_tokens": 180,
-                }
-                r = await client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                    json=payload,
-                )
-                if r.status_code != 200:
-                    body = (r.text[:800] + "…") if len(r.text) > 800 else r.text
-                    logger.warning("[AI] HTTP %s on attempt %s. Body: %s", r.status_code, i + 1, body)
-                    continue
+THANKS_RE = re.compile(r"\b(thank(?:\s*you)?|thanks|thx|ty|tack(?:\s*så\s*mycket)?)\b", re.IGNORECASE)
+APOLOGY_RE = re.compile(
+    r"\b("
+    r"sorry|i\s*(?:am|’m|'m)\s*sorry|i\s*apolog(?:ise|ize)|apologies|apology|"
+    r"my\s*bad|my\s*fault|i\s*was\s*wrong|didn'?t\s*mean|forgive\s*me|"
+    r"förlåt|ursäkta|jag\s*är\s*ledsen|ber\s*om\s*ursäkt|mitt\s*fel"
+    r")\b", re.IGNORECASE
+)
+MENTION_RE = r"(?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b)"
+INSULT_WORDS = (
+    r"(?:fuck(?:ing|er|ed)?|f\*+ck|shit|crap|trash|garbage|bs|sucks?|stupid|idiot|moron|dumb(?:ass)?|"
+    r"loser|pathetic|awful|terrible|useless|worthless|annoying|cringe|fraud|fake|clown|"
+    r"bitch|ass(?:hole|hat|clown)?|dick(?:head)?|prick|jerk|wank(?:er)?|twat|tosser|dipshit|jackass|motherfucker|mf)"
+)
+DIRECT_2P = r"(?:fuck\s*(?:you|u|ya)|screw\s*you|stfu|shut\s*up|you\s*(?:suck|are\s*(?:stupid|dumb|useless)))"
+INSULT_RE = re.compile(
+    rf"(?:(?:{MENTION_RE}).*?(?:{INSULT_WORDS})|(?:{INSULT_WORDS}).*?(?:{MENTION_RE}))|(?:{DIRECT_2P})",
+    re.IGNORECASE
+)
+SUMMON_PATTERN = re.compile(r"\b(pushup\s*prophet|prophet)\b", re.IGNORECASE)
 
-                data = r.json()
-                text = (data["choices"][0]["message"]["content"] or "").strip()
-                if not text:
-                    logger.warning("[AI] empty completion on attempt %s", i + 1)
-                return text
-
-        except httpx.HTTPError as e:
-            logger.warning("[AI] httpx error on attempt %s: %r", i + 1, e)
-        except Exception as e:
-            logger.exception("[AI] unexpected error on attempt %s: %r", i + 1, e)
-
-    return ""
-
+def _matches_wisdom_nat(t: str) -> bool:
+    patterns = [
+        r"\bshare\s+wisdom\b", r"\bgive\s+(?:me\s+)?wisdom\b", r"\bsay\s+(?:something\s+)?wise\b",
+        r"\bwisdom\s+please\b", r"\bteach\s+me\b", r"\bi\s+seek\s+wisdom\b",
+        r"\bprophet[,!\s]*\s*(?:share|give|drop)\s+(?:some\s+)?wisdom\b", r"\bdrop\s+(?:some\s+)?wisdom\b",
+    ]
+    return any(re.search(p, t, re.IGNORECASE) for p in patterns)
 
 def should_ai_reply(msg: Message) -> bool:
+    """Pure sync heuristic; DO NOT await this."""
     t = (msg.text or "").strip()
-    if not t:
+    if not t or t.startswith("/"):
         return False
-    if t.startswith("/"):
-        return False
-    # ignore canned flows (thanks / apology / insult / dice / wisdom)
     if THANKS_RE.search(t) or APOLOGY_RE.search(t) or INSULT_RE.search(_normalize_text(t)) \
-       or FATE_SUMMON_RE.search(t) or _matches_wisdom_nat(t):
+       or _matches_wisdom_nat(t):
         return False
-    # explicit summon is always a trigger
     if SUMMON_PATTERN.search(t):
         return True
-    # replies to the Prophet are also a trigger
-    if msg.reply_to_message and msg.reply_to_message.from_user and BOT_ID and msg.reply_to_message.from_user.id == BOT_ID:
+    if msg.reply_to_message and msg.reply_to_message.from_user and BOT_ID \
+       and msg.reply_to_message.from_user.id == BOT_ID:
         return True
-    # otherwise: soft “ask for help” heuristic (7% to keep noise down)
     if re.search(r"\b(help|advice|how do i|what should i)\b", t, re.IGNORECASE) and _sysrand.random() < 0.07:
         return True
     return False
 
+# ------------------------ Handlers ---------------------------
 
+@dp.message(CommandStart())
+async def start_cmd(msg: Message):
+    await msg.answer(
+        "I am the Pushup Prophet.\n\n"
+        "AI controls:\n"
+        "• /enable_ai — allow AI replies in this chat\n"
+        "• /disable_ai — stop AI replies in this chat\n"
+        "• /ai_status — show AI status\n\n"
+        "Scheduling (admin, DM):\n"
+        "• /schedule_once 2025-10-01 18:30 | Text\n"
+        "• /schedule_once -1001234567890 2025-10-01 18:30 | Text\n"
+        "• /schedule_many (then paste multiple lines)\n"
+        "• /schedule_list [optional_chat_id]\n"
+        "• /schedule_cancel <id>\n"
+    )
 
+@dp.message(Command("help"))
+async def help_cmd(msg: Message): await start_cmd(msg)
 
-# --------- Run bot + web server together ----------
+@dp.message(Command("ai_status"))
+async def ai_status_cmd(msg: Message):
+    enabled = await get_ai_enabled(msg.chat.id)
+    await msg.answer(f"AI status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
+
+@dp.message(Command("enable_ai"))
+async def enable_ai_cmd(msg: Message):
+    await set_ai_enabled(msg.chat.id, True)
+    await msg.answer("🤖 AI replies enabled for this chat.")
+
+@dp.message(Command("disable_ai"))
+async def disable_ai_cmd(msg: Message):
+    await set_ai_enabled(msg.chat.id, False)
+    await msg.answer("🛑 AI replies disabled for this chat.")
+
+@dp.message(Command("chatid"))
+async def chatid_cmd(msg: Message):
+    await msg.answer(f"Chat ID: <code>{msg.chat.id}</code>")
+
+# --- Scheduling (DB-backed, admin-only, use in private chat) ---
+
+def _parse_when_and_target(raw: str) -> Tuple[Optional[int], Optional[dt.datetime], str]:
+    """Parses '[-100... ]YYYY-MM-DD HH:MM | text' → (chat_id or None, aware_local_dt or None, text)."""
+    if "|" not in raw:
+        return None, None, ""
+    left, text = [p.strip() for p in raw.split("|", 1)]
+    parts = left.split()
+    if parts and parts[0].lstrip("-").isdigit() and len(parts) >= 3:
+        target_chat_id = int(parts[0])
+        when_part = " ".join(parts[1:3])
+    else:
+        target_chat_id = _DEFAULT_TARGET_CHAT or None
+        when_part = " ".join(parts[:2]) if len(parts) >= 2 else ""
+    try:
+        dt_local = dt.datetime.strptime(when_part, "%Y-%m-%d %H:%M")
+        run_at_local = TZ.localize(dt_local)
+    except Exception:
+        return target_chat_id, None, text
+    return target_chat_id, run_at_local, text
+
+@dp.message(Command("schedule_once"))
+async def schedule_once_cmd(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+    if not _is_private_chat(msg):
+        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        m = await msg.answer("Use this command in a private chat with me.")
+        asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        return
+
+    raw = re.sub(r"^/schedule_once(@\w+)?\s*", "", (msg.text or ""), flags=re.IGNORECASE).strip()
+    chat_id, run_at_local, text = _parse_when_and_target(raw)
+
+    if not chat_id:
+        return await msg.answer("No target chat set. Define ADMIN_DEFAULT_CHAT_ID or include chat id.")
+    if not run_at_local:
+        return await msg.answer("Time must be YYYY-MM-DD HH:MM (Stockholm).")
+    if not text:
+        return await msg.answer("Message text cannot be empty.")
+
+    run_at_utc = run_at_local.astimezone(dt.timezone.utc)
+
+    # Create DB row
+    async with AsyncSessionLocal() as s:
+        row = ScheduledMessage(
+            chat_id=chat_id,
+            user_id=msg.from_user.id,
+            text=text,
+            run_at=run_at_utc,
+            status="pending",
+        )
+        s.add(row)
+        await s.commit()
+        await s.refresh(row)
+
+    # Schedule job
+    scheduler.add_job(
+        _deliver_scheduled_message, "date",
+        run_date=run_at_utc, args=[row.id], id=_job_id_for(row.id), replace_existing=True
+    )
+
+    await msg.answer(f"✅ Scheduled #{row.id} → {chat_id} at {run_at_local.strftime('%Y-%m-%d %H:%M %Z')}.")
+
+@dp.message(Command("schedule_many"))
+async def schedule_many_cmd(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+    if not _is_private_chat(msg):
+        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        m = await msg.answer("Use this command in a private chat with me.")
+        asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        return
+
+    body = re.sub(r"^/schedule_many(@\w+)?\s*", "", (msg.text or ""), flags=re.IGNORECASE).strip()
+    if not body:
+        return await msg.answer(
+            "Paste multiple lines after the command, e.g.:\n"
+            "2025-10-02 07:00 | Morning truth.\n"
+            "-1001234567890 2025-10-05 20:30 | Night check-in."
+        )
+
+    ok_lines, bad_lines = [], []
+    rows_to_add: List[ScheduledMessage] = []
+
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        chat_id, run_at_local, text = _parse_when_and_target(line)
+        if not chat_id:
+            bad_lines.append((line, "No default/explicit chat id"))
+            continue
+        if not run_at_local:
+            bad_lines.append((line, "Bad time (YYYY-MM-DD HH:MM)"))
+            continue
+        if not text:
+            bad_lines.append((line, "Empty message"))
+            continue
+        rows_to_add.append(ScheduledMessage(
+            chat_id=chat_id,
+            user_id=msg.from_user.id,
+            text=text,
+            run_at=run_at_local.astimezone(dt.timezone.utc),
+            status="pending",
+        ))
+        ok_lines.append((chat_id, run_at_local, text))
+
+    created_ids: List[int] = []
+    if rows_to_add:
+        async with AsyncSessionLocal() as s:
+            s.add_all(rows_to_add)
+            await s.commit()
+            for r in rows_to_add:
+                await s.refresh(r)
+                created_ids.append(r.id)
+
+    for r in rows_to_add:
+        scheduler.add_job(
+            _deliver_scheduled_message, "date",
+            run_date=r.run_at, args=[r.id], id=_job_id_for(r.id), replace_existing=True
+        )
+
+    reply = []
+    if ok_lines:
+        reply.append("✅ Scheduled:")
+        for (chat, when_local, txt), sid in zip(ok_lines, created_ids):
+            reply.append(f"  • #{sid} → {chat} — {when_local.strftime('%Y-%m-%d %H:%M %Z')} — {txt[:60]}")
+    if bad_lines:
+        reply.append("\n⚠️ Skipped:")
+        for line, reason in bad_lines:
+            reply.append(f"  • {line}  ← {reason}")
+
+    await msg.answer("\n".join(reply) if reply else "Nothing parsed.")
+
+@dp.message(Command("schedule_list"))
+async def schedule_list_cmd(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+    if not _is_private_chat(msg):
+        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        m = await msg.answer("Use in private chat.")
+        asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        return
+
+    parts = (msg.text or "").split()
+    chat_filter = int(parts[1]) if len(parts) >= 2 and parts[1].lstrip("-").isdigit() else None
+
+    async with AsyncSessionLocal() as s:
+        q = select(ScheduledMessage).where(ScheduledMessage.status == "pending")
+        if chat_filter is not None:
+            q = q.where(ScheduledMessage.chat_id == chat_filter)
+        q = q.order_by(ScheduledMessage.run_at.asc())
+        res = await s.execute(q)
+        rows = res.scalars().all()
+
+    if not rows:
+        return await msg.answer("No pending schedules." + (f" (filtered by {chat_filter})" if chat_filter else ""))
+
+    lines = ["Pending schedules:"]
+    for r in rows:
+        when_local = r.run_at.astimezone(TZ)
+        lines.append(f"  • #{r.id} → {r.chat_id} — {when_local.strftime('%Y-%m-%d %H:%M %Z')} — {r.text[:70]}")
+    await msg.answer("\n".join(lines))
+
+@dp.message(Command("schedule_cancel"))
+async def schedule_cancel_cmd(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+    if not _is_private_chat(msg):
+        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        m = await msg.answer("Use in private chat.")
+        asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        return
+
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        return await msg.answer("Usage: /schedule_cancel <id>")
+
+    try:
+        sid = int(parts[1].strip())
+    except ValueError:
+        return await msg.answer("ID must be an integer.")
+
+    async with AsyncSessionLocal() as s:
+        r = await s.execute(select(ScheduledMessage).where(ScheduledMessage.id == sid))
+        row = r.scalar_one_or_none()
+        if not row or row.status != "pending":
+            return await msg.answer("No such pending id (maybe sent/canceled).")
+        await s.execute(update(ScheduledMessage).where(ScheduledMessage.id == sid).values(status="canceled"))
+        await s.commit()
+
+    try:
+        scheduler.remove_job(_job_id_for(sid))
+    except Exception:
+        pass
+
+    await msg.answer(f"🗑️ Canceled #{sid}.")
+
+# ------------------------ Lightweight content handlers -------
+
+BLESSINGS = [
+    "Your thanks is heard, {name}. May your shoulders carry light burdens and your will grow heavy with resolve.",
+    "Gratitude received, {name}. Walk with steady breath; strength will meet you there.",
+]
+REBUKES = [
+    "I hear your anger, {name}. I receive it—and I answer with steadiness.",
+    "Your words land, {name}. I take them in, and I remain your witness.",
+]
+SUMMON_RESPONSES = [
+    "Did someone summon me?",
+    "A whisper reaches the floor—speak, seeker.",
+]
+
+def _compose_blessing(user_name: Optional[str]) -> str:
+    safe = html.escape(user_name or "friend")
+    return _sysrand.choice(BLESSINGS).format(name=safe)
+
+def _compose_rebuke(user_name: Optional[str]) -> str:
+    safe = html.escape(user_name or "traveler")
+    return _sysrand.choice(REBUKES).format(name=safe)
+
+@dp.message(F.text.func(lambda t: isinstance(t, str) and not t.strip().startswith("/") and THANKS_RE.search(t)))
+async def thanks_plain(msg: Message):
+    try:
+        await upsert_username(msg.chat.id, msg.from_user.id,
+                              getattr(msg.from_user, "first_name", None),
+                              getattr(msg.from_user, "username", None))
+        await incr_counter(msg.chat.id, msg.from_user.id, "thanks", 1)
+    except Exception:
+        logger.exception("Failed to log 'thanks'")
+    await msg.answer(_compose_blessing(getattr(msg.from_user, "first_name", None)))
+
+@dp.message(F.text.func(lambda t: isinstance(t, str) and not t.strip().startswith("/") and APOLOGY_RE.search(t)))
+async def apology_reply(msg: Message):
+    try:
+        await upsert_username(msg.chat.id, msg.from_user.id,
+                              getattr(msg.from_user, "first_name", None),
+                              getattr(msg.from_user, "username", None))
+        await incr_counter(msg.chat.id, msg.from_user.id, "apology", 1)
+    except Exception:
+        logger.exception("Failed to log 'apology'")
+    await msg.answer(_compose_blessing(getattr(msg.from_user, "first_name", None)))
+
+@dp.message(F.text.func(lambda t: isinstance(t, str) and INSULT_RE.search(_normalize_text(t)) and not APOLOGY_RE.search(t)))
+async def prophet_insult_rebuke(msg: Message):
+    try:
+        await upsert_username(msg.chat.id, msg.from_user.id,
+                              getattr(msg.from_user, "first_name", None),
+                              getattr(msg.from_user, "username", None))
+        await incr_counter(msg.chat.id, msg.from_user.id, "insult", 1)
+    except Exception:
+        logger.exception("Failed to log 'insult'")
+    await msg.answer(_compose_rebuke(getattr(msg.from_user, "first_name", None)))
+
+@dp.message(F.text.func(lambda t: isinstance(t, str)
+                        and not t.strip().startswith("/")
+                        and SUMMON_PATTERN.search(t)
+                        and not THANKS_RE.search(t)
+                        and not APOLOGY_RE.search(t)))
+async def summon_reply(msg: Message):
+    if await get_ai_enabled(msg.chat.id):
+        name = getattr(msg.from_user, "first_name", "") or (msg.from_user.username or "friend")
+        user_text = msg.text or ""
+        messages = [{"role": "user", "content": f"{name}: {user_text}"}]
+        reply = await ai_reply(PROPHET_SYSTEM, messages)
+        if reply:
+            await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
+            return
+    await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
+
+# Catch-all AI (only if enabled; obey cooldown; sync trigger)
+@dp.message(F.text.func(lambda t: isinstance(t, str) and not t.startswith("/")))
+async def ai_catchall(msg: Message):
+    try:
+        if not await get_ai_enabled(msg.chat.id):
+            return
+        if not should_ai_reply(msg):          # <-- not awaited (fixed)
+            return
+        if not _cooldown_ok(msg.from_user.id):
+            return
+
+        name = getattr(msg.from_user, "first_name", "") or (msg.from_user.username or "friend")
+        user_text = msg.text or ""
+        messages = [{"role": "user", "content": f"{name}: {user_text}"}]
+        reply = await ai_reply(PROPHET_SYSTEM, messages)
+        if reply:
+            await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
+    except Exception:
+        logger.exception("AI catchall failed")
+
+# ------------------------ Health endpoints -------------------
 
 @app.get("/")
-def health():
-    return {"ok": True, "service": "pushup-prophet"}
+def health(): return {"ok": True, "service": "pushup-prophet"}
 
 @app.head("/")
-def health_head():
-    return Response(status_code=200)
+def health_head(): return Response(status_code=200)
 
-
-async def run_bot():
-    global _started_polling
-    if _started_polling:
-        logger.warning("Polling already started; skipping second start.")
-        return
-    _started_polling = True
-
-    scheduler.start()
-    logger.info("Scheduler started")
-
-    # Defensive: ensure webhook really gone right before polling
-    try:
-        await bot.delete_webhook(drop_pending_updates=True, request_timeout=30)
-    except Exception as e:
-        logger.warning(f"delete_webhook (pre-poll) failed (continuing): {e}")
-
-    # Retry loop around start_polling to survive transient conflicts
-    delays = [0, 1, 3, 5, 10]  # seconds
-    for i, delay in enumerate(delays, start=1):
-        if delay:
-            await asyncio.sleep(delay)
-        try:
-            logger.info(f"Starting polling (attempt {i})...")
-            # polling_timeout keeps long-polls short so shutdowns are snappier
-            await dp.start_polling(bot, polling_timeout=30)
-            logger.info("Polling finished cleanly.")
-            break
-        except TelegramBadRequest as e:
-            # Typical conflict/error from Bot API
-            msg = str(e)
-            logger.warning(f"start_polling TelegramBadRequest on attempt {i}: {msg}")
-            if "terminated by other getUpdates request" in msg.lower() \
-               or "can't use getupdates method while webhook is active" in msg.lower():
-                # Try to clear webhook and retry
-                try:
-                    await bot.delete_webhook(drop_pending_updates=True, request_timeout=30)
-                except Exception as e2:
-                    logger.warning(f"delete_webhook after conflict failed: {e2}")
-                continue
-            # other 400-level errors: let it bubble to next retry
-            continue
-        except TelegramNetworkError as e:
-            logger.warning(f"Network error on polling attempt {i}: {e}")
-            continue
-        except Exception as e:
-            logger.exception(f"Unexpected polling error on attempt {i}: {e}")
-            continue
-
+# ------------------------ Startup / Shutdown -----------------
 
 @app.on_event("startup")
 async def on_startup():
     global BOT_ID
-    try:
-        me = await bot.get_me()
-        BOT_ID = me.id
-        logger.info(f"Bot authorized: @{me.username} (id={me.id})")
-    except Exception:
-        logger.exception("get_me failed. Is BOT_TOKEN correct?")
-        raise
+    # Bot identity
+    me = await bot.get_me()
+    BOT_ID = me.id
+    logger.info(f"Bot authorized: @{me.username} (id={me.id})")
 
-    # Ensure webhook is removed before polling (with retries/timeouts)
+    # Ensure no webhook conflict with polling
     for attempt in range(1, 6):
         try:
             await bot.delete_webhook(drop_pending_updates=True, request_timeout=30)
             info = await bot.get_webhook_info()
             if not info.url:
-                logger.info("Webhook cleared successfully.")
                 break
-            logger.warning(f"Webhook still set to: {info.url!r} (attempt {attempt})")
         except Exception as e:
-            logger.warning(f"delete_webhook attempt {attempt}) failed: {e}")
+            logger.warning(f"delete_webhook attempt {attempt} failed: {e}")
         await asyncio.sleep(min(2 ** attempt, 10))
-    else:
-        logger.error("Could not clear webhook after multiple attempts. Polling may not receive updates.")
 
-    # --- DB init ---
-    # --- DB init ---
-    try:
-        await init_db()
-        logger.info("Database initialized and ready.")
-        await load_and_schedule_pending()
-    except Exception:
-        logger.exception("Database init failed.")
-        raise
+    # DB init & schedule resume
+    await init_db()
+    await load_and_schedule_pending()
 
+    # Start APScheduler and polling
+    scheduler.start()
+    asyncio.create_task(run_bot_polling())
 
-    asyncio.create_task(run_bot())  # start Telegram bot loop
-
-    # Auto-enable schedules for groups
-    ids = os.getenv("GROUP_CHAT_IDS", "").strip()
-    if ids:
-        for raw in ids.split(","):
-            raw = raw.strip()
-            if not raw:
-                continue
+async def run_bot_polling():
+    delays = [0, 1, 3, 5, 10]
+    for i, delay in enumerate(delays, start=1):
+        if delay: await asyncio.sleep(delay)
+        try:
+            logger.info(f"Starting polling (attempt {i})…")
+            await dp.start_polling(bot, polling_timeout=30)
+            break
+        except TelegramBadRequest as e:
+            msg = str(e)
+            logger.warning(f"Polling TelegramBadRequest: {msg}")
             try:
-                chat_id = int(raw)
-                schedule_random_daily(chat_id)
-                logger.info(f"Auto-enabled Forgiveness Chain for chat {chat_id}")
-
-                scheduler.add_job(
-                    send_daily_quote, "cron",
-                    hour=7, minute=0, args=[chat_id],
-                    id=f"daily_quote_{chat_id}", replace_existing=True,
-                )
-                logger.info(f"Scheduled daily quote (07:00) for chat {chat_id}")
-
-                scheduler.add_job(
-                    send_weekly_vote_prompts, "cron",
-                    day_of_week="sun", hour=11, minute=0, args=[chat_id],
-                    id=f"weekly_votes_{chat_id}", replace_existing=True,
-                )
-                logger.info(f"Scheduled weekly votes (Sun 11:00) for chat {chat_id}")
-            except Exception as e:
-                logger.exception(f"Startup scheduling failed for chat {raw}: {e}")
-
-
-
-from aiogram.filters import Command
-
-@dp.message(F.text.func(lambda t: isinstance(t, str) and not t.startswith("/")))
-async def ai_catchall(msg: Message):
-    try:
-        logger.info(f"[AI] incoming text in chat={msg.chat.id}: {msg.text!r}")
-
-        if not await get_ai_enabled(msg.chat.id):
-            logger.info("[AI] disabled for this chat")
-            return
-
-        if not await should_ai_reply(msg):
-            logger.info("[AI] should_ai_reply = False (not a trigger)")
-            return
-
-        if not _cooldown_ok(msg.from_user.id):
-            logger.info("[AI] cooldown blocked")
-            return
-
-        name = getattr(msg.from_user, "first_name", "") or (msg.from_user.username or "friend")
-        user_text = msg.text or ""
-        logger.info("[AI] calling OpenAI…")
-        messages = [{"role": "user", "content": f"{name}: {user_text}"}]
-        reply = await ai_reply(PROPHET_SYSTEM, messages)
-        if reply:
-            logger.info("[AI] got reply, sending to chat")
-            await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
-        else:
-            logger.warning("[AI] ai_reply returned empty string")
-    except Exception:
-        logger.exception("AI reply failed")
-
-
-
+                await bot.delete_webhook(drop_pending_updates=True, request_timeout=30)
+            except Exception as e2:
+                logger.warning(f"delete_webhook after conflict failed: {e2}")
+            continue
+        except TelegramNetworkError as e:
+            logger.warning(f"Network error on polling attempt {i}: {e}")
+            continue
+        except Exception as e:
+            logger.exception(f"Unexpected polling error attempt {i}: {e}")
+            continue
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -2130,28 +775,8 @@ async def on_shutdown():
     except Exception:
         pass
 
+# ------------------------ Entrypoint -------------------------
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
