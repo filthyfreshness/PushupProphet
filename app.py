@@ -1085,37 +1085,6 @@ def should_ai_reply(msg: Message) -> bool:
         return True
     return False
 
-@dp.message(F.text)
-async def ai_catchall(msg: Message):
-    try:
-        logger.info(f"[AI] incoming text in chat={msg.chat.id}: {msg.text!r}")
-
-        if not await get_ai_enabled(msg.chat.id):
-            logger.info("[AI] disabled for this chat")
-            return
-
-        if not should_ai_reply(msg):
-            logger.info("[AI] should_ai_reply = False (not a trigger)")
-            return
-
-        if not _cooldown_ok(msg.from_user.id):
-            logger.info("[AI] cooldown blocked")
-            return
-
-        name = getattr(msg.from_user, "first_name", "") or (msg.from_user.username or "friend")
-        user_text = msg.text or ""
-        logger.info("[AI] calling OpenAI…")
-        messages = [{"role": "user", "content": f"{name}: {user_text}"}]
-        reply = await ai_reply(PROPHET_SYSTEM, messages)
-        if reply:
-            logger.info("[AI] got reply, sending to chat")
-            await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
-        else:
-            logger.warning("[AI] ai_reply returned empty string")
-    except Exception:
-        logger.exception("AI reply failed")
-
-
 
 # --------- Run bot + web server together ----------
 
@@ -1241,6 +1210,41 @@ async def on_startup():
             except Exception as e:
                 logger.exception(f"Startup scheduling failed for chat {raw}: {e}")
 
+
+
+@dp.message(F.text)
+async def ai_catchall(msg: Message):
+    try:
+        logger.info(f"[AI] incoming text in chat={msg.chat.id}: {msg.text!r}")
+
+        if not await get_ai_enabled(msg.chat.id):
+            logger.info("[AI] disabled for this chat")
+            return
+
+        if not should_ai_reply(msg):
+            logger.info("[AI] should_ai_reply = False (not a trigger)")
+            return
+
+        if not _cooldown_ok(msg.from_user.id):
+            logger.info("[AI] cooldown blocked")
+            return
+
+        name = getattr(msg.from_user, "first_name", "") or (msg.from_user.username or "friend")
+        user_text = msg.text or ""
+        logger.info("[AI] calling OpenAI…")
+        messages = [{"role": "user", "content": f"{name}: {user_text}"}]
+        reply = await ai_reply(PROPHET_SYSTEM, messages)
+        if reply:
+            logger.info("[AI] got reply, sending to chat")
+            await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
+        else:
+            logger.warning("[AI] ai_reply returned empty string")
+    except Exception:
+        logger.exception("AI reply failed")
+
+
+
+
 @app.on_event("shutdown")
 async def on_shutdown():
     try:
@@ -1261,6 +1265,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
