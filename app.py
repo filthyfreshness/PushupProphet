@@ -1783,11 +1783,50 @@ async def disable_ai_cmd(msg: Message):
     logger.info(f"[AI TOGGLE] chat={msg.chat.id} set False -> now {enabled}")
     await msg.answer("🛑 AI replies disabled for this chat.")
 
-
 async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL) -> str:
+    """
+    Uses OpenAI Responses API (works great with project keys: sk-proj-...).
+    We pass the same chat-style messages under 'input'.
+    """
     if not OPENAI_API_KEY:
-        logger.error("[AI] OPENAI_API_KEY is empty/missing")
         return ""
+    delays = [0, 0.8, 2.0]
+    for i, delay in enumerate(delays):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    "https://api.openai.com/v1/responses",
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    },
+                    json={
+                        "model": model,
+                        "input": [{"role": "system", "content": system}] + messages,
+                        "temperature": 0.6,
+                        "max_output_tokens": 180
+                    },
+                )
+                r.raise_for_status()
+                data = r.json()
+                # extract the text output
+                # (Responses API returns a list of "output" items; we take the first text chunk)
+                for item in data.get("output", []):
+                    if item.get("type") == "message":
+                        parts = item.get("content", [])
+                        for p in parts:
+                            if p.get("type") == "output_text":
+                                txt = (p.get("text") or "").strip()
+                                if txt:
+                                    return txt
+                # fallback if "output" not present, try top-level "text"
+                txt = (data.get("text", {}).get("value") if isinstance(data.get("text"), dict) else None) or ""
+                return txt.strip()
+        except Exception as e:
+            logger.warning(f"AI call attempt {i+1} failed: {e}")
+    return ""
+
 
     delays = [0, 0.8, 2.0]
     for i, delay in enumerate(delays):
@@ -2033,6 +2072,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
