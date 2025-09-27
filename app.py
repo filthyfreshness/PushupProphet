@@ -144,6 +144,259 @@ class ChatSettings(Base):
     chat_id    = Column(BigInteger, primary_key=True)
     ai_enabled = Column(Boolean, nullable=False, default=False)
     changed_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+# ================== Private admin scheduling (DB-backed) ==================
+@dp.message(Command("schedule_once"))
+async def schedule_once_cmd(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+
+    # Keep it private: if used in a group, delete the command quickly
+    if not _is_private_chat(msg):
+        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        try:
+            m = await msg.answer("Use this command in a private chat with me.")
+            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        except Exception:
+            pass
+        return
+
+    # Parse:
+    # A) /schedule_once 2025-10-01 18:30 | Message text
+    # B) /schedule_once -1001234567890 2025-10-01 18:30 | Message text
+    raw = re.sub(r"^/schedule_once(@\w+)?\s*", "", (msg.text or ""), flags=re.IGNORECASE).strip()
+    if "|" not in raw:
+        return await msg.answer(
+            "Usage:\n"
+            "/schedule_once 2025-10-01 18:30 | Your message\n"
+            "or\n"
+            "/schedule_once -1001234567890 2025-10-01 18:30 | Your message"
+        )
+
+    left, text = [p.strip() for p in raw.split("|", 1)]
+    parts = left.split()
+
+    if parts and parts[0].lstrip("-").isdigit() and len(parts) >= 3:
+        target_chat_id = int(parts[0])
+        when_part = " ".join(parts[1:3])
+    else:
+        target_chat_id = _DEFAULT_TARGET_CHAT
+        when_part = " ".join(parts[:2]) if len(parts) >= 2 else ""
+
+    if not target_chat_id:
+        return await msg.answer("No target chat set. Define ADMIN_DEFAULT_CHAT_ID in .env or pass chat id explicitly.")
+
+    try:
+        dt_local = dt.datetime.strptime(when_part, "%Y-%m-%d %H:%M")
+        run_at_local = TZ.localize(dt_local)
+        run_at_utc = run_at_local.astimezone(dt.timezone.utc)
+    except Exception:
+        return await msg.answer("Time must be YYYY-MM-DD HH:MM (Stockholm).")
+
+    if not text:
+        return await msg.answer("Message text cannot be empty.")
+
+    # Insert row then schedule
+    async with AsyncSessionLocal() as s:
+        row = ScheduledMessage(
+            chat_id=target_chat_id,
+            text=text,
+            created_by=msg.from_user.id,
+            run_at_utc=run_at_utc,
+            delivered=False,
+            canceled=False,
+        )
+        s.add(row)
+        await s.commit()
+        await s.refresh(row)  # get auto id
+
+    _schedule_job_for_row(row)
+
+    human_when = run_at_local.strftime('%Y-%m-%d %H:%M %Z')
+    await msg.answer(f"✅ Scheduled #{row.id} → {target_chat_id} at {human_when}.")
+
+
+@dp.message(Command("schedule_many")))
+async def schedule_many_cmd(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+
+    if not _is_private_chat(msg):
+        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        try:
+            m = await msg.answer("Use this command in a private chat with me.")
+            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        except Exception:
+            pass
+        return
+
+    body = re.sub(r"^/schedule_many(@\w+)?\s*", "", (msg.text or ""), flags=re.IGNORECASE).strip()
+    if not body:
+        return await msg.answer(
+            "Paste multiple lines after the command, for example:\n"
+            "/schedule_many\n"
+            "2025-10-02 07:00 | Morning: receipts decide truth.\n"
+            "-1001234567890 2025-10-05 20:30 | Night check-in (explicit target)."
+        )
+
+    ok, bad = [], []
+    rows_to_add: List[ScheduledMessage] = []
+
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "|" not in line:
+            bad.append((line, "Missing '|'"))
+            continue
+
+        left, text = [p.strip() for p in line.split("|", 1)]
+        parts = left.split()
+
+        if parts and parts[0].lstrip("-").isdigit() and len(parts) >= 3:
+            target_chat_id = int(parts[0])
+            when_part = " ".join(parts[1:3])
+        else:
+            target_chat_id = _DEFAULT_TARGET_CHAT
+            when_part = " ".join(parts[:2]) if len(parts) >= 2 else ""
+
+        if not target_chat_id:
+            bad.append((line, "No default target chat configured"))
+            continue
+
+        try:
+            dt_local = dt.datetime.strptime(when_part, "%Y-%m-%d %H:%M")
+            run_at_local = TZ.localize(dt_local)
+            run_at_utc = run_at_local.astimezone(dt.timezone.utc)
+        except Exception:
+            bad.append((line, "Bad time (YYYY-MM-DD HH:MM)"))
+            continue
+
+        if not text:
+            bad.append((line, "Empty message"))
+            continue
+
+        rows_to_add.append(ScheduledMessage(
+            chat_id=target_chat_id,
+            text=text,
+            created_by=msg.from_user.id,
+            run_at_utc=run_at_utc,
+            delivered=False,
+            canceled=False,
+        ))
+        ok.append((target_chat_id, run_at_local, text))
+
+    created_ids = []
+    if rows_to_add:
+        async with AsyncSessionLocal() as s:
+            s.add_all(rows_to_add)
+            await s.commit()
+            # refresh to get IDs
+            for r in rows_to_add:
+                await s.refresh(r)
+                created_ids.append(r.id)
+
+    # schedule them
+    for r in rows_to_add:
+        _schedule_job_for_row(r)
+
+    reply = []
+    if ok:
+        reply.append("✅ Scheduled:")
+        for (chat, when_local, txt), sid in zip(ok, created_ids):
+            reply.append(f"  • #{sid} → {chat} — {when_local.strftime('%Y-%m-%d %H:%M %Z')} — {txt[:60]}")
+    if bad:
+        reply.append("\n⚠️ Skipped:")
+        for line, reason in bad:
+            reply.append(f"  • {line}  ← {reason}")
+    await msg.answer("\n".join(reply) if reply else "Nothing parsed.")
+
+
+@dp.message(Command("schedule_list"))
+async def schedule_list_cmd(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+    if not _is_private_chat(msg):
+        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        try:
+            m = await msg.answer("Use in private chat.")
+            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        except Exception:
+            pass
+        return
+
+    # optional chat filter: /schedule_list -1001234567890
+    parts = (msg.text or "").split()
+    chat_filter = None
+    if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
+        chat_filter = int(parts[1])
+
+    async with AsyncSessionLocal() as s:
+        q = select(ScheduledMessage).where(
+            ScheduledMessage.canceled.is_(False),
+            ScheduledMessage.delivered.is_(False),
+        )
+        if chat_filter is not None:
+            q = q.where(ScheduledMessage.chat_id == chat_filter)
+        q = q.order_by(ScheduledMessage.run_at_utc.asc())
+        res = await s.execute(q)
+        rows = res.scalars().all()
+
+    if not rows:
+        return await msg.answer("No pending schedules." + (f" (filtered by {chat_filter})" if chat_filter else ""))
+
+    lines = ["Pending schedules:"]
+    for r in rows:
+        when_local = r.run_at_utc.astimezone(TZ)
+        lines.append(f"  • #{r.id} → {r.chat_id} — {when_local.strftime('%Y-%m-%d %H:%M %Z')} — {r.text[:70]}")
+    await msg.answer("\n".join(lines))
+
+
+@dp.message(Command("schedule_cancel"))
+async def schedule_cancel_cmd(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+    if not _is_private_chat(msg):
+        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        try:
+            m = await msg.answer("Use in private chat.")
+            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        except Exception:
+            pass
+        return
+
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        return await msg.answer("Usage:\n/schedule_cancel <id>")
+
+    try:
+        sid = int(parts[1].strip())
+    except ValueError:
+        return await msg.answer("ID must be an integer.")
+
+    async with AsyncSessionLocal() as s:
+        r = await s.execute(select(ScheduledMessage).where(ScheduledMessage.id == sid))
+        row = r.scalar_one_or_none()
+        if not row or row.delivered or row.canceled:
+            return await msg.answer("No such pending id (maybe already delivered/canceled).")
+
+        # mark canceled in DB
+        await s.execute(
+            update(ScheduledMessage)
+            .where(ScheduledMessage.id == sid)
+            .values(canceled=True)
+        )
+        await s.commit()
+
+    # Remove in-memory job if present
+    try:
+        scheduler.remove_job(_job_id_for(sid))
+    except Exception:
+        pass
+
+    await msg.answer(f"🗑️ Canceled #{sid}.")
+
+
 # ============================
 
 from sqlalchemy import event  # ⬅️ add this import if not already present
@@ -267,6 +520,209 @@ async def top_n(chat_id: int, metric: str, n: int = 10) -> List[Tuple[int, int]]
         )
         return rows.all()
 
+# ================== Private admin scheduling ==================
+@dp.message(Command("schedule_once"))
+async def schedule_once_cmd(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+
+    # If someone runs it in a group: delete the command so nothing leaks
+    if not _is_private_chat(msg):
+        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        try:
+            m = await msg.answer("Use this command in a private chat with me.")
+            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        except Exception:
+            pass
+        return
+
+    # Parse:
+    # A) DM default target:  /schedule_once 2025-10-01 18:30 | Message text
+    # B) Explicit target:    /schedule_once -1001234567890 2025-10-01 18:30 | Message text
+    raw = re.sub(r"^/schedule_once(@\w+)?\s*", "", (msg.text or ""), flags=re.IGNORECASE).strip()
+    if "|" not in raw:
+        return await msg.answer(
+            "Usage:\n"
+            "/schedule_once 2025-10-01 18:30 | Your message\n"
+            "or\n"
+            "/schedule_once -1001234567890 2025-10-01 18:30 | Your message"
+        )
+
+    left, text = [p.strip() for p in raw.split("|", 1)]
+    parts = left.split()
+
+    # optional explicit chat id
+    if parts and parts[0].lstrip("-").isdigit() and len(parts) >= 3:
+        target_chat_id = int(parts[0])
+        when_part = " ".join(parts[1:3])
+    else:
+        target_chat_id = _DEFAULT_TARGET_CHAT
+        when_part = " ".join(parts[:2]) if len(parts) >= 2 else ""
+
+    if not target_chat_id:
+        return await msg.answer("No target chat set. Define ADMIN_DEFAULT_CHAT_ID in .env or pass chat id explicitly.")
+
+    try:
+        dt_local = dt.datetime.strptime(when_part, "%Y-%m-%d %H:%M")
+        run_at = TZ.localize(dt_local)
+    except Exception:
+        return await msg.answer("Time must be YYYY-MM-DD HH:MM (Stockholm).")
+
+    if not text:
+        return await msg.answer("Message text cannot be empty.")
+
+    # schedule
+    sched_id = _next_id()
+    job = scheduler.add_job(
+        _deliver_scheduled, "date",
+        run_date=run_at,
+        args=[target_chat_id, text]
+    )
+    _scheduled[sched_id] = _SchedInfo(job.id, target_chat_id, run_at, text)
+
+    await msg.answer(f"✅ Scheduled #{sched_id} → {target_chat_id} at {run_at.strftime('%Y-%m-%d %H:%M %Z')}.")
+
+@dp.message(Command("schedule_many"))
+async def schedule_many_cmd(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+
+    if not _is_private_chat(msg):
+        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        try:
+            m = await msg.answer("Use this command in a private chat with me.")
+            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        except Exception:
+            pass
+        return
+
+    body = re.sub(r"^/schedule_many(@\w+)?\s*", "", (msg.text or ""), flags=re.IGNORECASE).strip()
+    if not body:
+        return await msg.answer(
+            "Paste multiple lines after the command, for example:\n"
+            "/schedule_many\n"
+            "2025-10-02 07:00 | Morning: receipts decide truth.\n"
+            "-1001234567890 2025-10-05 20:30 | Night check-in (explicit target)."
+        )
+
+    ok, bad = [], []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "|" not in line:
+            bad.append((line, "Missing '|'"))
+            continue
+
+        left, text = [p.strip() for p in line.split("|", 1)]
+        parts = left.split()
+
+        # optional target
+        if parts and parts[0].lstrip("-").isdigit() and len(parts) >= 3:
+            target_chat_id = int(parts[0])
+            when_part = " ".join(parts[1:3])
+        else:
+            target_chat_id = _DEFAULT_TARGET_CHAT
+            when_part = " ".join(parts[:2]) if len(parts) >= 2 else ""
+
+        if not target_chat_id:
+            bad.append((line, "No default target chat configured"))
+            continue
+
+        try:
+            dt_local = dt.datetime.strptime(when_part, "%Y-%m-%d %H:%M")
+            run_at = TZ.localize(dt_local)
+        except Exception:
+            bad.append((line, "Bad time (YYYY-MM-DD HH:MM)"))
+            continue
+
+        if not text:
+            bad.append((line, "Empty message"))
+            continue
+
+        sched_id = _next_id()
+        job = scheduler.add_job(
+            _deliver_scheduled, "date",
+            run_date=run_at,
+            args=[target_chat_id, text]
+        )
+        _scheduled[sched_id] = _SchedInfo(job.id, target_chat_id, run_at, text)
+        ok.append((sched_id, target_chat_id, run_at, text))
+
+    reply = []
+    if ok:
+        reply.append("✅ Scheduled:")
+        for sid, chat, when, txt in ok:
+            reply.append(f"  • #{sid} → {chat} — {when.strftime('%Y-%m-%d %H:%M %Z')} — {txt[:60]}")
+    if bad:
+        reply.append("\n⚠️ Skipped:")
+        for line, reason in bad:
+            reply.append(f"  • {line}  ← {reason}")
+    await msg.answer("\n".join(reply) if reply else "Nothing parsed.")
+
+@dp.message(Command("schedule_list"))
+async def schedule_list_cmd(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+    if not _is_private_chat(msg):
+        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        try:
+            m = await msg.answer("Use in private chat.")
+            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        except Exception:
+            pass
+        return
+
+    # optional chat filter: /schedule_list -1001234567890
+    parts = (msg.text or "").split()
+    chat_filter = None
+    if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
+        chat_filter = int(parts[1])
+
+    items = []
+    for sid, info in sorted(_scheduled.items(), key=lambda kv: kv[1].run_at):
+        if chat_filter is not None and info.chat_id != chat_filter:
+            continue
+        items.append(f"#{sid} → {info.chat_id} — {info.run_at.astimezone(TZ).strftime('%Y-%m-%d %H:%M %Z')} — {info.text[:70]}")
+
+    if not items:
+        return await msg.answer("No pending in-memory schedules." + (f" (filtered by {chat_filter})" if chat_filter else ""))
+
+    await msg.answer("Pending schedules:\n" + "\n".join(items))
+
+@dp.message(Command("schedule_cancel"))
+async def schedule_cancel_cmd(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+    if not _is_private_chat(msg):
+        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        try:
+            m = await msg.answer("Use in private chat.")
+            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        except Exception:
+            pass
+        return
+
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        return await msg.answer("Usage:\n/schedule_cancel <id>")
+
+    try:
+        sid = int(parts[1].strip())
+    except ValueError:
+        return await msg.answer("ID must be an integer.")
+
+    info = _scheduled.pop(sid, None)
+    if not info:
+        return await msg.answer("No such id (or already delivered).")
+
+    try:
+        scheduler.remove_job(info.job_id)
+    except Exception:
+        pass
+
+    await msg.answer(f"🗑️ Canceled #{sid}.")
+
 async def user_totals(chat_id: int, user_id: int) -> Dict[str, int]:
     async with AsyncSessionLocal() as s:
         rows = await s.execute(
@@ -274,6 +730,49 @@ async def user_totals(chat_id: int, user_id: int) -> Dict[str, int]:
             .where(Counter.chat_id == chat_id, Counter.user_id == user_id)
         )
         return {m: c for (m, c) in rows.all()}
+
+# ---- Admin & privacy helpers ----
+_ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()}
+_DEFAULT_TARGET_CHAT = int(os.getenv("ADMIN_DEFAULT_CHAT_ID", "0") or "0")
+
+def _is_admin(user_id: int) -> bool:
+    return user_id in _ADMIN_IDS
+
+async def _delete_soon(chat_id: int, message_id: int, delay: float = 2.0):
+    try:
+        await asyncio.sleep(delay)
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+def _is_private_chat(msg: Message) -> bool:
+    # aiogram v3: "private", "group", "supergroup", "channel"
+    return getattr(msg.chat, "type", "") == "private"
+# ---- In-memory scheduled jobs (lost on restart) ----
+# We keep a small registry so you can /schedule_list and /schedule_cancel
+from dataclasses import dataclass
+
+@dataclass
+class _SchedInfo:
+    job_id: str
+    chat_id: int
+    run_at: dt.datetime
+    text: str
+
+_scheduled: Dict[int, _SchedInfo] = {}      # key: internal numeric id we assign
+_next_sched_id = 1
+
+def _next_id() -> int:
+    global _next_sched_id
+    v = _next_sched_id
+    _next_sched_id += 1
+    return v
+
+async def _deliver_scheduled(chat_id: int, text: str):
+    try:
+        await bot.send_message(chat_id, text)
+    except Exception:
+        logger.exception("Deliver scheduled message failed")
 
 # ===============================================================
 
@@ -893,6 +1392,8 @@ async def summon_reply(msg: Message):
 
 # --------- Other Handlers ----------
 
+
+
 @dp.message(Command("ai_ping"))
 async def ai_ping_cmd(msg: Message):
     reply = await ai_reply(PROPHET_SYSTEM, [
@@ -911,6 +1412,7 @@ async def chatid_cmd(msg: Message):
 @dp.message(F.text.func(lambda t: isinstance(t, str) and t.strip().lower().startswith(("/chatid", "/chatid@"))))
 async def chatid_fallback(msg: Message):
     await msg.answer(f"Chat ID: <code>{msg.chat.id}</code>")
+
 
 @dp.message(CommandStart())
 async def start_cmd(msg: Message):
@@ -1033,6 +1535,210 @@ async def disable_random_cmd(msg: Message):
 async def status_random_cmd(msg: Message):
     enabled = msg.chat.id in random_jobs
     await msg.answer(f"Forgiveness Chain status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
+
+# ================== Private admin scheduling ==================
+@dp.message(Command("schedule_once"))
+async def schedule_once_cmd(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+
+    # If someone runs it in a group: delete the command so nothing leaks
+    if not _is_private_chat(msg):
+        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        try:
+            m = await msg.answer("Use this command in a private chat with me.")
+            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        except Exception:
+            pass
+        return
+
+    # Parse:
+    # A) DM default target:  /schedule_once 2025-10-01 18:30 | Message text
+    # B) Explicit target:    /schedule_once -1001234567890 2025-10-01 18:30 | Message text
+    raw = re.sub(r"^/schedule_once(@\w+)?\s*", "", (msg.text or ""), flags=re.IGNORECASE).strip()
+    if "|" not in raw:
+        return await msg.answer(
+            "Usage:\n"
+            "/schedule_once 2025-10-01 18:30 | Your message\n"
+            "or\n"
+            "/schedule_once -1001234567890 2025-10-01 18:30 | Your message"
+        )
+
+    left, text = [p.strip() for p in raw.split("|", 1)]
+    parts = left.split()
+
+    # optional explicit chat id
+    if parts and parts[0].lstrip("-").isdigit() and len(parts) >= 3:
+        target_chat_id = int(parts[0])
+        when_part = " ".join(parts[1:3])
+    else:
+        target_chat_id = _DEFAULT_TARGET_CHAT
+        when_part = " ".join(parts[:2]) if len(parts) >= 2 else ""
+
+    if not target_chat_id:
+        return await msg.answer("No target chat set. Define ADMIN_DEFAULT_CHAT_ID in .env or pass chat id explicitly.")
+
+    try:
+        dt_local = dt.datetime.strptime(when_part, "%Y-%m-%d %H:%M")
+        run_at = TZ.localize(dt_local)
+    except Exception:
+        return await msg.answer("Time must be YYYY-MM-DD HH:MM (Stockholm).")
+
+    if not text:
+        return await msg.answer("Message text cannot be empty.")
+
+    # schedule
+    sched_id = _next_id()
+    job = scheduler.add_job(
+        _deliver_scheduled, "date",
+        run_date=run_at,
+        args=[target_chat_id, text]
+    )
+    _scheduled[sched_id] = _SchedInfo(job.id, target_chat_id, run_at, text)
+
+    await msg.answer(f"✅ Scheduled #{sched_id} → {target_chat_id} at {run_at.strftime('%Y-%m-%d %H:%M %Z')}.")
+
+@dp.message(Command("schedule_many"))
+async def schedule_many_cmd(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+
+    if not _is_private_chat(msg):
+        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        try:
+            m = await msg.answer("Use this command in a private chat with me.")
+            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        except Exception:
+            pass
+        return
+
+    body = re.sub(r"^/schedule_many(@\w+)?\s*", "", (msg.text or ""), flags=re.IGNORECASE).strip()
+    if not body:
+        return await msg.answer(
+            "Paste multiple lines after the command, for example:\n"
+            "/schedule_many\n"
+            "2025-10-02 07:00 | Morning: receipts decide truth.\n"
+            "-1001234567890 2025-10-05 20:30 | Night check-in (explicit target)."
+        )
+
+    ok, bad = [], []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "|" not in line:
+            bad.append((line, "Missing '|'"))
+            continue
+
+        left, text = [p.strip() for p in line.split("|", 1)]
+        parts = left.split()
+
+        # optional target
+        if parts and parts[0].lstrip("-").isdigit() and len(parts) >= 3:
+            target_chat_id = int(parts[0])
+            when_part = " ".join(parts[1:3])
+        else:
+            target_chat_id = _DEFAULT_TARGET_CHAT
+            when_part = " ".join(parts[:2]) if len(parts) >= 2 else ""
+
+        if not target_chat_id:
+            bad.append((line, "No default target chat configured"))
+            continue
+
+        try:
+            dt_local = dt.datetime.strptime(when_part, "%Y-%m-%d %H:%M")
+            run_at = TZ.localize(dt_local)
+        except Exception:
+            bad.append((line, "Bad time (YYYY-MM-DD HH:MM)"))
+            continue
+
+        if not text:
+            bad.append((line, "Empty message"))
+            continue
+
+        sched_id = _next_id()
+        job = scheduler.add_job(
+            _deliver_scheduled, "date",
+            run_date=run_at,
+            args=[target_chat_id, text]
+        )
+        _scheduled[sched_id] = _SchedInfo(job.id, target_chat_id, run_at, text)
+        ok.append((sched_id, target_chat_id, run_at, text))
+
+    reply = []
+    if ok:
+        reply.append("✅ Scheduled:")
+        for sid, chat, when, txt in ok:
+            reply.append(f"  • #{sid} → {chat} — {when.strftime('%Y-%m-%d %H:%M %Z')} — {txt[:60]}")
+    if bad:
+        reply.append("\n⚠️ Skipped:")
+        for line, reason in bad:
+            reply.append(f"  • {line}  ← {reason}")
+    await msg.answer("\n".join(reply) if reply else "Nothing parsed.")
+
+@dp.message(Command("schedule_list"))
+async def schedule_list_cmd(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+    if not _is_private_chat(msg):
+        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        try:
+            m = await msg.answer("Use in private chat.")
+            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        except Exception:
+            pass
+        return
+
+    # optional chat filter: /schedule_list -1001234567890
+    parts = (msg.text or "").split()
+    chat_filter = None
+    if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
+        chat_filter = int(parts[1])
+
+    items = []
+    for sid, info in sorted(_scheduled.items(), key=lambda kv: kv[1].run_at):
+        if chat_filter is not None and info.chat_id != chat_filter:
+            continue
+        items.append(f"#{sid} → {info.chat_id} — {info.run_at.astimezone(TZ).strftime('%Y-%m-%d %H:%M %Z')} — {info.text[:70]}")
+
+    if not items:
+        return await msg.answer("No pending in-memory schedules." + (f" (filtered by {chat_filter})" if chat_filter else ""))
+
+    await msg.answer("Pending schedules:\n" + "\n".join(items))
+
+@dp.message(Command("schedule_cancel"))
+async def schedule_cancel_cmd(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+    if not _is_private_chat(msg):
+        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        try:
+            m = await msg.answer("Use in private chat.")
+            asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        except Exception:
+            pass
+        return
+
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        return await msg.answer("Usage:\n/schedule_cancel <id>")
+
+    try:
+        sid = int(parts[1].strip())
+    except ValueError:
+        return await msg.answer("ID must be an integer.")
+
+    info = _scheduled.pop(sid, None)
+    if not info:
+        return await msg.answer("No such id (or already delivered).")
+
+    try:
+        scheduler.remove_job(info.job_id)
+    except Exception:
+        pass
+
+    await msg.answer(f"🗑️ Canceled #{sid}.")
+
 
 # --------- AI Layer (with toggles) ----------
 DEFAULT_PROPHET_SYSTEM = (
@@ -1227,12 +1933,15 @@ async def on_startup():
         logger.error("Could not clear webhook after multiple attempts. Polling may not receive updates.")
 
     # --- DB init ---
+    # --- DB init ---
     try:
         await init_db()
         logger.info("Database initialized and ready.")
+        await load_and_schedule_pending()
     except Exception:
         logger.exception("Database init failed.")
         raise
+
 
     asyncio.create_task(run_bot())  # start Telegram bot loop
 
@@ -1321,6 +2030,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
