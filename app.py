@@ -1041,8 +1041,13 @@ DEFAULT_PROPHET_SYSTEM = (
     "Avoid medical claims. Stay on-topic; if off-topic, gently steer back to training, habits, or group rituals."
 )
 
-# Read from env and turn "\n" into real newlines
 PROPHET_SYSTEM = os.getenv("OPENAI_SYSTEM_PROMPT", DEFAULT_PROPHET_SYSTEM).replace("\\n", "\n")
+
+# NEW: append Roast Mode block (if provided)
+ROAST_BLOCK = os.getenv("OPENAI_ROAST_BLOCK", "").replace("\\n", "\n")
+if ROAST_BLOCK:
+    PROPHET_SYSTEM = f"{PROPHET_SYSTEM}\n\n{ROAST_BLOCK}"
+
 
 
 _AI_COOLDOWN_S = int(os.getenv("AI_COOLDOWN_S", "15"))
@@ -1309,6 +1314,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
