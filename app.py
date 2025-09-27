@@ -1240,7 +1240,7 @@ async def on_startup():
 
 from aiogram.filters import Command
 
-@dp.message(F.text, ~Command())   # ignore any /command
+@dp.message(F.text.func(lambda t: isinstance(t, str) and not t.startswith("/")))
 async def ai_catchall(msg: Message):
     try:
         logger.info(f"[AI] incoming text in chat={msg.chat.id}: {msg.text!r}")
@@ -1293,6 +1293,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
