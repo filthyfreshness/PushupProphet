@@ -216,7 +216,7 @@ async def schedule_once_cmd(msg: Message):
     await msg.answer(f"✅ Scheduled #{row.id} → {target_chat_id} at {human_when}.")
 
 
-@dp.message(Command("schedule_many")))
+@dp.message(Command("schedule_many"))
 async def schedule_many_cmd(msg: Message):
     if not _is_admin(msg.from_user.id):
         return
@@ -2072,6 +2072,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
