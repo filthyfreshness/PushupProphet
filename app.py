@@ -1478,11 +1478,6 @@ async def ai_debug_cmd(msg: Message):
         await msg.answer(f"ai_debug failed: {e!r}")
 
 
-@dp.message(F.text.func(lambda t: isinstance(t, str) and t.strip().lower().startswith(("/ai_status", "/ai_status@"))))
-async def ai_status_fallback(msg: Message):
-    enabled = await get_ai_enabled(msg.chat.id)
-    await msg.answer(f"AI status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
-
 @dp.message(Command("vote_now", "weekly_votes", "votes_now"))
 async def vote_now_cmd(msg: Message):
     await send_weekly_vote_prompts(msg.chat.id)
@@ -1791,58 +1786,66 @@ async def disable_ai_cmd(msg: Message):
 
 async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL) -> str:
     if not OPENAI_API_KEY:
+        logger.error("[AI] OPENAI_API_KEY is empty/missing")
         return ""
-    # modest backoff retries to avoid going silent on transient errors
+
     delays = [0, 0.8, 2.0]
     for i, delay in enumerate(delays):
         if delay:
             await asyncio.sleep(delay)
         try:
             async with httpx.AsyncClient(timeout=30) as client:
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "system", "content": system}] + messages,
+                    "temperature": 0.6,
+                    "max_tokens": 180,
+                }
                 r = await client.post(
                     "https://api.openai.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                    json={
-                        "model": model,
-                        "messages": [{"role": "system", "content": system}] + messages,
-                        "temperature": 0.6,
-                        "max_tokens": 180,
-                    },
+                    json=payload,
                 )
-                r.raise_for_status()
+                if r.status_code != 200:
+                    body = (r.text[:800] + "…") if len(r.text) > 800 else r.text
+                    logger.warning("[AI] HTTP %s on attempt %s. Body: %s", r.status_code, i + 1, body)
+                    continue
+
                 data = r.json()
-                return (data["choices"][0]["message"]["content"] or "").strip()
+                text = (data["choices"][0]["message"]["content"] or "").strip()
+                if not text:
+                    logger.warning("[AI] empty completion on attempt %s", i + 1)
+                return text
+
+        except httpx.HTTPError as e:
+            logger.warning("[AI] httpx error on attempt %s: %r", i + 1, e)
         except Exception as e:
-            logger.warning(f"AI call attempt {i+1} failed: {e}")
+            logger.exception("[AI] unexpected error on attempt %s: %r", i + 1, e)
+
     return ""
 
-async def should_ai_reply(msg: Message) -> bool:
-    # 1) Check persisted setting
-    if not await get_ai_enabled(msg.chat.id):
-        return False
 
-    # 2) Basic guards
+def should_ai_reply(msg: Message) -> bool:
     t = (msg.text or "").strip()
-    if not t or t.startswith("/"):
+    if not t:
         return False
-
-    # 3) Skip if other themed handlers should answer
+    if t.startswith("/"):
+        return False
+    # ignore canned flows (thanks / apology / insult / dice / wisdom)
     if THANKS_RE.search(t) or APOLOGY_RE.search(t) or INSULT_RE.search(_normalize_text(t)) \
        or FATE_SUMMON_RE.search(t) or _matches_wisdom_nat(t):
         return False
-
-    # 4) Triggers
+    # explicit summon is always a trigger
     if SUMMON_PATTERN.search(t):
         return True
-    if (msg.reply_to_message
-        and msg.reply_to_message.from_user
-        and BOT_ID
-        and msg.reply_to_message.from_user.id == BOT_ID):
+    # replies to the Prophet are also a trigger
+    if msg.reply_to_message and msg.reply_to_message.from_user and BOT_ID and msg.reply_to_message.from_user.id == BOT_ID:
         return True
+    # otherwise: soft “ask for help” heuristic (7% to keep noise down)
     if re.search(r"\b(help|advice|how do i|what should i)\b", t, re.IGNORECASE) and _sysrand.random() < 0.07:
         return True
-
     return False
+
 
 
 
@@ -2030,6 +2033,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
