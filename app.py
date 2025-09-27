@@ -927,20 +927,46 @@ async def help_cmd(msg: Message):
     await start_cmd(msg)
 
 # === NEW: AI control commands ===
+@dp.message(Command("ai_status"))
+async def ai_status_cmd(msg: Message):
+    enabled = await get_ai_enabled(msg.chat.id)
+    await msg.answer(f"AI status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
+
 @dp.message(Command("enable_ai"))
 async def enable_ai_cmd(msg: Message):
     await set_ai_enabled(msg.chat.id, True)
+    enabled = await get_ai_enabled(msg.chat.id)
+    logger.info(f"[AI TOGGLE] chat={msg.chat.id} set True -> now {enabled}")
     await msg.answer("🤖 AI replies enabled for this chat.")
 
 @dp.message(Command("disable_ai"))
 async def disable_ai_cmd(msg: Message):
     await set_ai_enabled(msg.chat.id, False)
+    enabled = await get_ai_enabled(msg.chat.id)
+    logger.info(f"[AI TOGGLE] chat={msg.chat.id} set False -> now {enabled}")
     await msg.answer("🛑 AI replies disabled for this chat.")
 
-@dp.message(Command("ai_status"))
-async def ai_status_cmd(msg: Message):
-    enabled = await get_ai_enabled(msg.chat.id)
-    await msg.answer(f"AI status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
+@dp.message(Command("ai_debug"))
+async def ai_debug_cmd(msg: Message):
+    chat_id = msg.chat.id
+    try:
+        async with AsyncSessionLocal() as s:
+            res = await s.execute(
+                select(ChatSettings.chat_id, ChatSettings.ai_enabled, ChatSettings.changed_at)
+                .where(ChatSettings.chat_id == chat_id)
+            )
+            row = res.first()
+        enabled = await get_ai_enabled(chat_id)
+        await msg.answer(
+            "AI debug\n"
+            f"chat_id: {chat_id}\n"
+            f"get_ai_enabled(): {enabled}\n"
+            f"row: {row if row else 'NO ROW'}"
+        )
+    except Exception as e:
+        logger.exception("ai_debug failed")
+        await msg.answer(f"ai_debug failed: {e!r}")
+
 
 @dp.message(F.text.func(lambda t: isinstance(t, str) and t.strip().lower().startswith(("/ai_status", "/ai_status@"))))
 async def ai_status_fallback(msg: Message):
@@ -1212,7 +1238,9 @@ async def on_startup():
 
 
 
-@dp.message(F.text)
+from aiogram.filters import Command
+
+@dp.message(F.text, ~Command())   # ignore any /command
 async def ai_catchall(msg: Message):
     try:
         logger.info(f"[AI] incoming text in chat={msg.chat.id}: {msg.text!r}")
@@ -1265,6 +1293,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
