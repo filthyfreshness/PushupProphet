@@ -864,11 +864,10 @@ SUMMON_PATTERN = re.compile(r"\b(pushup\s*prophet|prophet)\b", re.IGNORECASE)
                         and not _matches_wisdom_nat(t)
                         and not APOLOGY_RE.search(t)))
 async def summon_reply(msg: Message):
-    # always record the name and count the mention
+    logger.info(f"[SUMMON] got mention in chat={msg.chat.id} text={msg.text!r}")
     try:
         await upsert_username(
-            msg.chat.id,
-            msg.from_user.id,
+            msg.chat.id, msg.from_user.id,
             getattr(msg.from_user, "first_name", None),
             getattr(msg.from_user, "username", None),
         )
@@ -876,15 +875,27 @@ async def summon_reply(msg: Message):
     except Exception:
         logger.exception("Failed to log 'mention' counter")
 
-    # if AI is enabled, let the AI catch-all handle the reply (no canned line)
     if await get_ai_enabled(msg.chat.id):
+        logger.info(f"[SUMMON] AI enabled -> letting catchall handle")
         return
 
-    # AI disabled → send canned line
     await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
 
 
+
 # --------- Other Handlers ----------
+
+@dp.message(Command("ai_ping"))
+async def ai_ping_cmd(msg: Message):
+    reply = await ai_reply(PROPHET_SYSTEM, [
+        {"role": "user", "content": "Give me one crisp pushup cue."}
+    ])
+    if reply:
+        await msg.answer(f"AI OK:\n{reply}", disable_web_page_preview=True, parse_mode=None)
+    else:
+        await msg.answer("AI call failed. Check server logs and OPENAI_API_KEY/OPENAI_MODEL.")
+
+
 @dp.message(Command("chatid"))
 async def chatid_cmd(msg: Message):
     await msg.answer(f"Chat ID: <code>{msg.chat.id}</code>")
@@ -1010,13 +1021,18 @@ def _cooldown_ok(user_id: int) -> bool:
 
 @dp.message(Command("enable_ai"))
 async def enable_ai_cmd(msg: Message):
-    _ai_enabled_for_chat[msg.chat.id] = True
+    await set_ai_enabled(msg.chat.id, True)
+    enabled = await get_ai_enabled(msg.chat.id)
+    logger.info(f"[AI TOGGLE] chat={msg.chat.id} set True -> now {enabled}")
     await msg.answer("🤖 AI replies enabled for this chat.")
 
 @dp.message(Command("disable_ai"))
 async def disable_ai_cmd(msg: Message):
-    _ai_enabled_for_chat[msg.chat.id] = False
-    await msg.answer("🤖 AI replies disabled for this chat.")
+    await set_ai_enabled(msg.chat.id, False)
+    enabled = await get_ai_enabled(msg.chat.id)
+    logger.info(f"[AI TOGGLE] chat={msg.chat.id} set False -> now {enabled}")
+    await msg.answer("🛑 AI replies disabled for this chat.")
+
 
 @dp.message(Command("status_ai"))
 async def status_ai_cmd(msg: Message):
@@ -1072,24 +1088,33 @@ def should_ai_reply(msg: Message) -> bool:
 @dp.message(F.text)
 async def ai_catchall(msg: Message):
     try:
-        # Only reply if AI is enabled for this chat
+        logger.info(f"[AI] incoming text in chat={msg.chat.id}: {msg.text!r}")
+
         if not await get_ai_enabled(msg.chat.id):
+            logger.info("[AI] disabled for this chat")
             return
 
         if not should_ai_reply(msg):
+            logger.info("[AI] should_ai_reply = False (not a trigger)")
             return
+
         if not _cooldown_ok(msg.from_user.id):
+            logger.info("[AI] cooldown blocked")
             return
 
         name = getattr(msg.from_user, "first_name", "") or (msg.from_user.username or "friend")
         user_text = msg.text or ""
+        logger.info("[AI] calling OpenAI…")
         messages = [{"role": "user", "content": f"{name}: {user_text}"}]
         reply = await ai_reply(PROPHET_SYSTEM, messages)
         if reply:
-            # IMPORTANT: send as plain text to avoid HTML/Markdown parsing issues
+            logger.info("[AI] got reply, sending to chat")
             await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
+        else:
+            logger.warning("[AI] ai_reply returned empty string")
     except Exception:
         logger.exception("AI reply failed")
+
 
 
 # --------- Run bot + web server together ----------
@@ -1236,6 +1261,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
