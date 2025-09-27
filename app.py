@@ -680,6 +680,358 @@ async def summon_reply(msg: Message):
             return
     await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
 
+# ================== Daily Quotes (rotation + /share_wisdom) ==================
+from collections import deque
+
+QUOTES = [
+    "“Gravity is my quill; with each rep I write strength upon your bones.”",
+    "“Do not count your pushups—make your pushups count, and the numbers will fear you.”",
+    "“Raise your standards before you raise your reps.”",
+]
+
+_quote_rotation: Dict[int, deque] = {}
+
+def _init_quote_rotation(chat_id: int) -> None:
+    if not QUOTES:
+        _quote_rotation[chat_id] = deque()
+        return
+    order = list(range(len(QUOTES)))
+    _sysrand.shuffle(order)
+    _quote_rotation[chat_id] = deque(order)
+
+def _next_quote(chat_id: int) -> Optional[str]:
+    if not QUOTES:
+        return None
+    dq = _quote_rotation.get(chat_id)
+    if dq is None or not dq:
+        _init_quote_rotation(chat_id)
+        dq = _quote_rotation[chat_id]
+    idx = dq.popleft()
+    return QUOTES[idx]
+
+async def send_daily_quote(chat_id: int):
+    q = _next_quote(chat_id)
+    if q is None:
+        return
+    safe = html.escape(q)
+    await bot.send_message(chat_id, f"🕖 Daily Wisdom\n{safe}")
+
+@dp.message(Command("share_wisdom"))
+async def share_wisdom_cmd(msg: Message):
+    q = _next_quote(msg.chat.id)
+    if not q:
+        await msg.answer("No quotes configured yet.")
+        return
+    await msg.answer(html.escape(q))
+
+
+# ================== Weekly Votes (polls on Sundays) ==================
+PLAYERS = ["Fresh", "Momo", "Valle", "Tän", "Hampa"]  # ← edit to your roster
+
+# Store vote state in-memory (per chat, per ISO week)
+weakest_votes: Dict[int, Dict[str, Dict[int, str]]] = {}
+inspiration_votes: Dict[int, Dict[str, Dict[int, str]]] = {}
+
+# Poll ID → { kind: 'weakest'|'inspiration', chat_id: int, options: [players] }
+POLL_META: Dict[str, Dict[str, object]] = {}
+
+def _week_key_now() -> str:
+    now = dt.datetime.now(TZ)
+    iso = now.isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+def _ensure_vote_map(bucket: Dict[int, Dict[str, Dict[int, str]]], chat_id: int, week_key: str) -> Dict[int, str]:
+    by_chat = bucket.setdefault(chat_id, {})
+    return by_chat.setdefault(week_key, {})
+
+async def send_weekly_vote_prompts(chat_id: int):
+    if not PLAYERS:
+        await bot.send_message(chat_id, "No players configured for weekly votes.")
+        return
+    options = list(PLAYERS)
+
+    msg_w = await bot.send_poll(
+        chat_id=chat_id,
+        question="🏷️ The Weakest Link — Who struggled the most this week?",
+        options=options,
+        is_anonymous=False,
+        allows_multiple_answers=False,
+    )
+    if msg_w.poll:
+        POLL_META[msg_w.poll.id] = {"kind": "weakest", "chat_id": chat_id, "options": options}
+
+    msg_i = await bot.send_poll(
+        chat_id=chat_id,
+        question="🌟 The Inspiration — Who inspired the circle this week?",
+        options=options,
+        is_anonymous=False,
+        allows_multiple_answers=False,
+    )
+    if msg_i.poll:
+        POLL_META[msg_i.poll.id] = {"kind": "inspiration", "chat_id": chat_id, "options": options}
+
+@dp.message(Command("vote_now", "weekly_votes", "votes_now"))
+async def vote_now_cmd(msg: Message):
+    await send_weekly_vote_prompts(msg.chat.id)
+    await msg.answer("🗳️ The weekly vote prompts have been posted.")
+
+@dp.poll_answer()
+async def handle_poll_vote(pa: PollAnswer):
+    poll_id = pa.poll_id
+    meta = POLL_META.get(poll_id)
+    if not meta:
+        return
+    option_ids = pa.option_ids or []
+    if not option_ids:
+        return
+    idx = option_ids[0]
+    options: List[str] = meta["options"]  # type: ignore
+    if idx < 0 or idx >= len(options):
+        return
+    player = options[idx]
+    kind = meta["kind"]            # 'weakest' or 'inspiration'
+    chat_id = meta["chat_id"]
+    week_key = _week_key_now()
+    user_id = pa.user.id
+    bucket = weakest_votes if kind == "weakest" else inspiration_votes
+    votes_map = _ensure_vote_map(bucket, chat_id, week_key)
+    votes_map[user_id] = player
+
+    voter_name = (pa.user.full_name or pa.user.first_name or pa.user.username or "Someone").strip()
+    safe_voter = html.escape(voter_name)
+    safe_player = html.escape(player)
+    label = "The Weakest Link" if kind == "weakest" else "The Inspiration"
+    await bot.send_message(chat_id, f"🗳️ <b>{safe_voter}</b> voted <b>{safe_player}</b> as <i>{label}</i>.")
+
+
+# ================== Dice of Fate ==================
+FATE_WEIGHTS = [
+    ("miracle",         3),
+    ("mercy_coin",      6),
+    ("trial_form",     10),
+    ("command_prophet",10),
+    ("giver",          12),
+    ("hurricane",      10),
+    ("oath_dawn",      16),
+    ("trial_flesh",    15),
+    ("tribute_blood",  15),
+    ("wrath",           3),
+]
+
+def _pick_fate_key() -> str:
+    keys = [k for k, _ in FATE_WEIGHTS]
+    weights = [w for _, w in FATE_WEIGHTS]
+    return _sysrand.choices(keys, weights=weights, k=1)[0]
+
+FATE_RULES_TEXT = (
+    "<b>Dice of Fate</b>\n\n"
+    "(3%) — ✨ <b>The Miracle</b> — Halve your debt\n"
+    "(6%) — 🪙 <b>Mercy Coin</b> — Skip one regular pushup day\n"
+    "(10%) — ⚔️ <b>Trial of Form</b> — Do 10 perfect pushups → erase 20 kr of debt\n"
+    "(10%) — 👑 <b>Command of the Prophet</b> — Pick a player: He does 30 pushups or 30 kr\n"
+    "(12%) — 🤝 <b>The Giver</b> — Give away 40 of your daily pushups to a random player\n"
+    "\n"
+    "(10%) — 🌪️ <b>Hurricane of Chaos</b> — Pay 10 kr; shift 10% of your debt to random player\n"
+    "(16%) — 🌅 <b>Oath of Dawn</b> — Be first tomorrow or pay 30 kr\n"
+    "(15%) — 🔥 <b>Trial of Flesh</b> — 100 pushups today or +45 kr\n"
+    "(15%) — 🩸 <b>Tribute of Blood</b> — Pay 50 kr\n"
+    "(3%) — ⚡ <b>Prophet’s Wrath</b> — Double your debt"
+)
+
+_fate_rolls: Dict[int, tuple[dt.date, set[int]]] = {}
+
+def _today_stockholm_date() -> dt.date:
+    return dt.datetime.now(TZ).date()
+
+def _fate_reset_if_new_day(chat_id: int):
+    today = _today_stockholm_date()
+    state = _fate_rolls.get(chat_id)
+    if not state or state[0] != today:
+        _fate_rolls[chat_id] = (today, set())
+
+def _fate_has_rolled_today(chat_id: int, user_id: int) -> bool:
+    _fate_reset_if_new_day(chat_id)
+    return user_id in _fate_rolls[chat_id][1]
+
+def _fate_mark_rolled(chat_id: int, user_id: int):
+    _fate_reset_if_new_day(chat_id)
+    _fate_rolls[chat_id][1].add(user_id)
+
+def _fate_epic_text(key: str, target_name: Optional[str] = None) -> str:
+    closers = [
+        "Thus it is spoken—walk wisely.",
+        "So decrees the Prophet—bear the mark with honor.",
+        "The die grows silent; let your deeds answer.",
+        "The seal is set; may your will not waver.",
+        "The wind keeps the tally; choose well.",
+    ]
+    end = _sysrand.choice(closers)
+    texts = {
+        "miracle": "✨ <b>The Miracle</b>\nThe scales tilt toward mercy. Your burden is cleaved in half.",
+        "giver": (
+            "🤝 <b>The Giver</b>\n" +
+            (f"Give away <b>40</b> of your daily pushups to <b>{html.escape(target_name)}</b>. Strength shared is strength multiplied."
+             if target_name else
+             "Give away <b>40</b> of your daily pushups to a random player. Strength shared is strength multiplied.")
+        ),
+        "trial_form": "⚔️ <b>Trial of Form</b>\nOffer <b>10</b> perfect pushups—tempo true, depth honest—and erase <b>20 kr</b> of debt.",
+        "command_prophet": "👑 <b>Command of the Prophet</b>\nPick a player: he does <b>30</b> pushups or pays <b>30 kr</b>. Authority tests friendship.",
+        "mercy_coin": "🪙 <b>Mercy Coin</b>\nOne regular day is pardoned. Do not spend it cheaply.",
+        "hurricane": "🌪️ <b>Hurricane of Chaos</b>\nPay <b>10 kr</b>; then shift <b>10%</b> of your debt to a random player.",
+        "oath_dawn": "🌅 <b>Oath of Dawn</b>\nBe first to rise tomorrow or pay <b>30 kr</b>. Dawn reveals the faithful.",
+        "trial_flesh": "🔥 <b>Trial of Flesh</b>\nChoose today: <b>100</b> pushups—or lay <b>45 kr</b> upon the altar.",
+        "tribute_blood": "🩸 <b>Tribute of Blood</b>\nThe pot demands <b>50 kr</b>. Pay without grudge, learn without delay.",
+        "wrath": "⚡ <b>Prophet’s Wrath</b>\nYour debt is doubled. Pride withers; discipline takes its seat.",
+    }
+    return texts.get(key, "The die rolls into shadow.") + f"\n\n<i>{end}</i>"
+
+@dp.message(Command("fate", "dice", "dice_of_fate"))
+async def fate_cmd(msg: Message):
+    await msg.answer("“You dare summon the Dice of Fate. The air trembles with judgment.”")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Roll the Dice 🎲", callback_data="fate:roll"),
+        InlineKeyboardButton(text="Cancel", callback_data="fate:cancel"),
+    ]])
+    await msg.answer(FATE_RULES_TEXT, reply_markup=kb)
+
+@dp.callback_query(F.data == "fate:cancel")
+async def fate_cancel(cb: CallbackQuery):
+    await cb.answer("The Dice return to their slumber.")
+    await cb.message.answer("The Dice close their eyes. Another day, perhaps.")
+
+@dp.callback_query(F.data == "fate:roll")
+async def fate_roll(cb: CallbackQuery):
+    chat_id = cb.message.chat.id
+    user_id = cb.from_user.id
+
+    if _fate_has_rolled_today(chat_id, user_id):
+        return await cb.answer("You have already rolled today. Return with the next dawn.", show_alert=True)
+
+    _fate_mark_rolled(chat_id, user_id)
+    fate_key = _pick_fate_key()
+
+    target = None
+    if fate_key == "giver":
+        target = _sysrand.choice(PLAYERS) if PLAYERS else None
+
+    epic = _fate_epic_text(fate_key, target_name=target)
+    await cb.answer()
+
+    if fate_key == "hurricane":
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🎯 Select random player", callback_data="hurricane:spin")
+        ]])
+        await cb.message.answer(epic, reply_markup=kb)
+    else:
+        await cb.message.answer(epic)
+
+@dp.callback_query(F.data == "hurricane:spin")
+async def hurricane_spin(cb: CallbackQuery):
+    invoker = (cb.from_user.first_name or "").strip()
+    candidates = [p for p in PLAYERS if p.lower() != invoker.lower()] or PLAYERS
+    if not candidates:
+        await cb.answer("No players configured.", show_alert=True)
+        return
+    target = _sysrand.choice(candidates)
+    await cb.answer()
+    await cb.message.answer(
+        f"🎯 The storm chooses: <b>{html.escape(target)}</b>.\n"
+        f"Shift <b>10%</b> of your debt to them. Order is restored."
+    )
+
+# Natural-language summon for Dice of Fate
+FATE_SUMMON_RE = re.compile(
+    r"\b(?:dice\s+of\s+fate|summon(?:\s+the)?\s+dice(?:\s+of\s+fate)?|fate\s+dice|roll\s+the\s+dice\s+of\s+fate)\b",
+    re.IGNORECASE
+)
+
+@dp.message(F.text.func(lambda t: isinstance(t, str)
+                        and not t.strip().startswith("/")
+                        and FATE_SUMMON_RE.search(t)))
+async def fate_natural(msg: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Roll the Dice 🎲", callback_data="fate:roll"),
+        InlineKeyboardButton(text="Cancel", callback_data="fate:cancel"),
+    ]])
+    await msg.answer("“You dare summon the Dice of Fate. The air trembles with judgment.”")
+    await msg.answer(FATE_RULES_TEXT, reply_markup=kb)
+
+# ================== Forgiveness Chain (random daily + 1h follow-up) ==================
+# Uses global: DAILY_TEXT, TZ, WINDOW_START, WINDOW_END, scheduler, bot
+# One job per chat in `random_jobs`. Cancels/reschedules cleanly.
+
+random_jobs: Dict[int, object] = {}  # chat_id -> APScheduler Job
+
+def _next_random_time(now: dt.datetime) -> dt.datetime:
+    """Pick a random time today within [WINDOW_START, WINDOW_END]. If already past, roll to tomorrow."""
+    hour = _sysrand.randint(WINDOW_START, WINDOW_END)
+    minute = _sysrand.randint(0, 59)
+    run_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if run_at <= now:
+        run_at += dt.timedelta(days=1)
+    return run_at
+
+def schedule_random_daily(chat_id: int) -> None:
+    """Start (or restart) the daily random announcement loop for a chat."""
+    # If a job exists, remove it first
+    old = random_jobs.get(chat_id)
+    if old:
+        try:
+            old.remove()
+        except Exception:
+            pass
+
+    now = dt.datetime.now(TZ)
+    run_at = _next_random_time(now)
+
+    async def send_and_reschedule():
+        try:
+            # 1) Send the main daily message
+            await bot.send_message(chat_id, DAILY_TEXT)
+
+            # 2) Schedule the exact 1-hour follow-up (no long sleep)
+            scheduler.add_job(
+                bot.send_message,
+                "date",
+                run_date=dt.datetime.now(TZ) + dt.timedelta(hours=1),
+                args=[chat_id,
+                      ("The hour has passed, the covenant stands. No debt weighs upon those who rise in unison. "
+                       "The choice has always been yours. I hope you made the right one.")]
+            )
+        finally:
+            # 3) Immediately schedule tomorrow's random time
+            tomorrow = dt.datetime.now(TZ) + dt.timedelta(days=1)
+            next_run = _next_random_time(tomorrow)
+            new_job = scheduler.add_job(send_and_reschedule, "date", run_date=next_run)
+            random_jobs[chat_id] = new_job
+
+    job = scheduler.add_job(send_and_reschedule, "date", run_date=run_at)
+    random_jobs[chat_id] = job
+
+@dp.message(Command("enable_random"))
+async def enable_random_cmd(msg: Message):
+    schedule_random_daily(msg.chat.id)
+    await msg.answer("✅ Forgiveness Chain enabled for this chat. I will announce once per day between "
+                     f"{WINDOW_START:02d}:00–{WINDOW_END:02d}:00 Stockholm, then follow up 1 hour later.")
+
+@dp.message(Command("disable_random"))
+async def disable_random_cmd(msg: Message):
+    job = random_jobs.pop(msg.chat.id, None)
+    if job:
+        try:
+            job.remove()
+        except Exception:
+            pass
+        await msg.answer("🛑 Forgiveness Chain disabled for this chat.")
+    else:
+        await msg.answer("It wasn’t enabled for this chat.")
+
+@dp.message(Command("status_random"))
+async def status_random_cmd(msg: Message):
+    enabled = msg.chat.id in random_jobs
+    await msg.answer(f"Forgiveness Chain status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
+
+
 # Catch-all AI (only if enabled; obey cooldown; sync trigger)
 @dp.message(F.text.func(lambda t: isinstance(t, str) and not t.startswith("/")))
 async def ai_catchall(msg: Message):
@@ -729,13 +1081,47 @@ async def on_startup():
             logger.warning(f"delete_webhook attempt {attempt} failed: {e}")
         await asyncio.sleep(min(2 ** attempt, 10))
 
-    # DB init & schedule resume
-    await init_db()
-    await load_and_schedule_pending()
+  # DB init & schedule resume
+await init_db()
+await load_and_schedule_pending()
 
-    # Start APScheduler and polling
-    scheduler.start()
-    asyncio.create_task(run_bot_polling())
+# === Schedule daily quotes and weekly votes for configured chats ===
+ids = os.getenv("GROUP_CHAT_IDS", "").strip()
+if ids:
+    for raw in ids.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            chat_id = int(raw)
+
+            # Daily quote at 07:00 Stockholm
+            scheduler.add_job(
+                send_daily_quote, "cron",
+                hour=7, minute=0, args=[chat_id],
+                id=f"daily_quote_{chat_id}", replace_existing=True,
+            )
+            logger.info(f"Scheduled daily quote (07:00) for chat {chat_id}")
+
+            # Weekly votes every Sunday at 11:00 Stockholm
+            scheduler.add_job(
+                send_weekly_vote_prompts, "cron",
+                day_of_week="sun", hour=11, minute=0, args=[chat_id],
+                id=f"weekly_votes_{chat_id}", replace_existing=True,
+            )
+            logger.info(f"Scheduled weekly votes (Sun 11:00) for chat {chat_id}")
+          
+            # Forgiveness Chain: random daily + 1h follow-up
+            schedule_random_daily(chat_id)
+            logger.info(f"Auto-enabled Forgiveness Chain for chat {chat_id}")
+
+        except Exception as e:
+            logger.exception(f"Startup scheduling failed for chat {raw}: {e}")
+
+# Start APScheduler and polling
+scheduler.start()
+asyncio.create_task(run_bot_polling())
+
 
 async def run_bot_polling():
     delays = [0, 1, 3, 5, 10]
@@ -780,3 +1166,4 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
