@@ -1048,6 +1048,13 @@ ROAST_BLOCK = os.getenv("OPENAI_ROAST_BLOCK", "").replace("\\n", "\n")
 if ROAST_BLOCK:
     PROPHET_SYSTEM = f"{PROPHET_SYSTEM}\n\n{ROAST_BLOCK}"
 
+OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.6"))
+spice = os.getenv("OPENAI_ROAST_SPICE", "medium").lower()
+if spice == "low":
+    OPENAI_TEMPERATURE = min(OPENAI_TEMPERATURE, 0.5)
+elif spice == "high":
+    OPENAI_TEMPERATURE = max(OPENAI_TEMPERATURE, 0.8)
+
 
 
 _AI_COOLDOWN_S = int(os.getenv("AI_COOLDOWN_S", "15"))
@@ -1314,6 +1321,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     # workers=1 guarantees single process (important for polling)
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
