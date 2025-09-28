@@ -61,6 +61,12 @@ if not BOT_TOKEN:
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.6"))
+OPENAI_USE_RESPONSES = os.getenv("OPENAI_USE_RESPONSES", "1").strip() == "1"
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip() or "https://api.openai.com"
+
+logger.info("[AI] Using key suffix: %s", (OPENAI_API_KEY or "")[-8:])
+logger.info("[AI] Responses enabled: %s", OPENAI_USE_RESPONSES)
+
 
 logger.info("[AI] Using key suffix: %s", (OPENAI_API_KEY or "")[-8:])
 logger.info("[AI] Using model: %s", OPENAI_MODEL)
@@ -451,6 +457,19 @@ async def start_cmd(msg: Message):
 
 @dp.message(Command("help"))
 async def help_cmd(msg: Message): await start_cmd(msg)
+
+@dp.message(Command("ai_diag"))
+async def ai_diag_cmd(msg: Message):
+    enabled = await get_ai_enabled(msg.chat.id)
+    await msg.answer(
+        "AI diagnostics\n"
+        f"chat_id: {msg.chat.id}\n"
+        f"enabled: {enabled}\n"
+        f"model: {OPENAI_MODEL}\n"
+        f"OPENAI_API_KEY set: {bool(OPENAI_API_KEY)}\n"
+        f"OPENAI_USE_RESPONSES: {OPENAI_USE_RESPONSES}\n"
+        f"OPENAI_BASE_URL: {OPENAI_BASE_URL}"
+    )
 
 @dp.message(Command("ai_ping"))
 async def ai_ping_cmd(msg: Message):
@@ -1295,6 +1314,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
