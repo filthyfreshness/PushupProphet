@@ -1562,7 +1562,7 @@ async def _auto_enable_chain_when_seen(msg: Message):
 # Catch-all AI (AI enforces thanks/apology/insult/summon policy; compact group replies)
 @dp.message(F.text.func(lambda t: isinstance(t, str) and not t.startswith("/")))
 async def ai_catchall(msg: Message):
-        logger.info(f"[AI] catchall hit chat={msg.chat.id} text={msg.text!r}")
+    logger.info(f"[AI] catchall hit chat={msg.chat.id} text={msg.text!r}")
     try:
         if not await get_ai_enabled(msg.chat.id):
             return
@@ -1815,6 +1815,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
