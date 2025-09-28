@@ -1092,17 +1092,6 @@ async def schedule_cancel_cmd(msg: Message):
 #            return
 #    await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
 
-# ================== Daily Quotes (rotation + /share_wisdom) ==================
-
-
-@dp.message(Command("share_wisdom"))
-async def share_wisdom_cmd(msg: Message):
-    q = _next_quote(msg.chat.id)
-    if not q:
-        await msg.answer("No quotes configured yet.")
-        return
-    await msg.answer(html.escape(q))
-
 
 # ================== Weekly Votes (polls on Sundays) ==================
 PLAYERS = ["Fresh", "Momo", "Valle", "Tän", "Hampa"]  # ← edit to your roster
@@ -1573,6 +1562,7 @@ async def _auto_enable_chain_when_seen(msg: Message):
 # Catch-all AI (AI enforces thanks/apology/insult/summon policy; compact group replies)
 @dp.message(F.text.func(lambda t: isinstance(t, str) and not t.startswith("/")))
 async def ai_catchall(msg: Message):
+        logger.info(f"[AI] catchall hit chat={msg.chat.id} text={msg.text!r}")
     try:
         if not await get_ai_enabled(msg.chat.id):
             return
@@ -1687,8 +1677,10 @@ async def ai_catchall(msg: Message):
 
         prompt = f"{name}: {text}\n\n[context-json]\n{ai_context}"
         reply = await ai_reply(PROPHET_SYSTEM, [{"role": "user", "content": prompt}])
-        if reply:
-            await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
+        if not reply:
+            reply = "I hear you. Walk me through it in one line."
+        await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
+
     except Exception:
         logger.exception("policy-aware AI reply failed")
 
@@ -1823,6 +1815,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
