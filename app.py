@@ -329,19 +329,6 @@ async def user_totals(chat_id: int, user_id: int) -> Dict[str, int]:
     for k in ("thanks", "apology", "insult", "penalty"):
         out.setdefault(k, 0)
     return out
-from sqlalchemy import insert
-
-async def log_chat_message(chat_id: int, author_id: int | None, is_bot: bool, text: str):
-    # (Optional) trim to avoid huge rows
-    t = text.strip()
-    if len(t) > 1000:
-        t = t[:1000] + "…"
-    ins = _dialect_insert()(ChatMessage).values(
-        chat_id=chat_id, author_id=author_id, is_bot=is_bot, text=t
-    )
-    async with AsyncSessionLocal() as s:
-        await s.execute(ins)
-        await s.commit()
 
 
 # ---------- Program day helpers ----------
@@ -802,8 +789,6 @@ INSULT_WORDS = (
     r"bitch|ass(?:hole|hat|clown)?|dick(?:head)?|prick|jerk|wank(?:er)?|twat|tosser|dipshit|jackass|motherfucker|mf)"
 )
 
-# General profanity detector (reply even if not directed)
-PROFANITY_RE = re.compile(INSULT_WORDS, re.IGNORECASE)
 
 # Directed at Prophet (mention adjacency or 2nd-person forms)
 DIRECT_2P = r"(?:fuck\s*(?:you|u|ya)|screw\s*you|stfu|shut\s*up|you\s*(?:suck|are\s*(?:stupid|dumb|useless)))"
@@ -1792,7 +1777,7 @@ async def ai_catchall(msg: Message):
         is_thanks     = bool(THANKS_RE.search(text))
         is_apology    = bool(APOLOGY_RE.search(text))
         has_profanity = bool(PROFANITY_RE.search(text))
-        is_summon     = bool(SUMMON_PATTERN.search(text))   # compiled regex
+        is_summon     = bool(SUMMON_PATTERN().search(text))   # compiled regex
 
         explicit_direct = bool(INSULT_DIRECT_RE().search(text)) or is_summon
         is_directed = explicit_direct or context_says_directed(msg.chat.id, msg.from_user.id, text)
@@ -1821,6 +1806,11 @@ async def ai_catchall(msg: Message):
                 await incr_counter(msg.chat.id, msg.from_user.id, "thanks", 1)
             if is_apology:
                 await incr_counter(msg.chat.id, msg.from_user.id, "apology", 1)
+                try:
+                    await bump_apology_db(msg.chat.id, msg.from_user.id)
+                except Exception:
+                    logger.exception("bump_apology_db failed")
+                
             if is_directed and has_profanity:
                 await incr_counter(msg.chat.id, msg.from_user.id, "insult", 1)
             if is_summon:
@@ -1989,8 +1979,6 @@ async def on_startup():
     BOT_USERNAME = (me.username or "").lower()
     logger.info(f"Bot authorized: @{me.username} (id={me.id})")
 
-    BOT_ID = me.id
-    logger.info(f"Bot authorized: @{me.username} (id={me.id})")
 
     # 2) Ensure no webhook conflict with polling
     for attempt in range(1, 6):
@@ -2103,6 +2091,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
