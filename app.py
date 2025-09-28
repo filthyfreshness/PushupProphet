@@ -89,6 +89,13 @@ WINDOW_END = 22
 
 # Bot ID cache
 BOT_ID: Optional[int] = None
+BOT_USERNAME: Optional[str] = None
+
+# Conversation windows (per chat)
+CHAT_LAST_BOT_TS: Dict[int, float] = {}      # chat_id -> last time Prophet spoke
+CHAT_CONVO_USER: Dict[int, int] = {}         # chat_id -> user id Prophet is currently “talking to”
+CONVO_WINDOW_S = 180                         # 3 minutes
+
 
 # ------------------------ Database ---------------------------
 
@@ -394,7 +401,7 @@ async def bump_insult_db(chat_id: int, user_id: int) -> Tuple[int, int]:
     """Returns (insult_count_today, hidden_threshold_2_to_6)."""
     async with AsyncSessionLocal() as s:
         row = await _get_or_create_user_daily(s, chat_id, user_id)
-        if row.insult_threshold is None:
+        if row.insult_threshold is None or row.insult_threshold < 2:
             row.insult_threshold = _sysrand.randint(2, 6)
         row.insult_count += 1
         await s.commit()
@@ -694,18 +701,36 @@ def _today_stockholm_date() -> dt.date:
     return dt.datetime.now(TZ).date()
 
 
-MENTION_RE = r"(?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b)"
+# Mentions / summons (prophet name, bot name, or @username). Dynamic so it picks up BOT_USERNAME after startup.
+def _summon_terms():
+    terms = [r"push\s*up\s*prophet", r"pushup\s*prophet", r"\bprophet\b", r"\bbot\b"]
+    if BOT_USERNAME:
+        terms.append(rf"@{re.escape(BOT_USERNAME)}")
+    return terms
+
+def MENTION_RE():
+    return r"(?:%s)" % "|".join(_summon_terms())
+
 INSULT_WORDS = (
     r"(?:fuck(?:ing|er|ed)?|f\*+ck|shit|crap|trash|garbage|bs|sucks?|stupid|idiot|moron|dumb(?:ass)?|"
     r"loser|pathetic|awful|terrible|useless|worthless|annoying|cringe|fraud|fake|clown|"
     r"bitch|ass(?:hole|hat|clown)?|dick(?:head)?|prick|jerk|wank(?:er)?|twat|tosser|dipshit|jackass|motherfucker|mf)"
 )
+
+# General profanity detector (reply even if not directed)
+PROFANITY_RE = re.compile(INSULT_WORDS, re.IGNORECASE)
+
+# Directed at Prophet (mention adjacency or 2nd-person forms)
 DIRECT_2P = r"(?:fuck\s*(?:you|u|ya)|screw\s*you|stfu|shut\s*up|you\s*(?:suck|are\s*(?:stupid|dumb|useless)))"
-INSULT_RE = re.compile(
-    rf"(?:(?:{MENTION_RE}).*?(?:{INSULT_WORDS})|(?:{INSULT_WORDS}).*?(?:{MENTION_RE}))|(?:{DIRECT_2P})",
-    re.IGNORECASE
-)
-SUMMON_PATTERN = re.compile(r"\b(pushup\s*prophet|prophet)\b", re.IGNORECASE)
+def INSULT_DIRECT_RE():
+    return re.compile(
+        rf"(?:(?:{MENTION_RE()}).*?(?:{INSULT_WORDS})|(?:{INSULT_WORDS}).*?(?:{MENTION_RE()}))|(?:{DIRECT_2P})",
+        re.IGNORECASE
+    )
+
+def SUMMON_PATTERN():
+    return re.compile(MENTION_RE(), re.IGNORECASE)
+
 
 def _matches_wisdom_nat(t: str) -> bool:
     patterns = [
@@ -716,21 +741,34 @@ def _matches_wisdom_nat(t: str) -> bool:
     return any(re.search(p, t, re.IGNORECASE) for p in patterns)
 
 def should_ai_reply(msg: Message) -> bool:
-    """Pure sync heuristic; DO NOT await this."""
     t = (msg.text or "").strip()
     if not t or t.startswith("/"):
         return False
-    if THANKS_RE.search(t) or APOLOGY_RE.search(t) or INSULT_RE.search(_normalize_text(t)) \
-       or _matches_wisdom_nat(t):
-        return False
-    if SUMMON_PATTERN.search(t):
+
+    # If user is in an active 3-minute window with the Prophet in this chat
+    now = dt.datetime.now().timestamp()
+    last_bot = CHAT_LAST_BOT_TS.get(msg.chat.id, 0.0)
+    active_user = CHAT_CONVO_USER.get(msg.chat.id)
+    in_window = (now - last_bot) <= CONVO_WINDOW_S
+
+    if in_window and active_user == (msg.from_user.id if msg.from_user else None):
         return True
+
+    # Mentions (dynamic, includes @username when known)
+    if SUMMON_PATTERN().search(t):
+        return True
+
+    # If they reply to the Prophet
     if msg.reply_to_message and msg.reply_to_message.from_user and BOT_ID \
        and msg.reply_to_message.from_user.id == BOT_ID:
         return True
-    if re.search(r"\b(help|advice|how do i|what should i)\b", t, re.IGNORECASE) and _sysrand.random() < 0.07:
+
+    # Light heuristic for generic help/advice requests
+    if re.search(r"\b(help|advice|how do i|what should i)\b", t, re.IGNORECASE) and _sysrand.random() < 0.2:
         return True
+
     return False
+
 
 # ------------------------ Handlers ---------------------------
 
@@ -1531,57 +1569,40 @@ async def my_stats_cmd(msg: Message):
 
 # --- Unified catch-all: auto-enable + AI reply (cannot be blocked) ---
 @dp.message(F.text, flags={"block": False})
+@dp.message(F.text)   # keep simple, reliable match
 async def ai_catchall(msg: Message):
-    # Ignore slash-commands
+    # Ignore commands here
     if not msg.text or msg.text.startswith("/"):
         return
 
-    # ===== 1) Auto-enable Forgiveness Chain / schedules (once per chat) =====
-    try:
-        logger.info(f"[AUTO] saw text chat={msg.chat.id} type={getattr(msg.chat,'type','')}")
-        if getattr(msg.chat, "type", "") in ("group", "supergroup"):
-            enabled_in_db = await get_chain_enabled(msg.chat.id)
-            if not enabled_in_db:
-                logger.info(f"[AUTO] chain disabled in DB for chat={msg.chat.id}")
-            else:
-                if msg.chat.id not in random_jobs:
-                    schedule_random_daily(msg.chat.id)
-                    logger.info(f"[Chain] Auto-enabled (default ON) for chat {msg.chat.id}")
-                    try:
-                        scheduler.add_job(
-                            send_ai_day_message, "cron",
-                            hour=7, minute=0, args=[msg.chat.id],
-                            id=f"day_msg_{msg.chat.id}", replace_existing=True,
-                        )
-                        scheduler.add_job(
-                            send_weekly_vote_prompts, "cron",
-                            day_of_week="sun", hour=11, minute=0, args=[msg.chat.id],
-                            id=f"weekly_votes_{msg.chat.id}", replace_existing=True,
-                        )
-                    except Exception:
-                        logger.exception("[Chain] extra schedules failed")
-    except Exception:
-        logger.exception("[AUTO] auto-enable hook failed")
-
-    # ===== 2) AI logic =====
     logger.info(f"[AI] catchall hit chat={msg.chat.id} text={msg.text!r}")
 
     try:
         enabled = await get_ai_enabled(msg.chat.id)
         logger.info(f"[AI] enabled={enabled} for chat={msg.chat.id}")
         if not enabled:
-            return  # AI replies are off in this chat
+            return  # AI off for this chat
 
         text = msg.text or ""
         norm = _normalize_text(text)
 
-        # Classify
-        is_thanks  = bool(THANKS_RE.search(text))
-        is_apology = bool(APOLOGY_RE.search(text))
-        is_insult  = bool(INSULT_RE.search(norm))
-        is_summon  = bool(SUMMON_PATTERN.search(text))
+        # --- Classification ---
+        is_thanks      = bool(THANKS_RE.search(text))
+        is_apology     = bool(APOLOGY_RE.search(text))
+        has_profanity  = bool(PROFANITY_RE.search(text))
+        is_directed    = bool(INSULT_DIRECT_RE().search(text))
+        is_summon      = bool(SUMMON_PATTERN().search(text))
 
-        logger.info(f"[AI] tags thanks={is_thanks} apology={is_apology} insult={is_insult} summon={is_summon}")
+        # Also consider follow-up window as “directed”
+        now = dt.datetime.now().timestamp()
+        if not is_directed:
+            last_bot = CHAT_LAST_BOT_TS.get(msg.chat.id, 0.0)
+            in_window = (now - last_bot) <= CONVO_WINDOW_S
+            if in_window and CHAT_CONVO_USER.get(msg.chat.id) == msg.from_user.id:
+                # if they swear or summon in-window, treat as addressed
+                is_directed = has_profanity or is_summon
+
+        logger.info(f"[AI] tags thanks={is_thanks} apology={is_apology} profanity={has_profanity} directed={is_directed} summon={is_summon}")
 
         # Persist lightweight lifetime stats
         try:
@@ -1592,17 +1613,18 @@ async def ai_catchall(msg: Message):
             )
             if is_thanks:  await incr_counter(msg.chat.id, msg.from_user.id, "thanks", 1)
             if is_apology: await incr_counter(msg.chat.id, msg.from_user.id, "apology", 1)
-            if is_insult:  await incr_counter(msg.chat.id, msg.from_user.id, "insult", 1)
+            if is_directed: await incr_counter(msg.chat.id, msg.from_user.id, "insult", 1)  # only count directed insults
             if is_summon:  await incr_counter(msg.chat.id, msg.from_user.id, "mention", 1)
         except Exception:
             logger.exception("counter/name upsert failed")
 
         user_id = msg.from_user.id
 
-        # Gratitude state (DB-backed)
+        # === Gratitude rules (DB-backed) ===
         thanks_count_today = 0
         gratitude_overused = False
         gratitude_reward   = False
+
         if is_thanks:
             thanks_count_today = await bump_thanks_db(msg.chat.id, user_id)
             if thanks_count_today > 5:
@@ -1612,22 +1634,26 @@ async def ai_catchall(msg: Message):
                 if gratitude_reward:
                     await log_penalty(msg.chat.id, user_id, "gratitude_boon", -10, "Random gratitude boon (≤5 thanks)")
 
-        # Insult / fake-apology state (DB-backed)
-        fake_or_insult = (is_insult and (is_thanks or is_apology)) or is_insult
+        # === Insults / profanity handling ===
+        # We only punish when profanity is DIRECTED at the Prophet.
+        fake_or_insult = is_directed and (has_profanity or is_apology)   # insulting apology, etc.
         offense_count_today = 0
         insult_punish_due = False
+
         if fake_or_insult:
             offense_count_today, threshold = await bump_insult_db(msg.chat.id, user_id)
-            insult_punish_due = (offense_count_today >= threshold)
+            safe_threshold = max(2, int(threshold or 99))  # NEVER punish on first offense
+            insult_punish_due = (offense_count_today >= safe_threshold)
+            logger.info(f"[AI] insult counters chat={msg.chat.id} user={user_id} count_today={offense_count_today} threshold={safe_threshold}")
             if insult_punish_due:
                 await log_penalty(msg.chat.id, user_id, "insult", +15, "Hidden daily threshold reached")
                 try:
-                    await incr_counter(msg.chat.id, msg.from_user.id, "penalty", 1)
+                    await incr_counter(msg.chat.id, user_id, "penalty", 1)
                 except Exception:
                     logger.exception("failed to increment lifetime penalty counter")
 
-        # Always reply for these categories; otherwise heuristic + cooldown
-        force_reply = is_thanks or is_apology or is_insult or is_summon
+        # Always reply for: thanks, apologies, ANY profanity, summons, or directed insult
+        force_reply = is_thanks or is_apology or has_profanity or is_summon or is_directed
         if not force_reply:
             if not should_ai_reply(msg):
                 logger.info("[AI] heuristic declined")
@@ -1636,17 +1662,18 @@ async def ai_catchall(msg: Message):
                 logger.info("[AI] cooldown blocked")
                 return
         else:
-            _last_ai_reply_at[user_id] = dt.datetime.now().timestamp()
+            _last_ai_reply_at[user_id] = now  # bypass cooldown
 
         name = (msg.from_user.first_name or msg.from_user.username or "friend")
 
-        # Program day for context
+        # Program day context
         try:
             day_idx, day_total = await get_program_day()
         except Exception:
             logger.exception("get_program_day failed")
             day_idx, day_total = (None, None)
 
+        # Build context for AI
         ai_context = {
             "chat_id": msg.chat.id,
             "user_id": user_id,
@@ -1655,7 +1682,8 @@ async def ai_catchall(msg: Message):
             "categories": {
                 "thanks": is_thanks,
                 "apology": is_apology,
-                "insult": is_insult,
+                "profanity": has_profanity,
+                "directed_insult": is_directed,
                 "summon": is_summon,
             },
             "gratitude": {
@@ -1668,18 +1696,31 @@ async def ai_catchall(msg: Message):
                 "count_today": offense_count_today,
                 "punish_plus_15": insult_punish_due,
             },
-            "pushup_wording": "Say 'extra pushups' or 'less pushups', never 'you owe N pushups'.",
-            "no_pre_warnings": True,
-            "guidance": "Keep replies short for group chat. Conceal thresholds. State amounts only when required.",
+            "policy": {
+                "never_reveal_thresholds": True,
+                "pushup_wording": "Say 'extra pushups' or 'less pushups', never 'you owe N pushups'.",
+                "style": "Short for group chat; on profanity not directed at you, respond with a brief nudge (no penalty).",
+            },
         }
 
-        prompt = f"{name}: {text}\n\n[context-json]\n{ai_context}"
+        # Prompt tailoring
+        if has_profanity and not is_directed:
+            user_mode = "The user used profanity not aimed at you; respond briefly with a calm nudge to keep the chat clean; do not punish."
+        elif is_directed:
+            user_mode = "User insulted you; if policy indicates punishment is due, state +15 kr to the pot; otherwise give a firm warning with no amounts."
+        else:
+            user_mode = "General message."
+
+        prompt = f"{user_mode}\n\n{name}: {text}\n\n[context-json]\n{ai_context}"
         reply = await ai_reply(PROPHET_SYSTEM, [{"role": "user", "content": prompt}])
         logger.info(f"[AI] model returned={bool(reply)}")
-
         if not reply:
             reply = "I hear you. Walk me through it in one line."
+
+        # Send and mark convo window with this user
         await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
+        CHAT_LAST_BOT_TS[msg.chat.id] = dt.datetime.now().timestamp()
+        CHAT_CONVO_USER[msg.chat.id]  = user_id
 
     except Exception:
         logger.exception("policy-aware AI reply failed")
@@ -1704,6 +1745,10 @@ async def on_startup():
     global BOT_ID
     # 1) Bot identity
     me = await bot.get_me()
+    global BOT_USERNAME
+    BOT_USERNAME = (me.username or "").lower()
+    logger.info(f"Bot authorized: @{me.username} (id={me.id})")
+
     BOT_ID = me.id
     logger.info(f"Bot authorized: @{me.username} (id={me.id})")
 
@@ -1818,6 +1863,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
