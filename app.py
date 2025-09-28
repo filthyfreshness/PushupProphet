@@ -1065,12 +1065,12 @@ def health_head(): return Response(status_code=200)
 @app.on_event("startup")
 async def on_startup():
     global BOT_ID
-    # Bot identity
+    # 1) Bot identity
     me = await bot.get_me()
     BOT_ID = me.id
     logger.info(f"Bot authorized: @{me.username} (id={me.id})")
 
-    # Ensure no webhook conflict with polling
+    # 2) Ensure no webhook conflict with polling
     for attempt in range(1, 6):
         try:
             await bot.delete_webhook(drop_pending_updates=True, request_timeout=30)
@@ -1081,46 +1081,47 @@ async def on_startup():
             logger.warning(f"delete_webhook attempt {attempt} failed: {e}")
         await asyncio.sleep(min(2 ** attempt, 10))
 
-  # DB init & schedule resume
-await init_db()
-await load_and_schedule_pending()
+    # 3) DB init & resume pending jobs
+    await init_db()
+    await load_and_schedule_pending()
 
-# === Schedule daily quotes and weekly votes for configured chats ===
-ids = os.getenv("GROUP_CHAT_IDS", "").strip()
-if ids:
-    for raw in ids.split(","):
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            chat_id = int(raw)
+    # 4) Schedule daily quotes, weekly votes, and Forgiveness Chain
+    ids = os.getenv("GROUP_CHAT_IDS", "").strip()
+    if ids:
+        for raw in ids.split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                chat_id = int(raw)
 
-            # Daily quote at 07:00 Stockholm
-            scheduler.add_job(
-                send_daily_quote, "cron",
-                hour=7, minute=0, args=[chat_id],
-                id=f"daily_quote_{chat_id}", replace_existing=True,
-            )
-            logger.info(f"Scheduled daily quote (07:00) for chat {chat_id}")
+                # Daily quote at 07:00 Stockholm
+                scheduler.add_job(
+                    send_daily_quote, "cron",
+                    hour=7, minute=0, args=[chat_id],
+                    id=f"daily_quote_{chat_id}", replace_existing=True,
+                )
+                logger.info(f"Scheduled daily quote (07:00) for chat {chat_id}")
 
-            # Weekly votes every Sunday at 11:00 Stockholm
-            scheduler.add_job(
-                send_weekly_vote_prompts, "cron",
-                day_of_week="sun", hour=11, minute=0, args=[chat_id],
-                id=f"weekly_votes_{chat_id}", replace_existing=True,
-            )
-            logger.info(f"Scheduled weekly votes (Sun 11:00) for chat {chat_id}")
-          
-            # Forgiveness Chain: random daily + 1h follow-up
-            schedule_random_daily(chat_id)
-            logger.info(f"Auto-enabled Forgiveness Chain for chat {chat_id}")
+                # Weekly votes every Sunday at 11:00 Stockholm
+                scheduler.add_job(
+                    send_weekly_vote_prompts, "cron",
+                    day_of_week="sun", hour=11, minute=0, args=[chat_id],
+                    id=f"weekly_votes_{chat_id}", replace_existing=True,
+                )
+                logger.info(f"Scheduled weekly votes (Sun 11:00) for chat {chat_id}")
 
-        except Exception as e:
-            logger.exception(f"Startup scheduling failed for chat {raw}: {e}")
+                # Forgiveness Chain: random daily + 1h follow-up
+                schedule_random_daily(chat_id)
+                logger.info(f"Auto-enabled Forgiveness Chain for chat {chat_id}")
 
-# Start APScheduler and polling
-scheduler.start()
-asyncio.create_task(run_bot_polling())
+            except Exception as e:
+                logger.exception(f"Startup scheduling failed for chat {raw}: {e}")
+
+    # 5) Start scheduler + bot polling
+    scheduler.start()
+    asyncio.create_task(run_bot_polling())
+
 
 
 async def run_bot_polling():
@@ -1166,4 +1167,5 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
