@@ -278,6 +278,30 @@ ROAST_BLOCK = os.getenv("OPENAI_ROAST_BLOCK", "").replace("\\n", "\n")
 if ROAST_BLOCK:
     PROPHET_SYSTEM = f"{PROPHET_SYSTEM}\n\n{ROAST_BLOCK}"
 
+POLICY_BLOCK = """
+You must enforce these community rules consistently:
+
+— Gratitude (“thanks”, “tack” etc.)
+  1) Always respond when someone says thanks.
+  2) A user who says “thanks” more than 5 times in the same day is being insincere: tell them to pay +15 kr to the pot.
+  3) On a random 5% of genuine thanks (and only if the user is not over the daily limit), grant a gratitude boon: “-10 kr” from the pot.
+  4) If a message mixes “thanks” with insults or obvious sarcasm, treat it as a fake apology/thanks: issue a warning the first time; on repeated offense today, punish +10 kr.
+
+— Apologies (sorry/“förlåt” etc.)
+  • Accept sincere apologies with calm guidance.
+  • If an apology is paired with insults/justifications (“fake apology”): first warn; on repetition today, punish +10 kr.
+
+— Insults / slurs
+  • Call it out without flaming. First offense today: warn; subsequent offense today: punish +10 kr.
+
+— Prophet summon
+  • If they summon the Prophet (mention “prophet” etc.), answer as the Prophet with short, on-topic guidance.
+
+When a penalty or reward applies today, include it clearly (e.g., “+15 kr to the pot” or “-10 kr boon”). Keep replies compact for group chats.
+"""
+
+PROPHET_SYSTEM = f"{PROPHET_SYSTEM}\n\n{POLICY_BLOCK}"
+
 _AI_COOLDOWN_S = int(os.getenv("AI_COOLDOWN_S", "15"))
 _last_ai_reply_at: Dict[int, float] = {}
 
@@ -727,75 +751,75 @@ async def schedule_cancel_cmd(msg: Message):
 
 # ------------------------ Lightweight content handlers -------
 
-BLESSINGS = [
-    "Your thanks is heard, {name}. May your shoulders carry light burdens and your will grow heavy with resolve.",
-    "Gratitude received, {name}. Walk with steady breath; strength will meet you there.",
-]
-REBUKES = [
-    "I hear your anger, {name}. I receive it—and I answer with steadiness.",
-    "Your words land, {name}. I take them in, and I remain your witness.",
-]
-SUMMON_RESPONSES = [
-    "Did someone summon me?",
-    "A whisper reaches the floor—speak, seeker.",
-]
+#BLESSINGS = [
+#    "Your thanks is heard, {name}. May your shoulders carry light burdens and your will grow heavy with resolve.",
+#    "Gratitude received, {name}. Walk with steady breath; strength will meet you there.",
+#]
+#REBUKES = [
+#    "I hear your anger, {name}. I receive it—and I answer with steadiness.",
+#    "Your words land, {name}. I take them in, and I remain your witness.",
+#]
+#SUMMON_RESPONSES = [
+#    "Did someone summon me?",
+#    "A whisper reaches the floor—speak, seeker.",
+#]
+#
+#def _compose_blessing(user_name: Optional[str]) -> str:
+#    safe = html.escape(user_name or "friend")
+#    return _sysrand.choice(BLESSINGS).format(name=safe)
+#
+#def _compose_rebuke(user_name: Optional[str]) -> str:
+#    safe = html.escape(user_name or "traveler")
+#    return _sysrand.choice(REBUKES).format(name=safe)
+#
+#@dp.message(F.text.func(lambda t: isinstance(t, str) and not t.strip().startswith("/") and THANKS_RE.search(t)))
+#async def thanks_plain(msg: Message):
+#    try:
+#        await upsert_username(msg.chat.id, msg.from_user.id,
+#                              getattr(msg.from_user, "first_name", None),
+#                              getattr(msg.from_user, "username", None))
+#        await incr_counter(msg.chat.id, msg.from_user.id, "thanks", 1)
+#    except Exception:
+#        logger.exception("Failed to log 'thanks'")
+#    await msg.answer(_compose_blessing(getattr(msg.from_user, "first_name", None)))
 
-def _compose_blessing(user_name: Optional[str]) -> str:
-    safe = html.escape(user_name or "friend")
-    return _sysrand.choice(BLESSINGS).format(name=safe)
+# @dp.message(F.text.func(lambda t: isinstance(t, str) and not t.strip().startswith("/") and APOLOGY_RE.search(t)))
+# async def apology_reply(msg: Message):
+#    try:
+#        await upsert_username(msg.chat.id, msg.from_user.id,
+#                              getattr(msg.from_user, "first_name", None),
+#                              getattr(msg.from_user, "username", None))
+#        await incr_counter(msg.chat.id, msg.from_user.id, "apology", 1)
+#    except Exception:
+#        logger.exception("Failed to log 'apology'")
+#    await msg.answer(_compose_blessing(getattr(msg.from_user, "first_name", None)))
 
-def _compose_rebuke(user_name: Optional[str]) -> str:
-    safe = html.escape(user_name or "traveler")
-    return _sysrand.choice(REBUKES).format(name=safe)
+#@dp.message(F.text.func(lambda t: isinstance(t, str) and INSULT_RE.search(_normalize_text(t)) and not APOLOGY_RE.search(t)))
+#async def prophet_insult_rebuke(msg: Message):
+#    try:
+#        await upsert_username(msg.chat.id, msg.from_user.id,
+#                              getattr(msg.from_user, "first_name", None),
+#                              getattr(msg.from_user, "username", None))
+#        await incr_counter(msg.chat.id, msg.from_user.id, "insult", 1)
+#    except Exception:
+#        logger.exception("Failed to log 'insult'")
+#    await msg.answer(_compose_rebuke(getattr(msg.from_user, "first_name", None)))
 
-@dp.message(F.text.func(lambda t: isinstance(t, str) and not t.strip().startswith("/") and THANKS_RE.search(t)))
-async def thanks_plain(msg: Message):
-    try:
-        await upsert_username(msg.chat.id, msg.from_user.id,
-                              getattr(msg.from_user, "first_name", None),
-                              getattr(msg.from_user, "username", None))
-        await incr_counter(msg.chat.id, msg.from_user.id, "thanks", 1)
-    except Exception:
-        logger.exception("Failed to log 'thanks'")
-    await msg.answer(_compose_blessing(getattr(msg.from_user, "first_name", None)))
-
-@dp.message(F.text.func(lambda t: isinstance(t, str) and not t.strip().startswith("/") and APOLOGY_RE.search(t)))
-async def apology_reply(msg: Message):
-    try:
-        await upsert_username(msg.chat.id, msg.from_user.id,
-                              getattr(msg.from_user, "first_name", None),
-                              getattr(msg.from_user, "username", None))
-        await incr_counter(msg.chat.id, msg.from_user.id, "apology", 1)
-    except Exception:
-        logger.exception("Failed to log 'apology'")
-    await msg.answer(_compose_blessing(getattr(msg.from_user, "first_name", None)))
-
-@dp.message(F.text.func(lambda t: isinstance(t, str) and INSULT_RE.search(_normalize_text(t)) and not APOLOGY_RE.search(t)))
-async def prophet_insult_rebuke(msg: Message):
-    try:
-        await upsert_username(msg.chat.id, msg.from_user.id,
-                              getattr(msg.from_user, "first_name", None),
-                              getattr(msg.from_user, "username", None))
-        await incr_counter(msg.chat.id, msg.from_user.id, "insult", 1)
-    except Exception:
-        logger.exception("Failed to log 'insult'")
-    await msg.answer(_compose_rebuke(getattr(msg.from_user, "first_name", None)))
-
-@dp.message(F.text.func(lambda t: isinstance(t, str)
-                        and not t.strip().startswith("/")
-                        and SUMMON_PATTERN.search(t)
-                        and not THANKS_RE.search(t)
-                        and not APOLOGY_RE.search(t)))
-async def summon_reply(msg: Message):
-    if await get_ai_enabled(msg.chat.id):
-        name = getattr(msg.from_user, "first_name", "") or (msg.from_user.username or "friend")
-        user_text = msg.text or ""
-        messages = [{"role": "user", "content": f"{name}: {user_text}"}]
-        reply = await ai_reply(PROPHET_SYSTEM, messages)
-        if reply:
-            await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
-            return
-    await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
+#@dp.message(F.text.func(lambda t: isinstance(t, str)
+#                        and not t.strip().startswith("/")
+#                        and SUMMON_PATTERN.search(t)
+#                        and not THANKS_RE.search(t)
+#                        and not APOLOGY_RE.search(t)))
+#async def summon_reply(msg: Message):
+#    if await get_ai_enabled(msg.chat.id):
+#        name = getattr(msg.from_user, "first_name", "") or (msg.from_user.username or "friend")
+#        user_text = msg.text or ""
+#        messages = [{"role": "user", "content": f"{name}: {user_text}"}]
+#        reply = await ai_reply(PROPHET_SYSTEM, messages)
+#        if reply:
+#            await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
+#            return
+#    await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
 
 # ================== Daily Quotes (rotation + /share_wisdom) ==================
 from collections import deque
@@ -920,6 +944,38 @@ async def handle_poll_vote(pa: PollAnswer):
     label = "The Weakest Link" if kind == "weakest" else "The Inspiration"
     await bot.send_message(chat_id, f"🗳️ <b>{safe_voter}</b> voted <b>{safe_player}</b> as <i>{label}</i>.")
 
+# ==== Daily state (Stockholm-local day) for thanks & offenses ====
+
+# If you already have _today_stockholm_date() from Dice of Fate, reuse it:
+def _today_stockholm() -> dt.date:
+    try:
+        return _today_stockholm_date()
+    except NameError:
+        return dt.datetime.now(TZ).date()
+
+# per-user “thanks” count per day (for >5 rule)
+_daily_thanks: Dict[int, tuple[dt.date, int]] = {}
+
+def _bump_thanks(user_id: int) -> int:
+    today = _today_stockholm()
+    d = _daily_thanks.get(user_id)
+    if not d or d[0] != today:
+        _daily_thanks[user_id] = (today, 0)
+    n = _daily_thanks[user_id][1] + 1
+    _daily_thanks[user_id] = (today, n)
+    return n
+
+# per-user offense count per day (insults/fake-apology) — warn → punish
+_daily_offense: Dict[int, tuple[dt.date, int]] = {}
+
+def _bump_offense(user_id: int) -> int:
+    today = _today_stockholm()
+    d = _daily_offense.get(user_id)
+    if not d or d[0] != today:
+        _daily_offense[user_id] = (today, 0)
+    n = _daily_offense[user_id][1] + 1
+    _daily_offense[user_id] = (today, n)
+    return n
 
 # ================== Dice of Fate ==================
 FATE_WEIGHTS = [
@@ -1185,19 +1241,93 @@ async def ai_catchall(msg: Message):
     try:
         if not await get_ai_enabled(msg.chat.id):
             return
-        if not should_ai_reply(msg):          # <-- not awaited (fixed)
-            return
-        if not _cooldown_ok(msg.from_user.id):
-            return
 
-        name = getattr(msg.from_user, "first_name", "") or (msg.from_user.username or "friend")
-        user_text = msg.text or ""
-        messages = [{"role": "user", "content": f"{name}: {user_text}"}]
-        reply = await ai_reply(PROPHET_SYSTEM, messages)
+        text = msg.text or ""
+        norm = _normalize_text(text)
+
+        # classify via existing regexes (keep those definitions)
+        is_thanks  = bool(THANKS_RE.search(text))
+        is_apology = bool(APOLOGY_RE.search(text))
+        is_insult  = bool(INSULT_RE.search(norm))
+        is_summon  = bool(SUMMON_PATTERN.search(text))
+
+        # persist lightweight stats (optional but useful)
+        try:
+            await upsert_username(
+                msg.chat.id, msg.from_user.id,
+                getattr(msg.from_user, "first_name", None),
+                getattr(msg.from_user, "username", None),
+            )
+            if is_thanks:  await incr_counter(msg.chat.id, msg.from_user.id, "thanks", 1)
+            if is_apology: await incr_counter(msg.chat.id, msg.from_user.id, "apology", 1)
+            if is_insult:  await incr_counter(msg.chat.id, msg.from_user.id, "insult", 1)
+            if is_summon:  await incr_counter(msg.chat.id, msg.from_user.id, "mention", 1)
+        except Exception:
+            logger.exception("counter/name upsert failed")
+
+        user_id = msg.from_user.id
+
+        # === Gratitude rules ===
+        thanks_count_today = 0
+        gratitude_penalty  = False   # +15 kr when >5 thanks
+        gratitude_reward   = False   # 5% chance of -10 kr if within limit
+
+        if is_thanks:
+            thanks_count_today = _bump_thanks(user_id)
+            if thanks_count_today > 5:
+                gratitude_penalty = True
+            else:
+                gratitude_reward = (_sysrand.random() < 0.05)
+
+        # === Insults / fake apologies or thanks (warn -> punish) ===
+        fake_or_insult = (is_insult and (is_thanks or is_apology)) or is_insult
+        offense_count_today = 0
+        action = None  # "warn" | "punish" | None
+
+        if fake_or_insult:
+            offense_count_today = _bump_offense(user_id)
+            action = "warn" if offense_count_today == 1 else "punish"  # punish = +10 kr
+
+        # Always reply for these four categories; otherwise use your usual heuristic + cooldown
+        force_reply = is_thanks or is_apology or is_insult or is_summon
+        if not force_reply:
+            if not should_ai_reply(msg):
+                return
+            if not _cooldown_ok(user_id):
+                return
+        else:
+            # bypass cooldown for rule-triggered categories
+            _last_ai_reply_at[user_id] = dt.datetime.now().timestamp()
+
+        name = (msg.from_user.first_name or msg.from_user.username or "friend")
+        ai_context = {
+            "chat_id": msg.chat.id,
+            "user_id": user_id,
+            "user_name": name,
+            "categories": {
+                "thanks": is_thanks, "apology": is_apology,
+                "insult": is_insult, "summon": is_summon,
+            },
+            "gratitude": {
+                "count_today": thanks_count_today,
+                "penalty_plus_15": gratitude_penalty,
+                "reward_minus_10": (gratitude_reward and not gratitude_penalty),
+            },
+            "offense": {
+                "is_fake_or_insult": fake_or_insult,
+                "count_today": offense_count_today,
+                "action": action,  # "warn" or "punish" (+10 kr)
+            },
+            "guidance": "Keep replies short for group chat. Explicitly include any penalty/reward lines.",
+        }
+
+        prompt = f"{name}: {text}\n\n[context-json]\n{ai_context}"
+        reply = await ai_reply(PROPHET_SYSTEM, [{"role": "user", "content": prompt}])
         if reply:
             await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
     except Exception:
-        logger.exception("AI catchall failed")
+        logger.exception("policy-aware AI reply failed")
+
 
 # ------------------------ Health endpoints -------------------
 
@@ -1314,6 +1444,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
