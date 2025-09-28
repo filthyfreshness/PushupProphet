@@ -564,6 +564,8 @@ Enforce these rules strictly. Do not reveal hidden thresholds or remaining allow
 — Apologies
   • Accept sincere apologies briefly.
   • If an apology includes insults/sarcasm, treat as a fake apology: follow the insult rules below.
+  • Do NOT reward apologies.
+  
 
 — Insults / slurs
   • The first offense today must be a warning (no amounts disclosed).
@@ -1760,16 +1762,15 @@ async def ai_catchall(msg: Message):
         # Persist this incoming user message for DB context
         await log_chat_message(msg.chat.id, msg.from_user.id, False, text)
 
-        norm = _normalize_text(text)
+        # --- Classification (clean separation of summon vs insult) ---
+        is_thanks        = bool(THANKS_RE.search(text))
+        is_apology       = bool(APOLOGY_RE.search(text))
+        has_profanity    = bool(PROFANITY_RE.search(text))
+        is_summon        = bool(SUMMON_PATTERN().search(text))   # mention / “prophet”
+        is_insult_direct = bool(INSULT_DIRECT_RE().search(text)) # requires directed profanity/insult
 
-        # --- Classification ---
-        is_thanks     = bool(THANKS_RE.search(text))
-        is_apology    = bool(APOLOGY_RE.search(text))
-        has_profanity = bool(PROFANITY_RE.search(text))
-        is_summon     = bool(SUMMON_PATTERN().search(text))   # compiled regex
-
-        explicit_direct = bool(INSULT_DIRECT_RE().search(text)) or is_summon
-        is_directed = explicit_direct or context_says_directed(msg.chat.id, msg.from_user.id, text)
+        # Conversational directedness is for reply heuristics only (not for insult decisions)
+        is_directed = is_summon or context_says_directed(msg.chat.id, msg.from_user.id, text)
 
         # Also consider a short follow-up window as “directed”
         now = dt.datetime.now().timestamp()
@@ -1781,7 +1782,7 @@ async def ai_catchall(msg: Message):
 
         logger.info(
             f"[AI] tags thanks={is_thanks} apology={is_apology} profanity={has_profanity} "
-            f"directed={is_directed} summon={is_summon}"
+            f"insult_direct={is_insult_direct} summon={is_summon} directed_ctx={is_directed}"
         )
 
         # Persist lightweight lifetime stats
@@ -1799,9 +1800,11 @@ async def ai_catchall(msg: Message):
                     await bump_apology_db(msg.chat.id, msg.from_user.id)
                 except Exception:
                     logger.exception("bump_apology_db failed")
-                
-            if is_directed and has_profanity:
+
+            # Count insult only when actually insulting (not just a summon)
+            if is_insult_direct:
                 await incr_counter(msg.chat.id, msg.from_user.id, "insult", 1)
+
             if is_summon:
                 await incr_counter(msg.chat.id, msg.from_user.id, "mention", 1)
         except Exception:
@@ -1826,16 +1829,14 @@ async def ai_catchall(msg: Message):
                         "Random gratitude boon (≤5 thanks)"
                     )
 
-        # === Insults / profanity handling ===
-        # Punish only when profanity is DIRECTED at the Prophet (or insulting apology).
-        fake_or_insult = is_directed and (has_profanity or is_apology)
+        # === Insults handling ===
+        # Punish only on *true directed insults*. Never punish apologies.
         offense_count_today = 0
         insult_punish_due = False
 
-        if fake_or_insult:
+        if is_insult_direct and not is_apology:
             offense_count_today, threshold = await bump_insult_db(msg.chat.id, user_id)
-            # Guard: never punish on very first insult → threshold min 2
-            safe_threshold = max(2, int(threshold or 99))
+            safe_threshold = max(2, int(threshold or 99))  # never punish on first
             insult_punish_due = (offense_count_today >= safe_threshold)
             logger.info(
                 f"[AI] insult counters chat={msg.chat.id} user={user_id} "
@@ -1848,8 +1849,15 @@ async def ai_catchall(msg: Message):
                 except Exception:
                     logger.exception("failed to increment lifetime penalty counter")
 
-        # Always reply for: thanks, apologies, ANY profanity, summons, or directed insult
-        force_reply = is_thanks or is_apology or has_profanity or is_summon or is_directed
+        # Decide whether to reply (always for thanks/apology/summon/insult; also nudge on non-directed profanity)
+        force_reply = (
+            is_thanks
+            or is_apology
+            or is_summon
+            or is_insult_direct
+            or (has_profanity and not is_insult_direct)
+        )
+
         if not force_reply:
             if not should_ai_reply(msg):
                 logger.info("[AI] heuristic declined")
@@ -1862,53 +1870,30 @@ async def ai_catchall(msg: Message):
 
         name = (msg.from_user.first_name or msg.from_user.username or "friend")
 
-        # Program day context
+        # Program day context (best-effort)
         try:
             day_idx, day_total = await get_program_day()
         except Exception:
             logger.exception("get_program_day failed")
             day_idx, day_total = (None, None)
 
-        # Build context for AI
-        ai_context = {
-            "chat_id": msg.chat.id,
-            "user_id": user_id,
-            "user_name": name,
-            "program_day": {"day": day_idx, "total": day_total},
-            "categories": {
-                "thanks": is_thanks,
-                "apology": is_apology,
-                "profanity": has_profanity,
-                "directed_insult": is_directed,
-                "summon": is_summon,
-            },
-            "gratitude": {
-                "count_today": thanks_count_today,
-                "overused": gratitude_overused,
-                "reward_minus_10": (gratitude_reward and not gratitude_overused),
-            },
-            "insults": {
-                "is_fake_or_insult": fake_or_insult,
-                "count_today": offense_count_today,
-                "punish_plus_15": insult_punish_due,
-            },
-            "policy": {
-                "never_reveal_thresholds": True,
-                "pushup_wording": "Say 'extra pushups' or 'less pushups', never 'you owe N pushups'.",
-                "style": "Short for group chat; if profanity not aimed at you, give a brief nudge (no penalty).",
-            },
-        }
-
-        # Prompt tailoring
-        if has_profanity and not is_directed:
+        # Tailor guidance for the model
+        if has_profanity and not is_insult_direct:
             user_mode = (
-                "The user used profanity not aimed at you; respond briefly with a calm nudge to keep the chat clean; "
-                "do not punish."
+                "User used profanity not aimed at you; give a brief, calm nudge to keep the chat clean; no penalties."
             )
-        elif is_directed:
+        elif is_insult_direct:
             user_mode = (
-                "User insulted you; if policy indicates punishment is due, state +15 kr to the pot; "
-                "otherwise give a firm warning with no amounts."
+                "User insulted you; if punishment is due per context, say +15 kr to the pot; "
+                "otherwise issue a firm warning with no numbers."
+            )
+        elif is_apology:
+            user_mode = (
+                "User apologized; accept briefly and move on. Do NOT punish apologies."
+            )
+        elif is_summon:
+            user_mode = (
+                "They summoned the Prophet; answer briefly, on-topic, and supportive."
             )
         else:
             user_mode = "General message."
@@ -1918,6 +1903,36 @@ async def ai_catchall(msg: Message):
         compact_ctx = build_compact_context(recent_rows)
 
         # Compose messages for the model (ai_reply injects the system)
+        ai_context = {
+            "chat_id": msg.chat.id,
+            "user_id": user_id,
+            "user_name": name,
+            "program_day": {"day": day_idx, "total": day_total},
+            "categories": {
+                "thanks": is_thanks,
+                "apology": is_apology,
+                "profanity": has_profanity,
+                "direct_insult": is_insult_direct,
+                "summon": is_summon,
+            },
+            "gratitude": {
+                "count_today": thanks_count_today,
+                "overused": gratitude_overused,
+                "reward_minus_10": (gratitude_reward and not gratitude_overused),
+            },
+            "insults": {
+                "is_insult": is_insult_direct,
+                "count_today": offense_count_today,
+                "punish_plus_15": insult_punish_due,
+            },
+            "policy": {
+                "never_reveal_thresholds": True,
+                "apologies_never_punish": True,
+                "pushup_wording": "Say 'extra pushups' or 'less pushups', never 'you owe N pushups'.",
+                "style": "Short for group chat; if profanity not aimed at you, give a brief nudge (no penalty).",
+            },
+        }
+
         messages = compact_ctx + [{
             "role": "user",
             "content": f"{user_mode}\n\n{name}: {text}\n\n[context-json]\n{ai_context}"
@@ -1944,6 +1959,7 @@ async def ai_catchall(msg: Message):
 
     except Exception:
         logger.exception("policy-aware AI reply failed")
+
 
 
 
@@ -2081,6 +2097,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
