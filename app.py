@@ -278,27 +278,42 @@ ROAST_BLOCK = os.getenv("OPENAI_ROAST_BLOCK", "").replace("\\n", "\n")
 if ROAST_BLOCK:
     PROPHET_SYSTEM = f"{PROPHET_SYSTEM}\n\n{ROAST_BLOCK}"
 
+# === Strict community policy for AI (conceal thresholds & amounts where required) ===
 POLICY_BLOCK = """
-You must enforce these community rules consistently:
+Enforce these rules strictly. Do not reveal hidden thresholds or remaining allowances. Never write “no penalties today.”
 
-— Gratitude (“thanks”, “tack” etc.)
-  1) Always respond when someone says thanks.
-  2) A user who says “thanks” more than 5 times in the same day is being insincere: tell them to pay +15 kr to the pot.
-  3) On a random 5% of genuine thanks (and only if the user is not over the daily limit), grant a gratitude boon: “-10 kr” from the pot.
-  4) If a message mixes “thanks” with insults or obvious sarcasm, treat it as a fake apology/thanks: issue a warning the first time; on repeated offense today, punish +10 kr.
+— Gratitude (“thanks”, “tack”, etc.)
+  • Always reply to thanks.
+  • If thanks are overused today (as indicated by the context flags), DO NOT reveal any penalty details or amounts.
+    Instead, give a stern verbal warning like “Enough praise—let deeds speak.” Do not mention numbers, thresholds,
+    or remaining strikes. Do not say “you have X left” or similar.
+  • A gratitude boon (−10 kr) is allowed only if the context flag `gratitude.reward_minus_10` is true.
+  • Never grant blanket exemptions or say “no penalties today.”
 
-— Apologies (sorry/“förlåt” etc.)
-  • Accept sincere apologies with calm guidance.
-  • If an apology is paired with insults/justifications (“fake apology”): first warn; on repetition today, punish +10 kr.
+— Apologies
+  • Accept sincere apologies briefly.
+  • If an apology includes insults/sarcasm, treat as a fake apology: follow the insult rules below.
 
 — Insults / slurs
-  • Call it out without flaming. First offense today: warn; subsequent offense today: punish +10 kr.
+  • The first offense today must be a warning (no amounts disclosed).
+  • When the context indicates punishment is due, apply +15 kr to the pot. Do not reveal how many strikes triggered it.
+  • Do not disclose thresholds or remaining strikes. Do not hint at when penalties will occur.
 
 — Prophet summon
-  • If they summon the Prophet (mention “prophet” etc.), answer as the Prophet with short, on-topic guidance.
+  • If they summon the Prophet (mention “prophet” etc.), answer briefly and on-topic.
 
-When a penalty or reward applies today, include it clearly (e.g., “+15 kr to the pot” or “-10 kr boon”). Keep replies compact for group chats.
+— Pushup phrasing
+  • Users already have a fixed daily baseline. When referencing additional work or relief,
+    say “N extra pushups” or “N less pushups,” not “you owe N pushups.”
+
+General style:
+  • Keep replies compact for group chats.
+  • When a penalty or reward must be stated (e.g., insult punishment, or a gratitude boon),
+    include it clearly (“+15 kr to the pot”, “−10 kr boon”), but NEVER reveal hidden thresholds.
+    
 """
+PROPHET_SYSTEM = f"{PROPHET_SYSTEM}\n\n{POLICY_BLOCK}"
+
 
 PROPHET_SYSTEM = f"{PROPHET_SYSTEM}\n\n{POLICY_BLOCK}"
 
@@ -977,6 +992,23 @@ def _bump_offense(user_id: int) -> int:
     _daily_offense[user_id] = (today, n)
     return n
 
+# === Secret insult threshold per user per day (random 2..6) ===
+_insult_threshold: Dict[int, tuple[dt.date, int]] = {}
+
+def _get_insult_threshold(user_id: int) -> int:
+    """
+    Pick a hidden daily threshold for this user (2..6 inclusive).
+    The first insult today assigns it; we then keep it secret and stable for the rest of the day.
+    """
+    today = _today_stockholm_date()
+    stored = _insult_threshold.get(user_id)
+    if not stored or stored[0] != today:
+        threshold = _sysrand.randint(2, 6)  # at least one warning; penalty sometime between 2 and 6 insults
+        _insult_threshold[user_id] = (today, threshold)
+        return threshold
+    return stored[1]
+
+
 # ================== Dice of Fate ==================
 FATE_WEIGHTS = [
     ("miracle",         3),
@@ -1235,7 +1267,7 @@ async def status_random_cmd(msg: Message):
     await msg.answer(f"Forgiveness Chain status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
 
 
-# Catch-all AI (only if enabled; obey cooldown; sync trigger)
+# Catch-all AI (AI enforces thanks/apology/insult/summon policy; compact group replies)
 @dp.message(F.text.func(lambda t: isinstance(t, str) and not t.startswith("/")))
 async def ai_catchall(msg: Message):
     try:
@@ -1245,13 +1277,13 @@ async def ai_catchall(msg: Message):
         text = msg.text or ""
         norm = _normalize_text(text)
 
-        # classify via existing regexes (keep those definitions)
+        # Classify using your existing regexes
         is_thanks  = bool(THANKS_RE.search(text))
         is_apology = bool(APOLOGY_RE.search(text))
         is_insult  = bool(INSULT_RE.search(norm))
         is_summon  = bool(SUMMON_PATTERN.search(text))
 
-        # persist lightweight stats (optional but useful)
+        # Persist lightweight stats (optional but useful)
         try:
             await upsert_username(
                 msg.chat.id, msg.from_user.id,
@@ -1268,27 +1300,31 @@ async def ai_catchall(msg: Message):
         user_id = msg.from_user.id
 
         # === Gratitude rules ===
+        # Overuse => stern warning ONLY (do not disclose thresholds or amounts)
         thanks_count_today = 0
-        gratitude_penalty  = False   # +15 kr when >5 thanks
-        gratitude_reward   = False   # 5% chance of -10 kr if within limit
+        gratitude_overused = False           # -> AI should warn only (no +kr mentioned)
+        gratitude_reward   = False           # 5% boon (−10 kr) ONLY if not overused
 
         if is_thanks:
             thanks_count_today = _bump_thanks(user_id)
             if thanks_count_today > 5:
-                gratitude_penalty = True
+                gratitude_overused = True
+                gratitude_reward = False
             else:
                 gratitude_reward = (_sysrand.random() < 0.05)
 
-        # === Insults / fake apologies or thanks (warn -> punish) ===
+        # === Insults / fake apologies-or-thanks ===
+        # First offense today -> warning; after a secret threshold (2..6) -> +15 kr (threshold never revealed)
         fake_or_insult = (is_insult and (is_thanks or is_apology)) or is_insult
         offense_count_today = 0
-        action = None  # "warn" | "punish" | None
+        insult_punish_due = False
 
         if fake_or_insult:
             offense_count_today = _bump_offense(user_id)
-            action = "warn" if offense_count_today == 1 else "punish"  # punish = +10 kr
+            threshold = _get_insult_threshold(user_id)  # daily hidden threshold 2..6
+            insult_punish_due = (offense_count_today >= threshold)
 
-        # Always reply for these four categories; otherwise use your usual heuristic + cooldown
+        # Always reply for these four categories; otherwise use heuristic + cooldown
         force_reply = is_thanks or is_apology or is_insult or is_summon
         if not force_reply:
             if not should_ai_reply(msg):
@@ -1296,29 +1332,36 @@ async def ai_catchall(msg: Message):
             if not _cooldown_ok(user_id):
                 return
         else:
-            # bypass cooldown for rule-triggered categories
+            # Bypass cooldown for rule-triggered categories
             _last_ai_reply_at[user_id] = dt.datetime.now().timestamp()
 
         name = (msg.from_user.first_name or msg.from_user.username or "friend")
+
+        # Build strict context for AI
         ai_context = {
             "chat_id": msg.chat.id,
             "user_id": user_id,
             "user_name": name,
             "categories": {
-                "thanks": is_thanks, "apology": is_apology,
-                "insult": is_insult, "summon": is_summon,
+                "thanks": is_thanks,
+                "apology": is_apology,
+                "insult": is_insult,
+                "summon": is_summon,
             },
             "gratitude": {
                 "count_today": thanks_count_today,
-                "penalty_plus_15": gratitude_penalty,
-                "reward_minus_10": (gratitude_reward and not gratitude_penalty),
+                "overused": gratitude_overused,                 # => stern warning only
+                "reward_minus_10": (gratitude_reward and not gratitude_overused),
             },
-            "offense": {
+            "insults": {
                 "is_fake_or_insult": fake_or_insult,
                 "count_today": offense_count_today,
-                "action": action,  # "warn" or "punish" (+10 kr)
+                "punish_plus_15": insult_punish_due,            # when True, Prophet must say “+15 kr to the pot”
+                # NEVER reveal or hint at the hidden threshold
             },
-            "guidance": "Keep replies short for group chat. Explicitly include any penalty/reward lines.",
+            "pushup_wording": "Say 'extra pushups' or 'less pushups', never 'you owe N pushups'.",
+            "no_pre_warnings": True,  # do not say “you have X left” or disclose thresholds
+            "guidance": "Keep replies short for group chat. Conceal thresholds. State amounts only when required.",
         }
 
         prompt = f"{name}: {text}\n\n[context-json]\n{ai_context}"
@@ -1327,6 +1370,7 @@ async def ai_catchall(msg: Message):
             await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
     except Exception:
         logger.exception("policy-aware AI reply failed")
+
 
 
 # ------------------------ Health endpoints -------------------
@@ -1444,6 +1488,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
