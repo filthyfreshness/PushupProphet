@@ -144,6 +144,61 @@ class ScheduledMessage(Base):
     status     = Column(String(16), nullable=False, default="pending")  # pending|sent|canceled
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+# ------------ Program / Stats models ------------
+class ProgramSettings(Base):
+    """
+    Singleton (id=1) storing the start date and total length of the challenge.
+    """
+    __tablename__ = "program_settings"
+    id          = Column(Integer, primary_key=True, default=1)
+    start_date  = Column(DateTime(timezone=True), nullable=False, default=func.now())
+    total_days  = Column(Integer, nullable=False, default=100)
+    updated_at  = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class UserDailyStats(Base):
+    """
+    Per-user, per-day counters with a persisted secret insult threshold (2..6).
+    date = Stockholm day at local midnight, stored as UTC midnight for stability.
+    """
+    __tablename__ = "user_daily_stats"
+
+    id                = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id           = Column(BigInteger, nullable=False)
+    user_id           = Column(BigInteger, nullable=False)
+    date              = Column(DateTime(timezone=True), nullable=False)
+    thanks_count      = Column(Integer, nullable=False, default=0)
+    apology_count     = Column(Integer, nullable=False, default=0)
+    insult_count      = Column(Integer, nullable=False, default=0)
+    insult_threshold  = Column(Integer, nullable=True)  # 2..6 set on first insult of the day
+    mercy_used        = Column(Boolean, nullable=False, default=False)
+    updated_at        = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("ux_user_daily_unique", "chat_id", "user_id", "date", unique=True),
+        Index("ix_user_daily_chat_date", "chat_id", "date"),
+    )
+
+
+class PenaltyLog(Base):
+    """
+    Audit log of penalties/rewards the Prophet declares.
+    """
+    __tablename__ = "penalty_log"
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id    = Column(BigInteger, nullable=False)
+    user_id    = Column(BigInteger, nullable=False)
+    kind       = Column(String(32), nullable=False)   # 'thanks_overuse' | 'insult' | 'fake_apology' | 'gratitude_boon'
+    amount_kr  = Column(Integer, nullable=False)      # +15, -10, etc.
+    text       = Column(String(512), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_penalty_chat_date", "chat_id", "created_at"),
+        Index("ix_penalty_user_date", "user_id", "created_at"),
+    )
+
 def _is_pg_url(async_url: str) -> bool:
     return async_url.startswith("postgresql+asyncpg://")
 
@@ -170,6 +225,8 @@ def _dialect_insert():
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
 
 # ------------------------ DB helpers -------------------------
 
@@ -210,6 +267,108 @@ async def set_ai_enabled(chat_id: int, enabled: bool) -> None:
     async with AsyncSessionLocal() as s:
         await s.execute(stmt)
         await s.commit()
+
+# ---------- Program day helpers ----------
+def _local_midnight_utc(today_local: Optional[dt.date] = None) -> dt.datetime:
+    """UTC instant corresponding to Stockholm local midnight."""
+    if today_local is None:
+        today_local = dt.datetime.now(TZ).date()
+    local_midnight = dt.datetime(today_local.year, today_local.month, today_local.day, 0, 0, tzinfo=TZ)
+    return local_midnight.astimezone(dt.timezone.utc)
+
+async def ensure_program_settings():
+    """Create/refresh singleton from env if missing."""
+    start_env = os.getenv("PROGRAM_START_DATE", "").strip()
+    total_env = int(os.getenv("PROGRAM_TOTAL_DAYS", "100") or "100")
+
+    if start_env:
+        try:
+            y, m, d = [int(x) for x in start_env.split("-")]
+            start_local = dt.datetime(y, m, d, 0, 0, tzinfo=TZ)
+        except Exception:
+            start_local = dt.datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start_local = dt.datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    start_utc = start_local.astimezone(dt.timezone.utc)
+
+    async with AsyncSessionLocal() as s:
+        row = await s.get(ProgramSettings, 1)
+        if not row:
+            s.add(ProgramSettings(id=1, start_date=start_utc, total_days=total_env))
+        else:
+            if start_env:
+                row.start_date = start_utc
+            row.total_days = total_env
+        await s.commit()
+
+async def get_program_day() -> Tuple[int, int]:
+    """Return (current_day, total_days) based on Stockholm local time."""
+    async with AsyncSessionLocal() as s:
+        row = await s.get(ProgramSettings, 1)
+        if not row:
+            await ensure_program_settings()
+            row = await s.get(ProgramSettings, 1)
+
+        start_local = row.start_date.astimezone(TZ)
+        today_local = dt.datetime.now(TZ)
+        day_index = (today_local.date() - start_local.date()).days + 1
+        return max(1, day_index), (row.total_days or 100)
+
+
+# ---------- Per-user daily stats (persisted) ----------
+async def _get_or_create_user_daily(session: AsyncSession, chat_id: int, user_id: int) -> UserDailyStats:
+    day_utc = _local_midnight_utc()
+    res = await session.execute(
+        select(UserDailyStats)
+        .where(UserDailyStats.chat_id == chat_id,
+               UserDailyStats.user_id == user_id,
+               UserDailyStats.date == day_utc)
+        .limit(1)
+    )
+    row = res.scalar_one_or_none()
+    if row:
+        return row
+    row = UserDailyStats(chat_id=chat_id, user_id=user_id, date=day_utc)
+    session.add(row)
+    await session.flush()
+    return row
+
+async def bump_thanks_db(chat_id: int, user_id: int) -> int:
+    async with AsyncSessionLocal() as s:
+        row = await _get_or_create_user_daily(s, chat_id, user_id)
+        row.thanks_count += 1
+        await s.commit()
+        return row.thanks_count
+
+async def bump_apology_db(chat_id: int, user_id: int) -> int:
+    async with AsyncSessionLocal() as s:
+        row = await _get_or_create_user_daily(s, chat_id, user_id)
+        row.apology_count += 1
+        await s.commit()
+        return row.apology_count
+
+async def bump_insult_db(chat_id: int, user_id: int) -> Tuple[int, int]:
+    """Returns (insult_count_today, hidden_threshold_2_to_6)."""
+    async with AsyncSessionLocal() as s:
+        row = await _get_or_create_user_daily(s, chat_id, user_id)
+        if row.insult_threshold is None:
+            row.insult_threshold = _sysrand.randint(2, 6)
+        row.insult_count += 1
+        await s.commit()
+        return row.insult_count, row.insult_threshold
+
+async def set_mercy_used(chat_id: int, user_id: int) -> None:
+    async with AsyncSessionLocal() as s:
+        row = await _get_or_create_user_daily(s, chat_id, user_id)
+        row.mercy_used = True
+        await s.commit()
+
+async def log_penalty(chat_id: int, user_id: int, kind: str, amount_kr: int, text: Optional[str] = None) -> None:
+    async with AsyncSessionLocal() as s:
+        s.add(PenaltyLog(chat_id=chat_id, user_id=user_id, kind=kind, amount_kr=amount_kr, text=text or ""))
+        await s.commit()
+
 
 # ------------------------ Scheduler (DB-backed) ---------------
 
@@ -1266,6 +1425,43 @@ async def status_random_cmd(msg: Message):
     enabled = msg.chat.id in random_jobs
     await msg.answer(f"Forgiveness Chain status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
 
+@dp.message(Command("day"))
+async def program_day_cmd(msg: Message):
+    day, total = await get_program_day()
+    await msg.answer(f"📅 Program day: <b>{day}</b> / {total}", parse_mode=ParseMode.HTML)
+
+@dp.message(Command("mystats"))
+async def my_stats_cmd(msg: Message):
+    # Lifetime (from Counter)
+    totals = await user_totals(msg.chat.id, msg.from_user.id)  # you already have this helper
+    thanks = totals.get("thanks", 0)
+    apologies = totals.get("apology", 0)
+    insults = totals.get("insult", 0)
+    penalties = totals.get("penalty", 0)
+
+    # Today (from UserDailyStats)
+    async with AsyncSessionLocal() as s:
+        res = await s.execute(
+            select(UserDailyStats.thanks_count, UserDailyStats.apology_count, UserDailyStats.insult_count)
+            .where(
+                UserDailyStats.chat_id == msg.chat.id,
+                UserDailyStats.user_id == msg.from_user.id,
+                UserDailyStats.date == _local_midnight_utc()
+            )
+        )
+        row = res.first()
+    today_line = "Today — thanks: 0, apologies: 0, insults: 0"
+    if row:
+        t,a,i = row
+        today_line = f"Today — thanks: {t}, apologies: {a}, insults: {i}"
+
+    await msg.answer(
+        "📊 Your stats\n"
+        f"Lifetime — thanks: {thanks}, apologies: {apologies}, insults: {insults}, penalties: {penalties}\n"
+        f"{today_line}"
+    )
+
+
 
 # Catch-all AI (AI enforces thanks/apology/insult/summon policy; compact group replies)
 @dp.message(F.text.func(lambda t: isinstance(t, str) and not t.startswith("/")))
@@ -1283,7 +1479,7 @@ async def ai_catchall(msg: Message):
         is_insult  = bool(INSULT_RE.search(norm))
         is_summon  = bool(SUMMON_PATTERN.search(text))
 
-        # Persist lightweight stats (optional but useful)
+        # Persist lightweight lifetime stats (useful for /mystats etc.)
         try:
             await upsert_username(
                 msg.chat.id, msg.from_user.id,
@@ -1299,30 +1495,40 @@ async def ai_catchall(msg: Message):
 
         user_id = msg.from_user.id
 
-        # === Gratitude rules ===
+        # === Gratitude rules (DB-backed) ===
         # Overuse => stern warning ONLY (do not disclose thresholds or amounts)
         thanks_count_today = 0
         gratitude_overused = False           # -> AI should warn only (no +kr mentioned)
         gratitude_reward   = False           # 5% boon (−10 kr) ONLY if not overused
 
         if is_thanks:
-            thanks_count_today = _bump_thanks(user_id)
+            thanks_count_today = await bump_thanks_db(msg.chat.id, user_id)
             if thanks_count_today > 5:
                 gratitude_overused = True
                 gratitude_reward = False
+                # (No penalty applied here—only a stern warning via AI response)
             else:
                 gratitude_reward = (_sysrand.random() < 0.05)
+                if gratitude_reward:
+                    # Record boon in audit log (not counted as a "penalty")
+                    await log_penalty(msg.chat.id, user_id, "gratitude_boon", -10, "Random gratitude boon (≤5 thanks)")
 
-        # === Insults / fake apologies-or-thanks ===
+        # === Insults / fake apologies-or-thanks (DB-backed) ===
         # First offense today -> warning; after a secret threshold (2..6) -> +15 kr (threshold never revealed)
         fake_or_insult = (is_insult and (is_thanks or is_apology)) or is_insult
         offense_count_today = 0
         insult_punish_due = False
 
         if fake_or_insult:
-            offense_count_today = _bump_offense(user_id)
-            threshold = _get_insult_threshold(user_id)  # daily hidden threshold 2..6
+            offense_count_today, threshold = await bump_insult_db(msg.chat.id, user_id)
             insult_punish_due = (offense_count_today >= threshold)
+            if insult_punish_due:
+                await log_penalty(msg.chat.id, user_id, "insult", +15, "Hidden daily threshold reached")
+                # Also track lifetime penalty count
+                try:
+                    await incr_counter(msg.chat.id, user_id, "penalty", 1)
+                except Exception:
+                    logger.exception("failed to increment lifetime penalty counter")
 
         # Always reply for these four categories; otherwise use heuristic + cooldown
         force_reply = is_thanks or is_apology or is_insult or is_summon
@@ -1337,11 +1543,19 @@ async def ai_catchall(msg: Message):
 
         name = (msg.from_user.first_name or msg.from_user.username or "friend")
 
+        # Add program day (e.g., Day 73/100) so AI can reference it
+        try:
+            day_idx, day_total = await get_program_day()
+        except Exception:
+            logger.exception("get_program_day failed")
+            day_idx, day_total = (None, None)
+
         # Build strict context for AI
         ai_context = {
             "chat_id": msg.chat.id,
             "user_id": user_id,
             "user_name": name,
+            "program_day": {"day": day_idx, "total": day_total},  # may be None/None if lookup failed
             "categories": {
                 "thanks": is_thanks,
                 "apology": is_apology,
@@ -1350,7 +1564,7 @@ async def ai_catchall(msg: Message):
             },
             "gratitude": {
                 "count_today": thanks_count_today,
-                "overused": gratitude_overused,                 # => stern warning only
+                "overused": gratitude_overused,                 # => stern warning only; no amounts/thresholds
                 "reward_minus_10": (gratitude_reward and not gratitude_overused),
             },
             "insults": {
@@ -1370,6 +1584,7 @@ async def ai_catchall(msg: Message):
             await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
     except Exception:
         logger.exception("policy-aware AI reply failed")
+
 
 
 
@@ -1488,6 +1703,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
