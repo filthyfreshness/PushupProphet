@@ -1023,6 +1023,41 @@ async def fate_natural(msg: Message):
     await msg.answer("“You dare summon the Dice of Fate. The air trembles with judgment.”")
     await msg.answer(FATE_RULES_TEXT, reply_markup=kb)
 
+@dp.message(Command("fate_stats"))
+async def fate_stats_cmd(msg: Message):
+    """
+    Simulate N rolls to sanity-check distribution.
+    Usage: /fate_stats [N]  (default N=10000, min 1000, max 200000)
+    """
+    parts = (msg.text or "").split()
+    try:
+        N = int(parts[1]) if len(parts) >= 2 else 10000
+        N = max(1000, min(N, 200000))
+    except Exception:
+        N = 10000
+
+    keys = [k for k, _ in FATE_WEIGHTS]
+    weights = [w for _, w in FATE_WEIGHTS]
+
+    counts = {k: 0 for k in keys}
+    for _ in range(N):
+        k = _sysrand.choices(keys, weights=weights, k=1)[0]
+        counts[k] += 1
+
+    lines = [f"🎲 Fate stats (N={N}):"]
+    total_w = sum(weights)
+    for k in keys:
+        pct = 100.0 * counts[k] / N
+        target = next(w for kk, w in FATE_WEIGHTS if kk == k)
+        lines.append(f"• {k:15s}: {counts[k]:6d}  ({pct:5.2f}% vs target {target/total_w*100:5.2f}%)")
+
+    # Probability that 4 in a row are identical (with current weights)
+    p4 = sum((w/total_w)**4 for w in weights)
+    approx = int(1 / max(p4, 1e-9))
+    lines.append(f"\nP(same result 4× in a row) ≈ {p4*100:.3f}% (~1 in {approx})")
+    await msg.answer("\n".join(lines))
+
+
 # ================== Forgiveness Chain (random daily + 1h follow-up) ==================
 # Uses global: DAILY_TEXT, TZ, WINDOW_START, WINDOW_END, scheduler, bot
 # One job per chat in `random_jobs`. Cancels/reschedules cleanly.
@@ -1234,6 +1269,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
