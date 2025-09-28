@@ -323,14 +323,70 @@ def _normalize_text(t: str) -> str:
     t = re.sub(r"[\u200b-\u200f\u202a-\u202e]", "", t or "")
     return t.lower()
 
-THANKS_RE = re.compile(r"\b(thank(?:\s*you)?|thanks|thx|ty|tack(?:\s*så\s*mycket)?)\b", re.IGNORECASE)
+# -------- Gratitude & Apology patterns + helpers (REPLACE your current ones) --------
+THANKS_RE = re.compile(
+    r"\b(thank(?:\s*you)?|thanks|thx|ty|tack(?:\s*så\s*mycket)?)\b",
+    re.IGNORECASE
+)
+
 APOLOGY_RE = re.compile(
     r"\b("
     r"sorry|i\s*(?:am|’m|'m)\s*sorry|i\s*apolog(?:ise|ize)|apologies|apology|"
     r"my\s*bad|my\s*fault|i\s*was\s*wrong|didn'?t\s*mean|forgive\s*me|"
     r"förlåt|ursäkta|jag\s*är\s*ledsen|ber\s*om\s*ursäkt|mitt\s*fel"
-    r")\b", re.IGNORECASE
+    r")\b",
+    re.IGNORECASE
 )
+
+# ---- Blessings & Absolution text ----
+BLESSINGS = [
+    "Your thanks is heard, {name}. May your shoulders carry light burdens and your will grow heavy with resolve.",
+    "Gratitude received, {name}. Walk with steady breath; strength will meet you there.",
+    "I accept your thanks, {name}. May your last rep be your cleanest.",
+    "Thanks noted, {name}. Keep the vow; the vow will keep you.",
+]
+APOLOGY_RESPONSES = [
+    "Your apology is received, {name}. Mercy given; standard unchanged—meet it.",
+    "I accept your apology, {name}. Make it right in form and in habit.",
+    "Apology taken in, {name}. Rise cleaner; let your next set speak.",
+    "Grace extends to you, {name}. Guard your form; guard your word.",
+]
+
+def _compose_blessing(user_name: Optional[str]) -> str:
+    safe = html.escape(user_name or "friend")
+    return _sysrand.choice(BLESSINGS).format(name=safe)
+
+def _compose_absolution(user_name: Optional[str]) -> str:
+    safe = html.escape(user_name or "friend")
+    return _sysrand.choice(APOLOGY_RESPONSES).format(name=safe)
+
+# ---- Gratitude daily limit + reward/penalty state ----
+_gratitude_uses: Dict[int, tuple[dt.date, int]] = {}  # user_id -> (date, count)
+
+def _today_stockholm_date() -> dt.date:
+    return dt.datetime.now(TZ).date()
+
+def _gratitude_inc_and_get(user_id: int) -> int:
+    today = _today_stockholm_date()
+    state = _gratitude_uses.get(user_id)
+    if not state or state[0] != today:
+        _gratitude_uses[user_id] = (today, 0)
+    count = _gratitude_uses[user_id][1] + 1
+    _gratitude_uses[user_id] = (today, count)
+    return count
+
+def _compose_gratitude_penalty(user_name: Optional[str]) -> str:
+    safe = html.escape(user_name or "friend")
+    return (
+        f"Your gratitude pours too freely today, {safe}. The floor is not fooled by sugar on the tongue.\n"
+        f"Let your deeds do the thanking.\n\n"
+        f"<b>Edict:</b> Lay <b>10 kr</b> in the pot and return with a steadier heart."
+    )
+
+def _compose_gratitude_reward() -> str:
+    # 5% chance message
+    return "🪙 <b>Favor of Gratitude</b> — Deduct <b>20 kr</b> from your debt for your loyalty."
+
 MENTION_RE = r"(?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b)"
 INSULT_WORDS = (
     r"(?:fuck(?:ing|er|ed)?|f\*+ck|shit|crap|trash|garbage|bs|sucks?|stupid|idiot|moron|dumb(?:ass)?|"
@@ -389,6 +445,17 @@ async def start_cmd(msg: Message):
 
 @dp.message(Command("help"))
 async def help_cmd(msg: Message): await start_cmd(msg)
+
+@dp.message(Command("ai_ping"))
+async def ai_ping_cmd(msg: Message):
+    reply = await ai_reply(PROPHET_SYSTEM, [
+        {"role": "user", "content": "Give me one crisp pushup cue."}
+    ])
+    if reply:
+        await msg.answer(f"AI OK:\n{reply}", disable_web_page_preview=True, parse_mode=None)
+    else:
+        await msg.answer("AI call failed. Check logs and OPENAI_API_KEY / OPENAI_MODEL.")
+
 
 @dp.message(Command("ai_status"))
 async def ai_status_cmd(msg: Message):
@@ -1167,5 +1234,6 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
