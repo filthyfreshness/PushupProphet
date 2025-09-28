@@ -144,19 +144,6 @@ class ChatSettings(Base):
     )
 
 
-class ScheduledMessage(Base):
-    __tablename__ = "scheduled_messages"
-    id         = Column(Integer, primary_key=True, autoincrement=True)
-    chat_id    = Column(BigInteger, nullable=False)
-    user_id    = Column(BigInteger, nullable=False)
-    text       = Column(String(4096), nullable=False)
-    run_at     = Column(DateTime(timezone=True), nullable=False)
-    status     = Column(String(16), nullable=False, default="pending")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    __table_args__ = (
-        Index("ix_sched_status_runat", "status", "run_at"),
-    )
 
 
 # ------------ Program / Stats models ------------
@@ -212,6 +199,20 @@ class PenaltyLog(Base):
     __table_args__ = (
         Index("ix_penalty_chat_date", "chat_id", "created_at"),
         Index("ix_penalty_user_date", "user_id", "created_at"),
+    )
+
+class ScheduledMessage(Base):
+    __tablename__ = "scheduled_messages"
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id    = Column(BigInteger, nullable=False)
+    user_id    = Column(BigInteger, nullable=False)
+    text       = Column(String(4096), nullable=False)
+    run_at     = Column(DateTime(timezone=True), nullable=False)
+    status     = Column(String(16), nullable=False, default="pending")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_sched_status_runat", "status", "run_at"),
     )
 
 def _is_pg_url(async_url: str) -> bool:
@@ -314,6 +315,19 @@ async def user_totals(chat_id: int, user_id: int) -> Dict[str, int]:
     for k in ("thanks", "apology", "insult", "penalty"):
         out.setdefault(k, 0)
     return out
+from sqlalchemy import insert
+
+async def log_chat_message(chat_id: int, author_id: int | None, is_bot: bool, text: str):
+    # (Optional) trim to avoid huge rows
+    t = text.strip()
+    if len(t) > 1000:
+        t = t[:1000] + "…"
+    ins = _dialect_insert()(ChatMessage).values(
+        chat_id=chat_id, author_id=author_id, is_bot=is_bot, text=t
+    )
+    async with AsyncSessionLocal() as s:
+        await s.execute(ins)
+        await s.commit()
 
 
 # ---------- Program day helpers ----------
@@ -417,6 +431,55 @@ async def log_penalty(chat_id: int, user_id: int, kind: str, amount_kr: int, tex
     async with AsyncSessionLocal() as s:
         s.add(PenaltyLog(chat_id=chat_id, user_id=user_id, kind=kind, amount_kr=amount_kr, text=text or ""))
         await s.commit()
+
+
+async def log_chat_message(chat_id: int, author_id: Optional[int], is_bot: bool, text: str) -> None:
+    t = (text or "").strip()
+    if len(t) > 1000:
+        t = t[:1000] + "…"  # keep rows small
+    async with AsyncSessionLocal() as s:
+        s.add(ChatMessage(chat_id=chat_id, author_id=author_id, is_bot=is_bot, text=t))
+        await s.commit()
+
+async def fetch_recent_context(chat_id: int, minutes: int = 20, limit: int = 20) -> list[ChatMessage]:
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)
+    async with AsyncSessionLocal() as s:
+        q = (
+            select(ChatMessage)
+            .where(ChatMessage.chat_id == chat_id, ChatMessage.created_at >= cutoff)
+            .order_by(ChatMessage.created_at.desc())
+            .limit(limit)
+        )
+        rows = (await s.execute(q)).scalars().all()
+    return list(reversed(rows))  # oldest -> newest
+
+def build_compact_context(rows: list[ChatMessage]) -> list[dict]:
+    # collapse consecutive messages by the same author and trim long text
+    convo: list[dict] = []
+    last_key = None
+    buf: list[str] = []
+
+    def flush():
+        nonlocal buf, last_key
+        if not buf:
+            return
+        text = " ".join(buf).strip()
+        if len(text) > 280:
+            text = text[:280] + "…"
+        role = "assistant" if last_key == "bot" else "user"
+        convo.append({"role": role, "content": text})
+        buf, last_key = [], None
+
+    for r in rows:
+        key = "bot" if r.is_bot else f"user:{r.author_id or 0}"
+        t = re.sub(r"https?://\S+", "", r.text or "").strip()
+        t = re.sub(r"\s+", " ", t)
+        if key != last_key:
+            flush()
+            last_key = key
+        buf.append(t)
+    flush()
+    return convo[-10:]  # keep final ~10 turns
 
 
 # ------------------------ Scheduler (DB-backed) ---------------
@@ -525,6 +588,14 @@ General style:
 PROPHET_SYSTEM = f"{PROPHET_SYSTEM}\n\n{POLICY_BLOCK}"
 
 _AI_COOLDOWN_S = int(os.getenv("AI_COOLDOWN_S", "15"))
+
+# Follow-up window: within this many seconds after the latest relevant message,
+# be more liberal about replying (skip heuristic + cooldown).
+FOLLOWUP_WINDOW_S = int(os.getenv("AI_FOLLOWUP_WINDOW_S", "30"))
+
+# chat_id -> epoch seconds until which follow-ups are allowed
+_followup_until: Dict[int, float] = {}
+
 _last_ai_reply_at: Dict[int, float] = {}
 
 def _cooldown_ok(user_id: int) -> bool:
@@ -1567,9 +1638,122 @@ async def my_stats_cmd(msg: Message):
         f"{today_line}"
     )
 
+# ====== Conversational heuristics & profanity helpers ======
+
+# === Lightweight conversational context (purely context-based) ===
+# Per chat rolling context of last turns (bot + users)
+# Each item: {"author": "bot" | int(user_id), "text": str}
+CHAT_CONTEXT: Dict[int, deque] = {}
+CHAT_CONTEXT_MAX = 8  # keep the last few turns only
+
+def _ctx_get(chat_id: int) -> deque:
+    dq = CHAT_CONTEXT.get(chat_id)
+    if dq is None:
+        dq = CHAT_CONTEXT[chat_id] = deque(maxlen=CHAT_CONTEXT_MAX)
+    return dq
+
+CONVO_WINDOW_S = 30  # max time to treat follow-ups as addressed to the bot
+CHAT_LAST_BOT_TS: Dict[int, float] = {}   # chat_id -> last time bot replied (epoch seconds)
+CHAT_CONVO_USER: Dict[int, int] = {}      # chat_id -> user_id who last "owned" the thread
+
+# Broad but safe profanity net (no slurs list here—already covered by INSULT_WORDS)
+PROFANITY_RE = re.compile(
+    r"\b(?:fuck(?:ing|er|ed)?|f\*+ck|shit|bullshit|bs|ass(?:hole)?|bitch|crap|piss|dick|prick|cunt|twat|wank(?:er)?|motherfucker|mf)\b",
+    re.IGNORECASE
+)
+
+def INSULT_DIRECT_RE() -> re.Pattern:
+    """
+    Directed insult at the Prophet (mention + profanity).
+    Uses your existing MENTION_RE and INSULT_WORDS constants defined above.
+    """
+    return re.compile(
+        rf"(?:{MENTION_RE}).*?(?:{INSULT_WORDS})|(?:{INSULT_WORDS}).*?(?:{MENTION_RE})",
+        re.IGNORECASE
+    )
+# Simple lexical sets for context continuity
+_CONNECTIVE_OPENERS = re.compile(
+    r"^(?:also|and|but|so|then|still|btw|anyway|anyways|plus|ok|okay|well|right)\b",
+    re.IGNORECASE
+)
+_SECOND_PERSON = re.compile(r"\b(?:you|u|ur|your|you\'re|youre)\b", re.IGNORECASE)
+_FOLLOWUP_TOKENS = re.compile(
+    r"\b(?:also|btw|besides|another\s+thing|one\s+more|and\s+another|still)\b",
+    re.IGNORECASE
+)
+
+def _token_set(s: str) -> set:
+    return set(re.findall(r"[a-zA-Z0-9']{2,}", s.lower()))
+
+def _overlap_ratio(a_text: str, b_text: str) -> float:
+    """Very cheap 'similarity': unigram Jaccard."""
+    A, B = _token_set(a_text), _token_set(b_text)
+    if not A or not B: 
+        return 0.0
+    inter = len(A & B)
+    union = len(A | B)
+    return inter / union
+
+def context_says_directed(chat_id: int, user_id: int, text: str) -> bool:
+    """
+    Heuristic score using ONLY conversational context:
+    - If last speaker was the bot, treat follow-up from same user as directed unless it clearly breaks context.
+    - If last speaker was the user and bot replied to them last turn, a short continuation is directed.
+    - Continuation cues (connective openers, 'you', 'also', '?') increase score.
+    - Strong topic overlap with bot's last message also counts.
+    """
+    dq = _ctx_get(chat_id)
+    if not dq:
+        return False
+
+    # Find the last bot message and who the bot last responded to
+    last_bot_idx = None
+    for i in range(len(dq) - 1, -1, -1):
+        if dq[i]["author"] == "bot":
+            last_bot_idx = i
+            break
+
+    if last_bot_idx is None:
+        return False
+
+    bot_msg = dq[last_bot_idx]["text"]
+    # Find who spoke right before/after that bot message
+    user_before_bot = None
+    user_after_bot  = None
+
+    if last_bot_idx - 1 >= 0 and isinstance(dq[last_bot_idx - 1]["author"], int):
+        user_before_bot = dq[last_bot_idx - 1]["author"]
+    if last_bot_idx + 1 < len(dq) and isinstance(dq[last_bot_idx + 1]["author"], int):
+        user_after_bot = dq[last_bot_idx + 1]["author"]
+
+    score = 0
+
+    # If the bot last interacted with THIS user (either before or after), that's a strong signal
+    if user_before_bot == user_id or user_after_bot == user_id:
+        score += 2
+
+    # Continuation cues in THIS message
+    if _CONNECTIVE_OPENERS.search(text):
+        score += 1
+    if _FOLLOWUP_TOKENS.search(text):
+        score += 1
+    if "?" in text:
+        score += 1
+    if _SECOND_PERSON.search(text):
+        score += 1
+
+    # Topic overlap with the bot's last message
+    if _overlap_ratio(text, bot_msg) >= 0.18:  # tiny, forgiving threshold
+        score += 1
+
+    # Very short follow-ups (“ok”, “but,” “and…”) after bot reply are likely directed
+    if len(text.strip()) <= 6 and (user_before_bot == user_id or user_after_bot == user_id):
+        score += 1
+
+    return score >= 2
+
 # --- Unified catch-all: auto-enable + AI reply (cannot be blocked) ---
 @dp.message(F.text, flags={"block": False})
-@dp.message(F.text)   # keep simple, reliable match
 async def ai_catchall(msg: Message):
     # Ignore commands here
     if not msg.text or msg.text.startswith("/"):
@@ -1584,25 +1768,33 @@ async def ai_catchall(msg: Message):
             return  # AI off for this chat
 
         text = msg.text or ""
+
+        # Persist this incoming user message for DB context
+        await log_chat_message(msg.chat.id, msg.from_user.id, False, text)
+
         norm = _normalize_text(text)
 
         # --- Classification ---
-        is_thanks      = bool(THANKS_RE.search(text))
-        is_apology     = bool(APOLOGY_RE.search(text))
-        has_profanity  = bool(PROFANITY_RE.search(text))
-        is_directed    = bool(INSULT_DIRECT_RE().search(text))
-        is_summon      = bool(SUMMON_PATTERN().search(text))
+        is_thanks     = bool(THANKS_RE.search(text))
+        is_apology    = bool(APOLOGY_RE.search(text))
+        has_profanity = bool(PROFANITY_RE.search(text))
+        is_summon     = bool(SUMMON_PATTERN.search(text))   # compiled regex
 
-        # Also consider follow-up window as “directed”
+        explicit_direct = bool(INSULT_DIRECT_RE().search(text)) or is_summon
+        is_directed = explicit_direct or context_says_directed(msg.chat.id, msg.from_user.id, text)
+
+        # Also consider a short follow-up window as “directed”
         now = dt.datetime.now().timestamp()
         if not is_directed:
             last_bot = CHAT_LAST_BOT_TS.get(msg.chat.id, 0.0)
             in_window = (now - last_bot) <= CONVO_WINDOW_S
             if in_window and CHAT_CONVO_USER.get(msg.chat.id) == msg.from_user.id:
-                # if they swear or summon in-window, treat as addressed
-                is_directed = has_profanity or is_summon
+                is_directed = True
 
-        logger.info(f"[AI] tags thanks={is_thanks} apology={is_apology} profanity={has_profanity} directed={is_directed} summon={is_summon}")
+        logger.info(
+            f"[AI] tags thanks={is_thanks} apology={is_apology} profanity={has_profanity} "
+            f"directed={is_directed} summon={is_summon}"
+        )
 
         # Persist lightweight lifetime stats
         try:
@@ -1611,10 +1803,14 @@ async def ai_catchall(msg: Message):
                 getattr(msg.from_user, "first_name", None),
                 getattr(msg.from_user, "username", None),
             )
-            if is_thanks:  await incr_counter(msg.chat.id, msg.from_user.id, "thanks", 1)
-            if is_apology: await incr_counter(msg.chat.id, msg.from_user.id, "apology", 1)
-            if is_directed: await incr_counter(msg.chat.id, msg.from_user.id, "insult", 1)  # only count directed insults
-            if is_summon:  await incr_counter(msg.chat.id, msg.from_user.id, "mention", 1)
+            if is_thanks:
+                await incr_counter(msg.chat.id, msg.from_user.id, "thanks", 1)
+            if is_apology:
+                await incr_counter(msg.chat.id, msg.from_user.id, "apology", 1)
+            if is_directed and has_profanity:
+                await incr_counter(msg.chat.id, msg.from_user.id, "insult", 1)
+            if is_summon:
+                await incr_counter(msg.chat.id, msg.from_user.id, "mention", 1)
         except Exception:
             logger.exception("counter/name upsert failed")
 
@@ -1632,19 +1828,26 @@ async def ai_catchall(msg: Message):
             else:
                 gratitude_reward = (_sysrand.random() < 0.05)
                 if gratitude_reward:
-                    await log_penalty(msg.chat.id, user_id, "gratitude_boon", -10, "Random gratitude boon (≤5 thanks)")
+                    await log_penalty(
+                        msg.chat.id, user_id, "gratitude_boon", -10,
+                        "Random gratitude boon (≤5 thanks)"
+                    )
 
         # === Insults / profanity handling ===
-        # We only punish when profanity is DIRECTED at the Prophet.
-        fake_or_insult = is_directed and (has_profanity or is_apology)   # insulting apology, etc.
+        # Punish only when profanity is DIRECTED at the Prophet (or insulting apology).
+        fake_or_insult = is_directed and (has_profanity or is_apology)
         offense_count_today = 0
         insult_punish_due = False
 
         if fake_or_insult:
             offense_count_today, threshold = await bump_insult_db(msg.chat.id, user_id)
-            safe_threshold = max(2, int(threshold or 99))  # NEVER punish on first offense
+            # Guard: never punish on very first insult → threshold min 2
+            safe_threshold = max(2, int(threshold or 99))
             insult_punish_due = (offense_count_today >= safe_threshold)
-            logger.info(f"[AI] insult counters chat={msg.chat.id} user={user_id} count_today={offense_count_today} threshold={safe_threshold}")
+            logger.info(
+                f"[AI] insult counters chat={msg.chat.id} user={user_id} "
+                f"count_today={offense_count_today} threshold={safe_threshold}"
+            )
             if insult_punish_due:
                 await log_penalty(msg.chat.id, user_id, "insult", +15, "Hidden daily threshold reached")
                 try:
@@ -1662,7 +1865,7 @@ async def ai_catchall(msg: Message):
                 logger.info("[AI] cooldown blocked")
                 return
         else:
-            _last_ai_reply_at[user_id] = now  # bypass cooldown
+            _last_ai_reply_at[user_id] = now  # bypass cooldown for triggered categories
 
         name = (msg.from_user.first_name or msg.from_user.username or "friend")
 
@@ -1699,32 +1902,55 @@ async def ai_catchall(msg: Message):
             "policy": {
                 "never_reveal_thresholds": True,
                 "pushup_wording": "Say 'extra pushups' or 'less pushups', never 'you owe N pushups'.",
-                "style": "Short for group chat; on profanity not directed at you, respond with a brief nudge (no penalty).",
+                "style": "Short for group chat; if profanity not aimed at you, give a brief nudge (no penalty).",
             },
         }
 
         # Prompt tailoring
         if has_profanity and not is_directed:
-            user_mode = "The user used profanity not aimed at you; respond briefly with a calm nudge to keep the chat clean; do not punish."
+            user_mode = (
+                "The user used profanity not aimed at you; respond briefly with a calm nudge to keep the chat clean; "
+                "do not punish."
+            )
         elif is_directed:
-            user_mode = "User insulted you; if policy indicates punishment is due, state +15 kr to the pot; otherwise give a firm warning with no amounts."
+            user_mode = (
+                "User insulted you; if policy indicates punishment is due, state +15 kr to the pot; "
+                "otherwise give a firm warning with no amounts."
+            )
         else:
             user_mode = "General message."
 
-        prompt = f"{user_mode}\n\n{name}: {text}\n\n[context-json]\n{ai_context}"
-        reply = await ai_reply(PROPHET_SYSTEM, [{"role": "user", "content": prompt}])
+        # Pull recent chat context from DB and condense it
+        recent_rows = await fetch_recent_context(msg.chat.id, minutes=20, limit=20)
+        compact_ctx = build_compact_context(recent_rows)
+
+        # Compose messages for the model (ai_reply injects the system)
+        messages = compact_ctx + [{
+            "role": "user",
+            "content": f"{user_mode}\n\n{name}: {text}\n\n[context-json]\n{ai_context}"
+        }]
+
+        reply = await ai_reply(PROPHET_SYSTEM, messages)
         logger.info(f"[AI] model returned={bool(reply)}")
         if not reply:
             reply = "I hear you. Walk me through it in one line."
 
         # Send and mark convo window with this user
         await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
+
+        # Persist bot reply
+        await log_chat_message(msg.chat.id, None, True, reply)
+
         CHAT_LAST_BOT_TS[msg.chat.id] = dt.datetime.now().timestamp()
         CHAT_CONVO_USER[msg.chat.id]  = user_id
 
+        # --- Record conversation turns for in-memory context-only directedness ---
+        dq = _ctx_get(msg.chat.id)
+        dq.append({"author": msg.from_user.id, "text": text})
+        dq.append({"author": "bot", "text": reply})
+
     except Exception:
         logger.exception("policy-aware AI reply failed")
-
 
 
 
@@ -1863,6 +2089,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
