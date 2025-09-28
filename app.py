@@ -1531,17 +1531,18 @@ async def my_stats_cmd(msg: Message):
 @dp.message(F.text.func(lambda t: isinstance(t, str)), flags={"block": False})
 async def _auto_enable_chain_when_seen(msg: Message):
     try:
+        logger.info(f"[AUTO] saw text chat={msg.chat.id} type={getattr(msg.chat,'type','')}")
         # Only groups/supergroups
         if getattr(msg.chat, "type", "") not in ("group", "supergroup"):
             return
         # Respect DB toggle (default True)
         if not await get_chain_enabled(msg.chat.id):
+            logger.info(f"[AUTO] chain disabled in DB for chat={msg.chat.id}")
             return
         # If not already scheduled in this process, schedule it now
         if msg.chat.id not in random_jobs:
             schedule_random_daily(msg.chat.id)
             logger.info(f"[Chain] Auto-enabled (default ON) for chat {msg.chat.id}")
-            # Also add the 07:00 daily quote and Sun 11:00 votes if you like:
             try:
                 scheduler.add_job(
                     send_ai_day_message, "cron",
@@ -1559,13 +1560,20 @@ async def _auto_enable_chain_when_seen(msg: Message):
         logger.exception("[Chain] auto-enable hook failed")
 
 
-# Catch-all AI (AI enforces thanks/apology/insult/summon policy; compact group replies)
-@dp.message(F.text.func(lambda t: isinstance(t, str) and not t.startswith("/")))
+# Catch-all AI (compact group replies)
+@dp.message(F.text)   # <- simpler, reliable match
 async def ai_catchall(msg: Message):
+    # Ignore commands here
+    if not msg.text or msg.text.startswith("/"):
+        return
+
     logger.info(f"[AI] catchall hit chat={msg.chat.id} text={msg.text!r}")
+
     try:
-        if not await get_ai_enabled(msg.chat.id):
-            return
+        enabled = await get_ai_enabled(msg.chat.id)
+        logger.info(f"[AI] enabled={enabled} for chat={msg.chat.id}")
+        if not enabled:
+            return  # AI off for this chat
 
         text = msg.text or ""
         norm = _normalize_text(text)
@@ -1575,6 +1583,8 @@ async def ai_catchall(msg: Message):
         is_apology = bool(APOLOGY_RE.search(text))
         is_insult  = bool(INSULT_RE.search(norm))
         is_summon  = bool(SUMMON_PATTERN.search(text))
+
+        logger.info(f"[AI] tags thanks={is_thanks} apology={is_apology} insult={is_insult} summon={is_summon}")
 
         # Persist lightweight lifetime stats (useful for /mystats etc.)
         try:
@@ -1593,25 +1603,20 @@ async def ai_catchall(msg: Message):
         user_id = msg.from_user.id
 
         # === Gratitude rules (DB-backed) ===
-        # Overuse => stern warning ONLY (do not disclose thresholds or amounts)
         thanks_count_today = 0
-        gratitude_overused = False           # -> AI should warn only (no +kr mentioned)
-        gratitude_reward   = False           # 5% boon (−10 kr) ONLY if not overused
+        gratitude_overused = False
+        gratitude_reward   = False
 
         if is_thanks:
             thanks_count_today = await bump_thanks_db(msg.chat.id, user_id)
             if thanks_count_today > 5:
                 gratitude_overused = True
-                gratitude_reward = False
-                # (No penalty applied here—only a stern warning via AI response)
             else:
                 gratitude_reward = (_sysrand.random() < 0.05)
                 if gratitude_reward:
-                    # Record boon in audit log (not counted as a "penalty")
                     await log_penalty(msg.chat.id, user_id, "gratitude_boon", -10, "Random gratitude boon (≤5 thanks)")
 
         # === Insults / fake apologies-or-thanks (DB-backed) ===
-        # First offense today -> warning; after a secret threshold (2..6) -> +15 kr (threshold never revealed)
         fake_or_insult = (is_insult and (is_thanks or is_apology)) or is_insult
         offense_count_today = 0
         insult_punish_due = False
@@ -1621,38 +1626,37 @@ async def ai_catchall(msg: Message):
             insult_punish_due = (offense_count_today >= threshold)
             if insult_punish_due:
                 await log_penalty(msg.chat.id, user_id, "insult", +15, "Hidden daily threshold reached")
-                # Also track lifetime penalty count
                 try:
                     await incr_counter(msg.chat.id, user_id, "penalty", 1)
                 except Exception:
                     logger.exception("failed to increment lifetime penalty counter")
 
-        # Always reply for these four categories; otherwise use heuristic + cooldown
+        # Always reply for these four categories; otherwise heuristic+cooldown
         force_reply = is_thanks or is_apology or is_insult or is_summon
         if not force_reply:
             if not should_ai_reply(msg):
+                logger.info("[AI] heuristic declined")
                 return
             if not _cooldown_ok(user_id):
+                logger.info("[AI] cooldown blocked")
                 return
         else:
-            # Bypass cooldown for rule-triggered categories
             _last_ai_reply_at[user_id] = dt.datetime.now().timestamp()
 
         name = (msg.from_user.first_name or msg.from_user.username or "friend")
 
-        # Add program day (e.g., Day 73/100) so AI can reference it
+        # Program day context
         try:
             day_idx, day_total = await get_program_day()
         except Exception:
             logger.exception("get_program_day failed")
             day_idx, day_total = (None, None)
 
-        # Build strict context for AI
         ai_context = {
             "chat_id": msg.chat.id,
             "user_id": user_id,
             "user_name": name,
-            "program_day": {"day": day_idx, "total": day_total},  # may be None/None if lookup failed
+            "program_day": {"day": day_idx, "total": day_total},
             "categories": {
                 "thanks": is_thanks,
                 "apology": is_apology,
@@ -1661,28 +1665,29 @@ async def ai_catchall(msg: Message):
             },
             "gratitude": {
                 "count_today": thanks_count_today,
-                "overused": gratitude_overused,                 # => stern warning only; no amounts/thresholds
+                "overused": gratitude_overused,
                 "reward_minus_10": (gratitude_reward and not gratitude_overused),
             },
             "insults": {
                 "is_fake_or_insult": fake_or_insult,
                 "count_today": offense_count_today,
-                "punish_plus_15": insult_punish_due,            # when True, Prophet must say “+15 kr to the pot”
-                # NEVER reveal or hint at the hidden threshold
+                "punish_plus_15": insult_punish_due,
             },
             "pushup_wording": "Say 'extra pushups' or 'less pushups', never 'you owe N pushups'.",
-            "no_pre_warnings": True,  # do not say “you have X left” or disclose thresholds
+            "no_pre_warnings": True,
             "guidance": "Keep replies short for group chat. Conceal thresholds. State amounts only when required.",
         }
 
         prompt = f"{name}: {text}\n\n[context-json]\n{ai_context}"
         reply = await ai_reply(PROPHET_SYSTEM, [{"role": "user", "content": prompt}])
+        logger.info(f"[AI] model returned={bool(reply)}")
         if not reply:
             reply = "I hear you. Walk me through it in one line."
         await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
 
     except Exception:
         logger.exception("policy-aware AI reply failed")
+
 
 
 
@@ -1815,6 +1820,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
