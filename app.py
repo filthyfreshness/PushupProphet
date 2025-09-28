@@ -62,6 +62,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.6"))
 
+logger.info("[AI] Using key suffix: %s", (OPENAI_API_KEY or "")[-8:])
+logger.info("[AI] Using model: %s", OPENAI_MODEL)
+logger.info("[AI] Responses enabled: %s", os.getenv("OPENAI_USE_RESPONSES","1"))
+
+
+
 TZ = timezone("Europe/Stockholm")
 _sysrand = random.SystemRandom()
 
@@ -455,6 +461,31 @@ async def ai_ping_cmd(msg: Message):
         await msg.answer(f"AI OK:\n{reply}", disable_web_page_preview=True, parse_mode=None)
     else:
         await msg.answer("AI call failed. Check logs and OPENAI_API_KEY / OPENAI_MODEL.")
+
+@dp.message(Command("ai_raw"))
+async def ai_raw_cmd(msg: Message):
+    base = os.getenv("OPENAI_BASE_URL", "").strip() or "https://api.openai.com"
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+    if not key:
+        await msg.answer("No OPENAI_API_KEY set.")
+        return
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            r = await client.post(
+                f"{base}/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}"},
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 5,
+                },
+            )
+        body = r.text
+        if len(body) > 800: body = body[:800] + "…"
+        await msg.answer(f"Status: {r.status_code}\nBody:\n<pre>{html.escape(body)}</pre>")
+    except Exception as e:
+        await msg.answer(f"Request error: {e!r}")
 
 
 @dp.message(Command("ai_status"))
@@ -1264,6 +1295,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
