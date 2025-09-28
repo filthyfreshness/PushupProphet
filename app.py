@@ -64,13 +64,10 @@ OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.6"))
 OPENAI_USE_RESPONSES = os.getenv("OPENAI_USE_RESPONSES", "1").strip() == "1"
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip() or "https://api.openai.com"
 
-logger.info("[AI] Using key suffix: %s", (OPENAI_API_KEY or "")[-8:])
-logger.info("[AI] Responses enabled: %s", OPENAI_USE_RESPONSES)
-
 
 logger.info("[AI] Using key suffix: %s", (OPENAI_API_KEY or "")[-8:])
 logger.info("[AI] Using model: %s", OPENAI_MODEL)
-logger.info("[AI] Responses enabled: %s", os.getenv("OPENAI_USE_RESPONSES","1"))
+logger.info("[AI] Responses API: %s", OPENAI_USE_RESPONSES)
 
 
 
@@ -130,19 +127,30 @@ class UserName(Base):
 
 class ChatSettings(Base):
     __tablename__ = "chat_settings"
-    chat_id    = Column(BigInteger, primary_key=True)
-    ai_enabled = Column(Boolean, nullable=False, default=False)
-    changed_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    chat_id       = Column(BigInteger, primary_key=True)
+    ai_enabled    = Column(Boolean, nullable=False, default=False)
+    chain_enabled = Column(Boolean, nullable=False, default=True)
+    changed_at    = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("ix_chatsettings_chain_enabled", "chain_enabled"),
+    )
+
 
 class ScheduledMessage(Base):
     __tablename__ = "scheduled_messages"
     id         = Column(Integer, primary_key=True, autoincrement=True)
-    chat_id    = Column(BigInteger, nullable=False)                # where to post
-    user_id    = Column(BigInteger, nullable=False)                # who scheduled it
+    chat_id    = Column(BigInteger, nullable=False)
+    user_id    = Column(BigInteger, nullable=False)
     text       = Column(String(4096), nullable=False)
-    run_at     = Column(DateTime(timezone=True), nullable=False)   # when to send (UTC or aware)
-    status     = Column(String(16), nullable=False, default="pending")  # pending|sent|canceled
+    run_at     = Column(DateTime(timezone=True), nullable=False)
+    status     = Column(String(16), nullable=False, default="pending")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_sched_status_runat", "status", "run_at"),
+    )
+
 
 # ------------ Program / Stats models ------------
 class ProgramSettings(Base):
@@ -268,12 +276,45 @@ async def set_ai_enabled(chat_id: int, enabled: bool) -> None:
         await s.execute(stmt)
         await s.commit()
 
+async def get_chain_enabled(chat_id: int) -> bool:
+    async with AsyncSessionLocal() as s:
+        res = await s.execute(select(ChatSettings.chain_enabled).where(ChatSettings.chat_id == chat_id))
+        row = res.first()
+        # Default ON if row missing (on by default)
+        return bool(row[0]) if row and row[0] is not None else True
+
+async def set_chain_enabled(chat_id: int, enabled: bool) -> None:
+    ins = _dialect_insert()(ChatSettings).values(chat_id=chat_id, chain_enabled=enabled)
+    stmt = ins.on_conflict_do_update(
+        index_elements=[ChatSettings.chat_id.name],
+        set_={"chain_enabled": enabled},
+    )
+    async with AsyncSessionLocal() as s:
+        await s.execute(stmt)
+        await s.commit()
+
+async def user_totals(chat_id: int, user_id: int) -> Dict[str, int]:
+    async with AsyncSessionLocal() as s:
+        res = await s.execute(
+            select(Counter.metric, Counter.count)
+            .where(Counter.chat_id == chat_id, Counter.user_id == user_id)
+        )
+        rows = res.all()
+    out: Dict[str, int] = {}
+    for m, c in rows:
+        out[m] = int(c or 0)
+    # ensure keys exist
+    for k in ("thanks", "apology", "insult", "penalty"):
+        out.setdefault(k, 0)
+    return out
+
+
 # ---------- Program day helpers ----------
 def _local_midnight_utc(today_local: Optional[dt.date] = None) -> dt.datetime:
-    """UTC instant corresponding to Stockholm local midnight."""
+    """UTC instant corresponding to Stockholm local midnight (DST-safe)."""
     if today_local is None:
         today_local = dt.datetime.now(TZ).date()
-    local_midnight = dt.datetime(today_local.year, today_local.month, today_local.day, 0, 0, tzinfo=TZ)
+    local_midnight = TZ.localize(dt.datetime(today_local.year, today_local.month, today_local.day, 0, 0))
     return local_midnight.astimezone(dt.timezone.utc)
 
 async def ensure_program_settings():
@@ -284,7 +325,8 @@ async def ensure_program_settings():
     if start_env:
         try:
             y, m, d = [int(x) for x in start_env.split("-")]
-            start_local = dt.datetime(y, m, d, 0, 0, tzinfo=TZ)
+            start_local = TZ.localize(dt.datetime(y, m, d, 0, 0))
+
         except Exception:
             start_local = dt.datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
     else:
@@ -471,7 +513,6 @@ General style:
     include it clearly (“+15 kr to the pot”, “−10 kr boon”), but NEVER reveal hidden thresholds.
     
 """
-PROPHET_SYSTEM = f"{PROPHET_SYSTEM}\n\n{POLICY_BLOCK}"
 
 
 PROPHET_SYSTEM = f"{PROPHET_SYSTEM}\n\n{POLICY_BLOCK}"
@@ -488,9 +529,27 @@ def _cooldown_ok(user_id: int) -> bool:
     return False
 
 async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL) -> str:
-    """OpenAI Responses API with simple retry; returns text ('' on failure)."""
+    """Use Responses API when OPENAI_USE_RESPONSES==True, else Chat Completions. Honors OPENAI_BASE_URL."""
     if not OPENAI_API_KEY:
         return ""
+
+    url = f"{OPENAI_BASE_URL}/v1/responses" if OPENAI_USE_RESPONSES else f"{OPENAI_BASE_URL}/v1/chat/completions"
+    payload = (
+        {
+            "model": model,
+            "input": [{"role": "system", "content": system}] + messages,
+            "temperature": OPENAI_TEMPERATURE,
+            "max_output_tokens": 180,
+        }
+        if OPENAI_USE_RESPONSES else
+        {
+            "model": model,
+            "messages": [{"role": "system", "content": system}] + messages,
+            "temperature": OPENAI_TEMPERATURE,
+            "max_tokens": 180,
+        }
+    )
+
     delays = [0, 0.8, 2.0]
     for i, delay in enumerate(delays):
         if delay:
@@ -498,35 +557,39 @@ async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL)
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.post(
-                    "https://api.openai.com/v1/responses",
+                    url,
                     headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                    json={
-                        "model": model,
-                        "input": [{"role": "system", "content": system}] + messages,
-                        "temperature": OPENAI_TEMPERATURE,
-                        "max_output_tokens": 180,
-                    },
+                    json=payload,
                 )
                 r.raise_for_status()
                 data = r.json()
-                # Extract first text chunk
-                for item in data.get("output", []):
-                    if item.get("type") == "message":
-                        for p in item.get("content", []):
-                            if p.get("type") == "output_text":
-                                txt = (p.get("text") or "").strip()
-                                if txt:
-                                    return txt
-                # Fallback for alternate shapes
-                txt = ""
-                if isinstance(data.get("text"), dict):
-                    txt = (data.get("text", {}).get("value") or "").strip()
-                elif isinstance(data.get("text"), str):
-                    txt = data["text"].strip()
-                return txt
+
+                if OPENAI_USE_RESPONSES:
+                    # New Responses format
+                    for item in data.get("output", []):
+                        if item.get("type") == "message":
+                            for p in item.get("content", []):
+                                if p.get("type") == "output_text":
+                                    txt = (p.get("text") or "").strip()
+                                    if txt:
+                                        return txt
+                    # Fallbacks
+                    if isinstance(data.get("text"), dict):
+                        return (data["text"].get("value") or "").strip()
+                    if isinstance(data.get("text"), str):
+                        return data["text"].strip()
+                    return ""
+                else:
+                    # Chat Completions format
+                    choices = data.get("choices") or []
+                    if choices and "message" in choices[0]:
+                        return (choices[0]["message"].get("content") or "").strip()
+                    return ""
         except Exception as e:
             logger.warning(f"[AI] attempt {i+1} failed: {e}")
+
     return ""
+
 
 # Triggers and patterns
 def _normalize_text(t: str) -> str:
@@ -570,32 +633,10 @@ def _compose_absolution(user_name: Optional[str]) -> str:
     safe = html.escape(user_name or "friend")
     return _sysrand.choice(APOLOGY_RESPONSES).format(name=safe)
 
-# ---- Gratitude daily limit + reward/penalty state ----
-_gratitude_uses: Dict[int, tuple[dt.date, int]] = {}  # user_id -> (date, count)
 
 def _today_stockholm_date() -> dt.date:
     return dt.datetime.now(TZ).date()
 
-def _gratitude_inc_and_get(user_id: int) -> int:
-    today = _today_stockholm_date()
-    state = _gratitude_uses.get(user_id)
-    if not state or state[0] != today:
-        _gratitude_uses[user_id] = (today, 0)
-    count = _gratitude_uses[user_id][1] + 1
-    _gratitude_uses[user_id] = (today, count)
-    return count
-
-def _compose_gratitude_penalty(user_name: Optional[str]) -> str:
-    safe = html.escape(user_name or "friend")
-    return (
-        f"Your gratitude pours too freely today, {safe}. The floor is not fooled by sugar on the tongue.\n"
-        f"Let your deeds do the thanking.\n\n"
-        f"<b>Edict:</b> Lay <b>10 kr</b> in the pot and return with a steadier heart."
-    )
-
-def _compose_gratitude_reward() -> str:
-    # 5% chance message
-    return "🪙 <b>Favor of Gratitude</b> — Deduct <b>20 kr</b> from your debt for your loyalty."
 
 MENTION_RE = r"(?:\bpush\s*up\s*prophet\b|\bpushup\s*prophet\b|\bprophet\b|\bbot\b)"
 INSULT_WORDS = (
@@ -996,7 +1037,6 @@ async def schedule_cancel_cmd(msg: Message):
 #    await msg.answer(_sysrand.choice(SUMMON_RESPONSES))
 
 # ================== Daily Quotes (rotation + /share_wisdom) ==================
-from collections import deque
 
 QUOTES = [
     "“Gravity is my quill; with each rep I write strength upon your bones.”",
@@ -1204,9 +1244,6 @@ FATE_RULES_TEXT = (
 
 _fate_rolls: Dict[int, tuple[dt.date, set[int]]] = {}
 
-def _today_stockholm_date() -> dt.date:
-    return dt.datetime.now(TZ).date()
-
 def _fate_reset_if_new_day(chat_id: int):
     today = _today_stockholm_date()
     state = _fate_rolls.get(chat_id)
@@ -1347,6 +1384,9 @@ async def fate_stats_cmd(msg: Message):
         pct = 100.0 * counts[k] / N
         target = next(w for kk, w in FATE_WEIGHTS if kk == k)
         lines.append(f"• {k:15s}: {counts[k]:6d}  ({pct:5.2f}% vs target {target/total_w*100:5.2f}%)")
+        
+    await msg.answer("\n".join(lines))
+
 
 
 
@@ -1367,7 +1407,6 @@ def _next_random_time(now: dt.datetime) -> dt.datetime:
 
 def schedule_random_daily(chat_id: int) -> None:
     """Start (or restart) the daily random announcement loop for a chat."""
-    # If a job exists, remove it first
     old = random_jobs.get(chat_id)
     if old:
         try:
@@ -1380,20 +1419,21 @@ def schedule_random_daily(chat_id: int) -> None:
 
     async def send_and_reschedule():
         try:
+            sent_at = dt.datetime.now(TZ)
             # 1) Send the main daily message
             await bot.send_message(chat_id, DAILY_TEXT)
 
-            # 2) Schedule the exact 1-hour follow-up (no long sleep)
+            # 2) Schedule the exact 1-hour follow-up anchored to sent_at
             scheduler.add_job(
                 bot.send_message,
                 "date",
-                run_date=dt.datetime.now(TZ) + dt.timedelta(hours=1),
+                run_date=sent_at + dt.timedelta(hours=1),
                 args=[chat_id,
                       ("The hour has passed, the covenant stands. No debt weighs upon those who rise in unison. "
                        "The choice has always been yours. I hope you made the right one.")]
             )
         finally:
-            # 3) Immediately schedule tomorrow's random time
+            # 3) Schedule tomorrow's random time immediately
             tomorrow = dt.datetime.now(TZ) + dt.timedelta(days=1)
             next_run = _next_random_time(tomorrow)
             new_job = scheduler.add_job(send_and_reschedule, "date", run_date=next_run)
@@ -1404,26 +1444,40 @@ def schedule_random_daily(chat_id: int) -> None:
 
 @dp.message(Command("enable_random"))
 async def enable_random_cmd(msg: Message):
-    schedule_random_daily(msg.chat.id)
-    await msg.answer("✅ Forgiveness Chain enabled for this chat. I will announce once per day between "
-                     f"{WINDOW_START:02d}:00–{WINDOW_END:02d}:00 Stockholm, then follow up 1 hour later.")
+    await set_chain_enabled(msg.chat.id, True)
+    if msg.chat.id not in random_jobs:
+        schedule_random_daily(msg.chat.id)
+    await msg.answer("✅ Forgiveness Chain enabled for this chat (and will stay enabled across restarts).")
 
 @dp.message(Command("disable_random"))
 async def disable_random_cmd(msg: Message):
+    await set_chain_enabled(msg.chat.id, False)
     job = random_jobs.pop(msg.chat.id, None)
     if job:
-        try:
-            job.remove()
-        except Exception:
-            pass
-        await msg.answer("🛑 Forgiveness Chain disabled for this chat.")
-    else:
-        await msg.answer("It wasn’t enabled for this chat.")
+        try: job.remove()
+        except Exception: pass
+    # Remove related cron jobs if you tied them to the chain
+    try:
+        scheduler.remove_job(f"daily_quote_{msg.chat.id}")
+    except Exception: pass
+    try:
+        scheduler.remove_job(f"weekly_votes_{msg.chat.id}")
+    except Exception: pass
+    await msg.answer("🛑 Forgiveness Chain disabled for this chat (persists across restarts).")
 
 @dp.message(Command("status_random"))
 async def status_random_cmd(msg: Message):
-    enabled = msg.chat.id in random_jobs
-    await msg.answer(f"Forgiveness Chain status: {'Enabled ✅' if enabled else 'Disabled 🛑'}")
+    try:
+        enabled_db = await get_chain_enabled(msg.chat.id)
+    except Exception:
+        logger.exception("status_random: get_chain_enabled failed")
+        enabled_db = True  # default-on
+
+    scheduled = (msg.chat.id in random_jobs)
+    status = "Enabled ✅" if enabled_db else "Disabled 🛑"
+    sched  = " (scheduled)" if scheduled else " (not scheduled)"
+    await msg.answer(f"Forgiveness Chain: {status}{sched}")
+
 
 @dp.message(Command("day"))
 async def program_day_cmd(msg: Message):
@@ -1461,6 +1515,35 @@ async def my_stats_cmd(msg: Message):
         f"{today_line}"
     )
 
+@dp.message(F.text.func(lambda t: isinstance(t, str)))
+async def _auto_enable_chain_when_seen(msg: Message):
+    try:
+        # Only groups/supergroups
+        if getattr(msg.chat, "type", "") not in ("group", "supergroup"):
+            return
+        # Respect DB toggle (default True)
+        if not await get_chain_enabled(msg.chat.id):
+            return
+        # If not already scheduled in this process, schedule it now
+        if msg.chat.id not in random_jobs:
+            schedule_random_daily(msg.chat.id)
+            logger.info(f"[Chain] Auto-enabled (default ON) for chat {msg.chat.id}")
+            # Also add the 07:00 daily quote and Sun 11:00 votes if you like:
+            try:
+                scheduler.add_job(
+                    send_daily_quote, "cron",
+                    hour=7, minute=0, args=[msg.chat.id],
+                    id=f"daily_quote_{msg.chat.id}", replace_existing=True,
+                )
+                scheduler.add_job(
+                    send_weekly_vote_prompts, "cron",
+                    day_of_week="sun", hour=11, minute=0, args=[msg.chat.id],
+                    id=f"weekly_votes_{msg.chat.id}", replace_existing=True,
+                )
+            except Exception:
+                logger.exception("[Chain] extra schedules failed")
+    except Exception:
+        logger.exception("[Chain] auto-enable hook failed")
 
 
 # Catch-all AI (AI enforces thanks/apology/insult/summon policy; compact group replies)
@@ -1621,6 +1704,19 @@ async def on_startup():
     await init_db()
     await load_and_schedule_pending()
 
+    # Resume Forgiveness Chain for chats that are enabled in DB
+    try:
+        async with AsyncSessionLocal() as s:
+            res = await s.execute(select(ChatSettings.chat_id).where(ChatSettings.chain_enabled.is_(True)))
+            rows = [r[0] for r in res.all()]
+        for cid in rows:
+            if cid not in random_jobs:
+                schedule_random_daily(cid)
+        logger.info(f"Resumed Forgiveness Chain for {len(rows)} chat(s) from DB.")
+    except Exception:
+        logger.exception("Failed to resume chain from DB")
+    
+
     # 4) Schedule daily quotes, weekly votes, and Forgiveness Chain
     ids = os.getenv("GROUP_CHAT_IDS", "").strip()
     if ids:
@@ -1686,7 +1782,7 @@ async def run_bot_polling():
 @app.on_event("shutdown")
 async def on_shutdown():
     try:
-        await scheduler.shutdown(wait=False)
+        scheduler.shutdown(wait=False)   # remove 'await'
     except Exception:
         pass
     try:
@@ -1703,6 +1799,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
