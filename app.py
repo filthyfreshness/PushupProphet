@@ -215,6 +215,20 @@ class ScheduledMessage(Base):
         Index("ix_sched_status_runat", "status", "run_at"),
     )
 
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id    = Column(BigInteger, nullable=False)
+    author_id  = Column(BigInteger, nullable=True)   # None for bot
+    is_bot     = Column(Boolean, nullable=False, default=False)
+    text       = Column(String(2000), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_chat_messages_chat_time", "chat_id", "created_at"),
+    )
+
 def _is_pg_url(async_url: str) -> bool:
     return async_url.startswith("postgresql+asyncpg://")
 
@@ -2089,6 +2103,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
