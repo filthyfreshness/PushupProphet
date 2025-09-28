@@ -1359,9 +1359,10 @@ FATE_SUMMON_RE = re.compile(
     re.IGNORECASE
 )
 
-@dp.message(F.text.func(lambda t: isinstance(t, str)
-                        and not t.strip().startswith("/")
-                        and FATE_SUMMON_RE.search(t)))
+@dp.message(
+    F.text.func(lambda t: isinstance(t, str) and not t.strip().startswith("/") and FATE_SUMMON_RE.search(t)),
+    flags={"block": False}
+)
 async def fate_natural(msg: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="Roll the Dice 🎲", callback_data="fate:roll"),
@@ -1528,57 +1529,53 @@ async def my_stats_cmd(msg: Message):
         f"{today_line}"
     )
 
-@dp.message(F.text.func(lambda t: isinstance(t, str)), flags={"block": False})
-async def _auto_enable_chain_when_seen(msg: Message):
-    try:
-        logger.info(f"[AUTO] saw text chat={msg.chat.id} type={getattr(msg.chat,'type','')}")
-        # Only groups/supergroups
-        if getattr(msg.chat, "type", "") not in ("group", "supergroup"):
-            return
-        # Respect DB toggle (default True)
-        if not await get_chain_enabled(msg.chat.id):
-            logger.info(f"[AUTO] chain disabled in DB for chat={msg.chat.id}")
-            return
-        # If not already scheduled in this process, schedule it now
-        if msg.chat.id not in random_jobs:
-            schedule_random_daily(msg.chat.id)
-            logger.info(f"[Chain] Auto-enabled (default ON) for chat {msg.chat.id}")
-            try:
-                scheduler.add_job(
-                    send_ai_day_message, "cron",
-                    hour=7, minute=0, args=[msg.chat.id],
-                    id=f"day_msg_{msg.chat.id}", replace_existing=True,
-                )
-                scheduler.add_job(
-                    send_weekly_vote_prompts, "cron",
-                    day_of_week="sun", hour=11, minute=0, args=[msg.chat.id],
-                    id=f"weekly_votes_{msg.chat.id}", replace_existing=True,
-                )
-            except Exception:
-                logger.exception("[Chain] extra schedules failed")
-    except Exception:
-        logger.exception("[Chain] auto-enable hook failed")
-
-
-# Catch-all AI (compact group replies)
-@dp.message(F.text)   # <- simpler, reliable match
+# --- Unified catch-all: auto-enable + AI reply (cannot be blocked) ---
+@dp.message(F.text, flags={"block": False})
 async def ai_catchall(msg: Message):
-    # Ignore commands here
+    # Ignore slash-commands
     if not msg.text or msg.text.startswith("/"):
         return
 
+    # ===== 1) Auto-enable Forgiveness Chain / schedules (once per chat) =====
+    try:
+        logger.info(f"[AUTO] saw text chat={msg.chat.id} type={getattr(msg.chat,'type','')}")
+        if getattr(msg.chat, "type", "") in ("group", "supergroup"):
+            enabled_in_db = await get_chain_enabled(msg.chat.id)
+            if not enabled_in_db:
+                logger.info(f"[AUTO] chain disabled in DB for chat={msg.chat.id}")
+            else:
+                if msg.chat.id not in random_jobs:
+                    schedule_random_daily(msg.chat.id)
+                    logger.info(f"[Chain] Auto-enabled (default ON) for chat {msg.chat.id}")
+                    try:
+                        scheduler.add_job(
+                            send_ai_day_message, "cron",
+                            hour=7, minute=0, args=[msg.chat.id],
+                            id=f"day_msg_{msg.chat.id}", replace_existing=True,
+                        )
+                        scheduler.add_job(
+                            send_weekly_vote_prompts, "cron",
+                            day_of_week="sun", hour=11, minute=0, args=[msg.chat.id],
+                            id=f"weekly_votes_{msg.chat.id}", replace_existing=True,
+                        )
+                    except Exception:
+                        logger.exception("[Chain] extra schedules failed")
+    except Exception:
+        logger.exception("[AUTO] auto-enable hook failed")
+
+    # ===== 2) AI logic =====
     logger.info(f"[AI] catchall hit chat={msg.chat.id} text={msg.text!r}")
 
     try:
         enabled = await get_ai_enabled(msg.chat.id)
         logger.info(f"[AI] enabled={enabled} for chat={msg.chat.id}")
         if not enabled:
-            return  # AI off for this chat
+            return  # AI replies are off in this chat
 
         text = msg.text or ""
         norm = _normalize_text(text)
 
-        # Classify using your existing regexes
+        # Classify
         is_thanks  = bool(THANKS_RE.search(text))
         is_apology = bool(APOLOGY_RE.search(text))
         is_insult  = bool(INSULT_RE.search(norm))
@@ -1586,7 +1583,7 @@ async def ai_catchall(msg: Message):
 
         logger.info(f"[AI] tags thanks={is_thanks} apology={is_apology} insult={is_insult} summon={is_summon}")
 
-        # Persist lightweight lifetime stats (useful for /mystats etc.)
+        # Persist lightweight lifetime stats
         try:
             await upsert_username(
                 msg.chat.id, msg.from_user.id,
@@ -1602,11 +1599,10 @@ async def ai_catchall(msg: Message):
 
         user_id = msg.from_user.id
 
-        # === Gratitude rules (DB-backed) ===
+        # Gratitude state (DB-backed)
         thanks_count_today = 0
         gratitude_overused = False
         gratitude_reward   = False
-
         if is_thanks:
             thanks_count_today = await bump_thanks_db(msg.chat.id, user_id)
             if thanks_count_today > 5:
@@ -1616,22 +1612,21 @@ async def ai_catchall(msg: Message):
                 if gratitude_reward:
                     await log_penalty(msg.chat.id, user_id, "gratitude_boon", -10, "Random gratitude boon (≤5 thanks)")
 
-        # === Insults / fake apologies-or-thanks (DB-backed) ===
+        # Insult / fake-apology state (DB-backed)
         fake_or_insult = (is_insult and (is_thanks or is_apology)) or is_insult
         offense_count_today = 0
         insult_punish_due = False
-
         if fake_or_insult:
             offense_count_today, threshold = await bump_insult_db(msg.chat.id, user_id)
             insult_punish_due = (offense_count_today >= threshold)
             if insult_punish_due:
                 await log_penalty(msg.chat.id, user_id, "insult", +15, "Hidden daily threshold reached")
                 try:
-                    await incr_counter(msg.chat.id, user_id, "penalty", 1)
+                    await incr_counter(msg.chat.id, msg.from_user.id, "penalty", 1)
                 except Exception:
                     logger.exception("failed to increment lifetime penalty counter")
 
-        # Always reply for these four categories; otherwise heuristic+cooldown
+        # Always reply for these categories; otherwise heuristic + cooldown
         force_reply = is_thanks or is_apology or is_insult or is_summon
         if not force_reply:
             if not should_ai_reply(msg):
@@ -1645,7 +1640,7 @@ async def ai_catchall(msg: Message):
 
         name = (msg.from_user.first_name or msg.from_user.username or "friend")
 
-        # Program day context
+        # Program day for context
         try:
             day_idx, day_total = await get_program_day()
         except Exception:
@@ -1681,12 +1676,14 @@ async def ai_catchall(msg: Message):
         prompt = f"{name}: {text}\n\n[context-json]\n{ai_context}"
         reply = await ai_reply(PROPHET_SYSTEM, [{"role": "user", "content": prompt}])
         logger.info(f"[AI] model returned={bool(reply)}")
+
         if not reply:
             reply = "I hear you. Walk me through it in one line."
         await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
 
     except Exception:
         logger.exception("policy-aware AI reply failed")
+
 
 
 
@@ -1820,6 +1817,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
