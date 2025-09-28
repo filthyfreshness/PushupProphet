@@ -1720,6 +1720,7 @@ async def on_startup():
 
     # 3) DB init & resume pending jobs
     await init_db()
+    await ensure_program_settings()
     await load_and_schedule_pending()
 
     # Resume Forgiveness Chain for chats that are enabled in DB
@@ -1817,6 +1818,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
