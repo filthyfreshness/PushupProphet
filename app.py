@@ -1051,11 +1051,6 @@ async def fate_stats_cmd(msg: Message):
         target = next(w for kk, w in FATE_WEIGHTS if kk == k)
         lines.append(f"• {k:15s}: {counts[k]:6d}  ({pct:5.2f}% vs target {target/total_w*100:5.2f}%)")
 
-    # Probability that 4 in a row are identical (with current weights)
-    p4 = sum((w/total_w)**4 for w in weights)
-    approx = int(1 / max(p4, 1e-9))
-    lines.append(f"\nP(same result 4× in a row) ≈ {p4*100:.3f}% (~1 in {approx})")
-    await msg.answer("\n".join(lines))
 
 
 # ================== Forgiveness Chain (random daily + 1h follow-up) ==================
@@ -1269,6 +1264,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
