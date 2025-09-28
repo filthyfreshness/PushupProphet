@@ -17,7 +17,6 @@ import asyncio
 import logging
 import random
 import datetime as dt
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
 from collections import deque
@@ -94,7 +93,7 @@ BOT_USERNAME: Optional[str] = None
 # Conversation windows (per chat)
 CHAT_LAST_BOT_TS: Dict[int, float] = {}      # chat_id -> last time Prophet spoke
 CHAT_CONVO_USER: Dict[int, int] = {}         # chat_id -> user id Prophet is currently “talking to”
-CONVO_WINDOW_S = 180                         # 3 minutes
+CONVO_WINDOW_S = 30                         # 3 minutes
 
 
 # ------------------------ Database ---------------------------
@@ -1651,9 +1650,7 @@ def _ctx_get(chat_id: int) -> deque:
         dq = CHAT_CONTEXT[chat_id] = deque(maxlen=CHAT_CONTEXT_MAX)
     return dq
 
-CONVO_WINDOW_S = 30  # max time to treat follow-ups as addressed to the bot
-CHAT_LAST_BOT_TS: Dict[int, float] = {}   # chat_id -> last time bot replied (epoch seconds)
-CHAT_CONVO_USER: Dict[int, int] = {}      # chat_id -> user_id who last "owned" the thread
+
 
 # Broad but safe profanity net (no slurs list here—already covered by INSULT_WORDS)
 PROFANITY_RE = re.compile(
@@ -1661,15 +1658,7 @@ PROFANITY_RE = re.compile(
     re.IGNORECASE
 )
 
-def INSULT_DIRECT_RE() -> re.Pattern:
-    """
-    Directed insult at the Prophet (mention + profanity).
-    Uses your existing MENTION_RE and INSULT_WORDS constants defined above.
-    """
-    return re.compile(
-        rf"(?:{MENTION_RE}).*?(?:{INSULT_WORDS})|(?:{INSULT_WORDS}).*?(?:{MENTION_RE})",
-        re.IGNORECASE
-    )
+
 # Simple lexical sets for context continuity
 _CONNECTIVE_OPENERS = re.compile(
     r"^(?:also|and|but|so|then|still|btw|anyway|anyways|plus|ok|okay|well|right)\b",
@@ -1977,6 +1966,7 @@ async def on_startup():
     me = await bot.get_me()
     global BOT_USERNAME
     BOT_USERNAME = (me.username or "").lower()
+    BOT_ID = me.id
     logger.info(f"Bot authorized: @{me.username} (id={me.id})")
 
 
@@ -2091,6 +2081,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
