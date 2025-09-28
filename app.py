@@ -1528,7 +1528,7 @@ async def my_stats_cmd(msg: Message):
         f"{today_line}"
     )
 
-@dp.message(F.text.func(lambda t: isinstance(t, str))), flags={"block": False})
+@dp.message(F.text.func(lambda t: isinstance(t, str)), flags={"block": False})
 async def _auto_enable_chain_when_seen(msg: Message):
     try:
         # Only groups/supergroups
@@ -1815,6 +1815,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
