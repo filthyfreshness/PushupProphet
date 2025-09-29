@@ -1592,13 +1592,22 @@ async def fate_stats_cmd(msg: Message):
 random_jobs: Dict[int, object] = {}  # chat_id -> APScheduler Job
 
 def _next_random_time(now: dt.datetime) -> dt.datetime:
-    """Pick a random time today within [WINDOW_START, WINDOW_END]. If already past, roll to tomorrow."""
-    hour = _sysrand.randint(WINDOW_START, WINDOW_END)
-    minute = _sysrand.randint(0, 59)
-    run_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    """
+    Pick a random time on the same local day within [WINDOW_START, WINDOW_END].
+    If hour == WINDOW_END, force minute = 0 (so latest possible time is exactly HH:00).
+    If that time has already passed, roll to *tomorrow* and pick again with the same rule.
+    """
+    def pick_for(day: dt.date) -> dt.datetime:
+        hour = _sysrand.randint(WINDOW_START, WINDOW_END)  # inclusive
+        minute = 0 if hour == WINDOW_END else _sysrand.randint(0, 59)
+        return now.replace(year=day.year, month=day.month, day=day.day,
+                           hour=hour, minute=minute, second=0, microsecond=0)
+
+    run_at = pick_for(now.date())
     if run_at <= now:
-        run_at += dt.timedelta(days=1)
+        run_at = pick_for((now + dt.timedelta(days=1)).date())
     return run_at
+
 
 def schedule_random_daily(chat_id: int) -> None:
     """Start (or restart) the daily random announcement loop for a chat."""
@@ -2169,6 +2178,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
