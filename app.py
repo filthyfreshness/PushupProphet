@@ -525,6 +525,16 @@ async def load_and_schedule_pending():
 
     logger.info("Scheduled %d pending messages from DB.", count)
 
+def ensure_day_job(chat_id: int) -> None:
+    job_id = f"day_msg_{chat_id}"
+    if not scheduler.get_job(job_id):
+        scheduler.add_job(
+            send_ai_day_message, "cron",
+            hour=7, minute=0, args=[chat_id],
+            id=job_id, replace_existing=True,
+        )
+
+
 # ------------------------ Utilities --------------------------
 
 def _is_admin(user_id: int) -> bool: return user_id in _ADMIN_IDS
@@ -974,6 +984,23 @@ async def schedules_cmd(msg: Message):
 
     await msg.answer("\n".join(lines))
 
+@dp.message(Command("day_enable"))
+async def day_enable_cmd(msg: Message):
+    ensure_day_job(msg.chat.id)
+    await msg.answer("✅ Day message scheduled (07:00 Stockholm).")
+
+@dp.message(Command("day_disable"))
+async def day_disable_cmd(msg: Message):
+    job_id = f"day_msg_{msg.chat.id}"
+    try:
+        scheduler.remove_job(job_id)
+        await msg.answer("🛑 Day message disabled.")
+    except Exception:
+        await msg.answer("Day message wasn’t scheduled.")
+
+@dp.message(Command("day_now"))
+async def day_now_cmd(msg: Message):
+    await send_ai_day_message(msg.chat.id)
 
 # --- Scheduling (DB-backed, admin-only, use in private chat) ---
 
@@ -1619,19 +1646,19 @@ async def enable_random_cmd(msg: Message):
 
 @dp.message(Command("disable_random"))
 async def disable_random_cmd(msg: Message):
+    # Only disable the Forgiveness Chain random opener (plus its 1-hour follow-up scheduling).
     await set_chain_enabled(msg.chat.id, False)
+
     job = random_jobs.pop(msg.chat.id, None)
     if job:
-        try: job.remove()
-        except Exception: pass
-    # Remove related cron jobs if you tied them to the chain
-    try:
-        scheduler.remove_job(f"day_msg_{msg.chat.id}")
-    except Exception: pass
-    try:
-        scheduler.remove_job(f"weekly_votes_{msg.chat.id}")
-    except Exception: pass
+        try:
+            job.remove()
+        except Exception:
+            pass
+
+    # Intentionally do NOT touch the 07:00 day message or weekly votes here.
     await msg.answer("🛑 Forgiveness Chain disabled for this chat (persists across restarts).")
+
 
 @dp.message(Command("status_random"))
 async def status_random_cmd(msg: Message):
@@ -2142,6 +2169,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
