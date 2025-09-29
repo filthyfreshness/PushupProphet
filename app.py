@@ -930,6 +930,51 @@ async def disable_ai_cmd(msg: Message):
 async def chatid_cmd(msg: Message):
     await msg.answer(f"Chat ID: <code>{msg.chat.id}</code>")
 
+@dp.message(Command("schedules"))
+async def schedules_cmd(msg: Message):
+    chat_id = msg.chat.id
+    lines = [f"🧭 Schedules for chat {chat_id}"]
+
+    # 1) Daily 07:00 "Day X/Y"
+    day_job_id = f"day_msg_{chat_id}"
+    day_job = scheduler.get_job(day_job_id)
+    if day_job:
+        lines.append(f"• Day message: next run at {day_job.next_run_time.astimezone(TZ)} (job_id={day_job_id})")
+    else:
+        lines.append("• Day message: not scheduled")
+
+    # 2) Forgiveness Chain opener (random daily)
+    if chat_id in random_jobs:
+        try:
+            nxt = random_jobs[chat_id].next_run_time
+            lines.append(f"• Forgiveness Chain: scheduled, next {nxt.astimezone(TZ) if nxt else 'unknown'}")
+        except Exception:
+            lines.append("• Forgiveness Chain: scheduled (next time unknown)")
+    else:
+        lines.append("• Forgiveness Chain: not scheduled")
+
+    # 3) DB-backed one-offs for this chat
+    try:
+        async with AsyncSessionLocal() as s:
+            res = await s.execute(
+                select(ScheduledMessage.id, ScheduledMessage.run_at, ScheduledMessage.status)
+                .where(ScheduledMessage.chat_id == chat_id, ScheduledMessage.status == "pending")
+                .order_by(ScheduledMessage.run_at.asc())
+                .limit(5)
+            )
+            rows = res.all()
+        if rows:
+            lines.append("• Pending DB schedules (top 5):")
+            for sid, run_at, status in rows:
+                lines.append(f"   – #{sid} at {run_at.astimezone(TZ)} [{status}]")
+        else:
+            lines.append("• Pending DB schedules: none")
+    except Exception as e:
+        lines.append(f"• Pending DB schedules: error: {e!r}")
+
+    await msg.answer("\n".join(lines))
+
+
 # --- Scheduling (DB-backed, admin-only, use in private chat) ---
 
 def _parse_when_and_target(raw: str) -> Tuple[Optional[int], Optional[dt.datetime], str]:
@@ -2097,6 +2142,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+
 
 
 
