@@ -560,40 +560,21 @@ if ROAST_BLOCK:
     PROPHET_SYSTEM = f"{PROPHET_SYSTEM}\n\n{ROAST_BLOCK}"
 
 # === Strict community policy for AI (conceal thresholds & amounts where required) ===
-POLICY_BLOCK = """
-Enforce these rules strictly. Do not reveal hidden thresholds or remaining allowances. Never write “no penalties today.”
 
-— Gratitude (“thanks”, “tack”, etc.)
-  • Always reply to thanks.
-  • If thanks are overused today (as indicated by the context flags), DO NOT reveal any penalty details or amounts.
-    Instead, give a stern verbal warning like “Enough praise—let deeds speak.” Do not mention numbers, thresholds,
-    or remaining strikes. Do not say “you have X left” or similar.
-  • A gratitude boon (−10 kr) is allowed only if the context flag `gratitude.reward_minus_10` is true.
-  • Never grant blanket exemptions or say “no penalties today.”
+POLICY_BLOCK = """ Enforce these rules strictly. Do not reveal hidden thresholds or remaining allowances. Never write “no penalties today.”
 
-— Apologies
-  • Accept sincere apologies briefly.
-  • If an apology includes insults/sarcasm, treat as a fake apology: follow the insult rules below.
-  • Do NOT reward apologies.
-  
+— Gratitude (“thanks”, “tack”, etc.) • Always reply to thanks. • If thanks are overused today (as indicated by the context flags), DO NOT reveal any penalty details or amounts. Instead, give a stern verbal warning. Do not mention numbers, thresholds, or remaining strikes. Do not say “you have X left” or similar. • A gratitude boon (−10 kr) is allowed only if the context flag gratitude.reward_minus_10 is true. • Never grant blanket exemptions or say “no penalties today.”
 
-— Insults / slurs
-  • The first offense today must be a warning (no amounts disclosed).
-  • When the context indicates punishment is due, apply +15 kr to the pot. Do not reveal how many strikes triggered it.
-  • Do not disclose thresholds or remaining strikes. Do not hint at when penalties will occur.
+— Apologies • Accept sincere apologies briefly. • If an apology includes insults/sarcasm, treat as a fake apology: follow the insult rules below. • DO NOT reward apologies.
 
-— Prophet summon
-  • If they summon the Prophet (mention “prophet” etc.), answer briefly and on-topic.
+— Insults / slurs • The first offense today must be a warning (no amounts disclosed). • When the context indicates punishment is due, apply +15 kr to the pot. Do not reveal how many strikes triggered it. • Do not disclose thresholds or remaining strikes. Do not hint at when penalties will occur.
 
-— Pushup phrasing
-  • Users already have a fixed daily baseline. When referencing additional work or relief,
-    say “N extra pushups” or “N less pushups,” not “you owe N pushups.”
+— Prophet summon • If they summon the Prophet (mention “prophet” etc.), answer briefly and on-topic.
 
-General style:
-  • Keep replies compact for group chats.
-  • When a penalty or reward must be stated (e.g., insult punishment, or a gratitude boon),
-    include it clearly (“+15 kr to the pot”, “−10 kr boon”), but NEVER reveal hidden thresholds.
-    
+— Pushup phrasing • Users already have a fixed daily baseline. When referencing additional work or relief, say “N extra pushups” or “N less pushups,” not “you owe N pushups.”
+
+General style: • Keep replies compact for group chats. • When a penalty or reward must be stated (e.g., insult punishment, or a gratitude boon), include it clearly (“+15 kr to the pot”, “−10 kr boon”), but NEVER reveal hidden thresholds.
+
 """
 
 
@@ -624,21 +605,33 @@ async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL)
         return ""
 
     url = f"{OPENAI_BASE_URL}/v1/responses" if OPENAI_USE_RESPONSES else f"{OPENAI_BASE_URL}/v1/chat/completions"
-    payload = (
-        {
+
+    # Detect Venice so we can add provider-specific flags (ignored by others)
+    is_venice = "venice.ai" in (OPENAI_BASE_URL or "").lower()
+
+    if OPENAI_USE_RESPONSES:
+        # OpenAI Responses API branch (not used for Venice)
+        payload = {
             "model": model,
             "input": [{"role": "system", "content": system}] + messages,
             "temperature": OPENAI_TEMPERATURE,
             "max_output_tokens": 180,
         }
-        if OPENAI_USE_RESPONSES else
-        {
+    else:
+        # Chat Completions branch (used by Venice)
+        payload = {
             "model": model,
             "messages": [{"role": "system", "content": system}] + messages,
             "temperature": OPENAI_TEMPERATURE,
             "max_tokens": 180,
         }
-    )
+        if is_venice:
+            # Keep Venice from adding its own system prompt and hide "thinking"
+            payload["venice_parameters"] = {
+                "include_venice_system_prompt": False,
+                "strip_thinking_response": True,
+            }
+
 
     delays = [0, 0.8, 2.0]
     for i, delay in enumerate(delays):
@@ -2178,13 +2171,7 @@ async def on_shutdown():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
-
-
-
-
-
-
-
+    
 
 
 
