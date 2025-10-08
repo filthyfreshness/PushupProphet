@@ -600,17 +600,30 @@ def _cooldown_ok(user_id: int) -> bool:
     return False
 
 async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL) -> str:
-    """Use Responses API when OPENAI_USE_RESPONSES==True, else Chat Completions. Honors OPENAI_BASE_URL."""
+    """Use Responses API when OPENAI_USE_RESPONSES==True (except for Venice), else Chat Completions.
+    Honors OPENAI_BASE_URL and adds Venice niceties when applicable.
+    """
     if not OPENAI_API_KEY:
         return ""
 
-    url = f"{OPENAI_BASE_URL}/v1/responses" if OPENAI_USE_RESPONSES else f"{OPENAI_BASE_URL}/v1/chat/completions"
+    # --- Build a robust endpoint URL ---
+    base = (OPENAI_BASE_URL or "https://api.openai.com").rstrip("/")
+    is_venice = "venice.ai" in base.lower()
 
-    # Detect Venice so we can add provider-specific flags (ignored by others)
-    is_venice = "venice.ai" in (OPENAI_BASE_URL or "").lower()
+    def _join(*parts: str) -> str:
+        return "/".join(p.strip("/") for p in parts if p)
 
-    if OPENAI_USE_RESPONSES:
-        # OpenAI Responses API branch (not used for Venice)
+    def _after_v1(path_after_v1: str) -> str:
+        # If base already ends with /v1, don't append another /v1
+        return _join(base, path_after_v1) if base.endswith("/v1") else _join(base, "v1", path_after_v1)
+
+    # Venice does not support /v1/responses → force chat/completions for Venice
+    use_responses = OPENAI_USE_RESPONSES and not is_venice
+    url = _after_v1("responses") if use_responses else _after_v1("chat/completions")
+
+    # -------- Build payload ----------
+    if use_responses:
+        # OpenAI Responses API branch (NOT used for Venice)
         payload = {
             "model": model,
             "input": [{"role": "system", "content": system}] + messages,
@@ -618,21 +631,24 @@ async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL)
             "max_output_tokens": 180,
         }
     else:
-        # Chat Completions branch (used by Venice)
+        # Chat Completions branch (Venice + OpenAI-compatible)
         payload = {
             "model": model,
             "messages": [{"role": "system", "content": system}] + messages,
             "temperature": OPENAI_TEMPERATURE,
             "max_tokens": 180,
         }
-        if is_venice:
-            # Keep Venice from adding its own system prompt and hide "thinking"
+        # Optional Venice-specific flags (guarded; ignored by other providers)
+        if is_venice and os.getenv("VENICE_FLAGS", "1") == "1":
             payload["venice_parameters"] = {
                 "include_venice_system_prompt": False,
                 "strip_thinking_response": True,
             }
 
+    if os.getenv("DEBUG_AI", "0") == "1":
+        logger.info("[AI] POST %s", url)
 
+    # -------- Make request with simple retries ----------
     delays = [0, 0.8, 2.0]
     for i, delay in enumerate(delays):
         if delay:
@@ -641,14 +657,21 @@ async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL)
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.post(
                     url,
-                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
                     json=payload,
                 )
                 r.raise_for_status()
+                if os.getenv("DEBUG_AI", "0") == "1":
+                    logger.info("[AI] raw response (trunc): %s", r.text[:2000])
+
                 data = r.json()
 
-                if OPENAI_USE_RESPONSES:
-                    # New Responses format
+                if use_responses:
+                    # ---- OpenAI Responses format ----
                     for item in data.get("output", []):
                         if item.get("type") == "message":
                             for p in item.get("content", []):
@@ -656,22 +679,45 @@ async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL)
                                     txt = (p.get("text") or "").strip()
                                     if txt:
                                         return txt
-                    # Fallbacks
+                    # Fallbacks seen in some variants
                     if isinstance(data.get("text"), dict):
                         return (data["text"].get("value") or "").strip()
                     if isinstance(data.get("text"), str):
                         return data["text"].strip()
                     return ""
                 else:
-                    # Chat Completions format
+                    # ---- Chat Completions format (tolerant) ----
                     choices = data.get("choices") or []
-                    if choices and "message" in choices[0]:
-                        return (choices[0]["message"].get("content") or "").strip()
+                    if choices:
+                        msg = choices[0].get("message") or {}
+                        content = msg.get("content")
+
+                        # 1) Plain string (OpenAI-style)
+                        if isinstance(content, str):
+                            txt = content.strip()
+                            if txt:
+                                return txt
+
+                        # 2) List-of-parts (some providers)
+                        if isinstance(content, list):
+                            parts = []
+                            for part in content:
+                                if isinstance(part, dict):
+                                    val = part.get("text") or part.get("value") or part.get("content") or ""
+                                    if isinstance(val, str) and val.strip():
+                                        parts.append(val.strip())
+                                elif isinstance(part, str) and part.strip():
+                                    parts.append(part.strip())
+                            txt = "".join(parts).strip()
+                            if txt:
+                                return txt
                     return ""
+
         except Exception as e:
             logger.warning(f"[AI] attempt {i+1} failed: {e}")
 
     return ""
+
 
 # ================== AI Day-Number Morning Message ==================
 
@@ -2172,6 +2218,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
     
+
 
 
 
