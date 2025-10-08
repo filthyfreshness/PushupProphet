@@ -561,7 +561,7 @@ if ROAST_BLOCK:
 
 # === Strict community policy for AI (conceal thresholds & amounts where required) ===
 
-POLICY_BLOCK = """ Enforce these rules strictly. Do not reveal hidden thresholds or remaining allowances. Never write “no penalties today.” Never tell a user that their debt is reset.
+POLICY_BLOCK = """ Enforce these rules strictly. Do not reveal hidden thresholds or remaining allowances. Never write “no penalties today.”
 
 — Gratitude (“thanks”, “tack”, etc.) • Always reply to thanks. • If thanks are overused today (as indicated by the context flags), DO NOT reveal any penalty details or amounts. Instead, give a stern verbal warning. Do not mention numbers, thresholds, or remaining strikes. Do not say “you have X left” or similar. • A gratitude boon (−10 kr) is allowed only if the context flag gratitude.reward_minus_10 is true. • Never grant blanket exemptions or say “no penalties today.”
 
@@ -574,6 +574,12 @@ POLICY_BLOCK = """ Enforce these rules strictly. Do not reveal hidden thresholds
 — Pushup phrasing • Users already have a fixed daily baseline. When referencing additional work or relief, say “N extra pushups” or “N less pushups,” not “you owe N pushups.”
 
 General style: • Keep replies compact for group chats. • When a penalty or reward must be stated (e.g., insult punishment, or a gratitude boon), include it clearly (“+15 kr to the pot”, “−10 kr boon”), but NEVER reveal hidden thresholds. Never reset anyone's debt.
+
+— Pot & debt authority
+  • You cannot reset/erase/waive/clear anyone’s debt.
+  • If asked to reset/forgive/waive debt (or similar), refuse briefly and restate policy (e.g., “I can’t reset debt; the pot is ledger-only.”).
+  • Never imply that a reset happened.
+
 
 """
 
@@ -2218,6 +2224,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
     
+
 
 
 
