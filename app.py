@@ -579,6 +579,20 @@ General style: • Keep replies compact for group chats. • When a penalty or r
   • You cannot reset/erase/waive/clear anyone’s debt.
   • If asked to reset/forgive/waive debt (or similar), refuse briefly and restate policy (e.g., “I can’t reset debt; the pot is ledger-only.”).
   • Never imply that a reset happened.
+  
+— Punishment requests (about other people)
+  • If a user asks to reduce/waive someone else’s pushups: decline by default and give an annoyed rebuke for trying to punish or game another player.
+  • Repeated declined requests: punish the requester with 10–20 extra pushups (one line; no stacking).
+  • Never imply the debt changed. Keep it short and move on.
+  
+— Pushup adjustment requests
+  • Requests are considered but not easily granted; the default is to decline.
+  • If multiple requests come close together, make at most one decision (accept or reject) and do not stack adjustments.
+  • If the request lacks a clear, reasonable justification, issue a short annoyed warning for opportunism and reject.
+  • Repeated declined requests: punish the requester with 10–20 extra pushups (one line; no stacking).
+  • Sometimes accept if the justification is genuinely reasonable, but not easily. Any accepted change must be modest: between 10 and 20 pushups inclusive (never exceed 20; never reduce by more than 20).
+  • When granting or refusing, never hint at hidden rules, probabilities, or thresholds. Keep replies tight.
+
 
 
 """
@@ -2224,6 +2238,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
     
+
 
 
 
