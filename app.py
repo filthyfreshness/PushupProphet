@@ -2258,11 +2258,11 @@ def _finale_prompt(name: str, ctx: dict) -> str:
         
     )
 
+# 1) Finale command — mirror Dice of Fate style
 @dp.message(Command("challenge_complete", "finale", "finale_now"))
 async def challenge_complete_cmd(msg: Message):
-    logger.info("(/challenge_complete alias) chat=%s user=%s text=%r", msg.chat.id, getattr(msg.from_user, "id", None), msg.text)
+    logger.info("(/challenge_complete) chat=%s user=%s", msg.chat.id, msg.from_user.id)
 
-    # Gate: only allow posting the button after day >= total
     try:
         day, total = await get_program_day()
     except Exception:
@@ -2271,7 +2271,6 @@ async def challenge_complete_cmd(msg: Message):
     if day is None or total is None:
         await msg.answer("Program settings not initialized yet.")
         return
-
     if day < total:
         await msg.answer(f"Not yet — we are on Day {day}/{total}. Come back when the hundred is done.")
         return
@@ -2285,11 +2284,19 @@ async def challenge_complete_cmd(msg: Message):
         reply_markup=kb
     )
 
-# Fallback catcher for group chats and @mentions, forwards to the same handler.
-@dp.message(F.text.regexp(r"^/(challenge_complete|finale)(?:@\w+)?(?:\s|$)"), flags={"block": False})
-async def challenge_complete_text_fallback(msg: Message):
-    logger.info("(/challenge_complete fallback) chat=%s user=%s text=%r", msg.chat.id, getattr(msg.from_user, "id", None), msg.text)
+# 2) Regex fallback — copy the “summon” approach so weird spacing/@mentions still match
+@dp.message(F.text.regexp(r"^/(?:challenge_complete|finale|finale_now)(?:@\w+)?(?:\s|$)"))
+async def challenge_complete_cmd_alias(msg: Message):
     await challenge_complete_cmd(msg)
+
+# 3) Bypass test — like your other quick-test utilities
+@dp.message(Command("finale_button_test"))
+async def finale_button_test_cmd(msg: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🎖️ Claim your Final Prophecy", callback_data="finale:claim")
+    ]])
+    await msg.answer("Test: Final Prophecy claim button below.", reply_markup=kb)
+
 
 
 @dp.callback_query(F.data == "finale:claim")
