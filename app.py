@@ -1463,16 +1463,14 @@ def _get_insult_threshold(user_id: int) -> int:
 
 # ================== Dice of Fate ==================
 FATE_WEIGHTS = [
-    ("miracle",         3),
-    ("mercy_coin",      6),
-    ("trial_form",     10),
-    ("command_prophet",10),
+    ("miracle",         10),
+    ("trial_form",     8),
     ("giver",          12),
-    ("hurricane",      10),
+    ("hurricane",      12),
     ("oath_dawn",      16),
-    ("trial_flesh",    15),
+    ("trial_flesh",    16),
     ("tribute_blood",  15),
-    ("wrath",           3),
+    ("wrath",          12),
 ]
 
 def _pick_fate_key() -> str:
@@ -1482,17 +1480,15 @@ def _pick_fate_key() -> str:
 
 FATE_RULES_TEXT = (
     "<b>Dice of Fate</b>\n\n"
-    "(3%) — ✨ <b>The Miracle</b> — Halve your debt\n"
-    "(6%) — 🪙 <b>Mercy Coin</b> — Skip one regular pushup day\n"
-    "(10%) — ⚔️ <b>Trial of Form</b> — Do 10 perfect pushups → erase 20 kr of debt\n"
-    "(10%) — 👑 <b>Command of the Prophet</b> — Pick a player: He does 30 pushups or 30 kr\n"
-    "(12%) — 🤝 <b>The Giver</b> — Give away 40 of your daily pushups to a random player\n"
+    "(10%) — ✨ <b>The Miracle</b> — Halve your debt\n"
+    "(8%) — ⚔️ <b>Trial of Form</b> — Do 20 perfect pushups → erase 50 kr of debt\n"
+    "(12%) — 🤝 <b>The Giver</b> —  Give away 50 of your daily pushups to a random player\n"
+    "(12%) — 🌪️ <b>Hurricane of Chaos</b> — Pay 50 kr; shift 30% of your debt to random player\n"
+    "(16%) — 🌅 <b>Oath of Dawn</b> — Complete daily pushups by 8am or pay 50 kr\n"
     "\n"
-    "(10%) — 🌪️ <b>Hurricane of Chaos</b> — Pay 10 kr; shift 10% of your debt to random player\n"
-    "(16%) — 🌅 <b>Oath of Dawn</b> — Be first tomorrow or pay 30 kr\n"
-    "(15%) — 🔥 <b>Trial of Flesh</b> — 100 pushups today or +45 kr\n"
+    "(16%) — 🔥 <b>Trial of Flesh</b> — 100 pushups today or +45 kr\n"
     "(15%) — 🩸 <b>Tribute of Blood</b> — Pay 50 kr\n"
-    "(3%) — ⚡ <b>Prophet’s Wrath</b> — Double your debt"
+    "(12%) — ⚡ <b>Prophet’s Wrath</b> — Double your debt"
 )
 
 _fate_rolls: Dict[int, tuple[dt.date, set[int]]] = {}
@@ -2238,6 +2234,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
     
+
 
 
 
