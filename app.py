@@ -2262,11 +2262,9 @@ def _finale_prompt(name: str, ctx: dict) -> str:
 
 @dp.message(Command("challenge_complete"))
 async def challenge_complete_cmd(msg: Message):
-    """
-    Posts a button to let each player claim their personal finale message.
-    You can restrict to admins by uncommenting the _is_admin check below.
-    """
-    # Optional gate: only allow posting the button after day >= total
+    logger.info("(/challenge_complete) chat=%s user=%s", msg.chat.id, msg.from_user.id)
+
+    # Gate: only allow posting the button after day >= total
     try:
         day, total = await get_program_day()
     except Exception:
@@ -2280,10 +2278,6 @@ async def challenge_complete_cmd(msg: Message):
         await msg.answer(f"Not yet — we are on Day {day}/{total}. Come back when the hundred is done.")
         return
 
-    # Uncomment to require admin to post the button in groups:
-    # if not _is_admin(msg.from_user.id):
-    #     return
-
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🎖️ Claim your Final Prophecy", callback_data="finale:claim")
     ]])
@@ -2293,26 +2287,29 @@ async def challenge_complete_cmd(msg: Message):
         reply_markup=kb
     )
 
+
 @dp.callback_query(F.data == "finale:claim")
 async def finale_claim_cb(cb: CallbackQuery):
+    logger.info("(finale:claim) chat=%s user=%s", cb.message.chat.id, cb.from_user.id)
+
     chat_id = cb.message.chat.id
     user_id = cb.from_user.id
 
-    # Check program completed (defensive check)
+    # Defensive: block if not yet completed
     try:
         day, total = await get_program_day()
     except Exception:
         day, total = (None, None)
-    if day is not None and total is not None and day < total:
+    if day is None or total is None or day < total:
         await cb.answer("The challenge is not complete yet.", show_alert=True)
         return
 
-    # Prevent repeat spam in this runtime
+    # Prevent repeat claims during this runtime
     if not _finale_mark_claimed(chat_id, user_id):
         await cb.answer("You’ve already claimed your Final Prophecy.", show_alert=True)
         return
 
-    # Keep stored name fresh
+    # Refresh stored name
     try:
         await upsert_username(
             chat_id, user_id,
@@ -2322,20 +2319,14 @@ async def finale_claim_cb(cb: CallbackQuery):
     except Exception:
         pass
 
-    profile = await _get_user_profile_for_finale(chat_id, user_id)
-    name = html.escape(profile["display_name"])
-
-    # Build compact context for the AI
-    ctx = {
-        "stats": profile["totals"],        # {thanks, apology, insult, mention, penalty}
-        "program": {"day": day, "total": total},
-    }
+    # ⬇️ Use your already-defined builder instead of the missing _get_user_profile_for_finale
+    ctx = await build_finale_context(chat_id, user_id)
+    name = html.escape(ctx["display_name"])
 
     user_msg = _finale_prompt(name, ctx)
 
-    # Ask the AI for a longer output
+    # Long AI output (make sure ai_reply supports max_tokens as shown earlier)
     reply = await ai_reply(PROPHET_SYSTEM, [{"role": "user", "content": user_msg}], max_tokens=550)
-
     if not reply:
         reply = (
             f"{name}, you made it across the hundred dawns. Your effort outlasted your excuses. "
@@ -2343,11 +2334,9 @@ async def finale_claim_cb(cb: CallbackQuery):
             "Now go—carry this standard into whatever comes next."
         )
 
-    # Clear the loading state and post the message
     await cb.answer()
     await cb.message.answer(reply, parse_mode=None, disable_web_page_preview=True)
 
-    # Persist bot reply for context/history
     try:
         await log_chat_message(chat_id, None, True, reply)
     except Exception:
@@ -2489,6 +2478,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
     
+
 
 
 
