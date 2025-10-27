@@ -648,7 +648,7 @@ async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL)
             "model": model,
             "input": [{"role": "system", "content": system}] + messages,
             "temperature": OPENAI_TEMPERATURE,
-            "max_output_tokens": 180,
+            "max_output_tokens": max_tokens,
         }
     else:
         # Chat Completions branch (Venice + OpenAI-compatible)
@@ -656,7 +656,7 @@ async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL)
             "model": model,
             "messages": [{"role": "system", "content": system}] + messages,
             "temperature": OPENAI_TEMPERATURE,
-            "max_tokens": 180,
+            "max_tokens": max_tokens,
         }
         # Optional Venice-specific flags (guarded; ignored by other providers)
         if is_venice and os.getenv("VENICE_FLAGS", "1") == "1":
@@ -2097,6 +2097,261 @@ async def ai_catchall(msg: Message):
         logger.exception("policy-aware AI reply failed")
 
 
+# ================== Challenge completion (Final Prophecy) ==================
+# Locked until program completion (day >= total). Each player taps a button
+# to claim a personal congrats+roast that uses their stats and a peer comparison.
+
+# In-memory guard so users don't spam-claim repeatedly in one runtime.
+_finale_claimed: Dict[int, set[int]] = {}   # chat_id -> set(user_id)
+
+def _finale_mark_claimed(chat_id: int, user_id: int) -> bool:
+    s = _finale_claimed.setdefault(chat_id, set())
+    if user_id in s:
+        return False
+    s.add(user_id)
+    return True
+
+# -------- Stats helpers --------
+async def _all_user_totals(chat_id: int) -> Dict[int, Dict[str, int]]:
+    """
+    Return {user_id: {thanks, apology, insult, mention, penalty}} for the whole chat.
+    Missing metrics are zero-filled.
+    """
+    needed = {"thanks", "apology", "insult", "mention", "penalty"}
+    out: Dict[int, Dict[str, int]] = {}
+    async with AsyncSessionLocal() as s:
+        rows = (await s.execute(
+            select(Counter.user_id, Counter.metric, Counter.count)
+            .where(Counter.chat_id == chat_id)
+        )).all()
+    for uid, metric, count in rows:
+        bucket = out.setdefault(int(uid), {m: 0 for m in needed})
+        if metric in needed:
+            bucket[metric] = int(count or 0)
+    for uid in list(out.keys()):
+        for m in needed:
+            out[uid].setdefault(m, 0)
+    return out
+
+async def _display_names(chat_id: int) -> Dict[int, str]:
+    """Map user_id -> nice display name (first_name > username > 'User 123')."""
+    names: Dict[int, str] = {}
+    async with AsyncSessionLocal() as s:
+        rows = (await s.execute(
+            select(UserName.user_id, UserName.first_name, UserName.username)
+            .where(UserName.chat_id == chat_id)
+        )).all()
+    for uid, first, user in rows:
+        uid = int(uid)
+        disp = (first or "").strip() or (user or "").strip() or f"User {uid}"
+        names[uid] = disp
+    return names
+
+def _compare_against_peers(user_id: int, all_totals: Dict[int, Dict[str, int]], names: Dict[int, str]) -> Dict[str, dict]:
+    """
+    For each metric, compute a simple comparison vs one peer:
+      returns metric -> {
+        count, rank, of, relation ('ahead_of'|'behind'|'solo'),
+        versus_user_id, versus_name, delta
+      }
+    """
+    out: Dict[str, dict] = {}
+    metrics = ["apology", "thanks", "insult", "mention"]
+    user_set = list(all_totals.keys())
+    n = len(user_set)
+
+    for m in metrics:
+        board = sorted(
+            ((uid, all_totals.get(uid, {}).get(m, 0)) for uid in user_set),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        idx = next((i for i, (uid, _) in enumerate(board) if uid == user_id), None)
+        if idx is None:
+            continue
+
+        user_count = board[idx][1]
+        rank = idx + 1
+        entry = {
+            "count": user_count,
+            "rank": rank,
+            "of": n,
+            "relation": "solo",
+            "versus_user_id": None,
+            "versus_name": None,
+            "delta": 0,
+        }
+
+        if n >= 2:
+            if idx == 0:
+                uid2, c2 = board[1]
+                entry.update({
+                    "relation": "ahead_of",
+                    "versus_user_id": uid2,
+                    "versus_name": names.get(uid2, f"User {uid2}"),
+                    "delta": user_count - c2,
+                })
+            else:
+                uid1, c1 = board[0]
+                entry.update({
+                    "relation": "behind",
+                    "versus_user_id": uid1,
+                    "versus_name": names.get(uid1, f"User {uid1}"),
+                    "delta": c1 - user_count,
+                })
+
+        out[m] = entry
+
+    return out
+
+async def build_finale_context(chat_id: int, user_id: int) -> dict:
+    """
+    Returns a single dict the AI can use:
+      {
+        display_name: str,
+        stats: {...},
+        comparatives: {metric: {...}},
+        program: {day, total}
+      }
+    """
+    names = await _display_names(chat_id)
+    all_tot = await _all_user_totals(chat_id)
+    me_stats = all_tot.get(user_id, {"thanks":0,"apology":0,"insult":0,"mention":0,"penalty":0})
+    comps = _compare_against_peers(user_id, all_tot, names)
+
+    try:
+        day, total = await get_program_day()
+    except Exception:
+        day, total = (None, None)
+
+    display_name = names.get(user_id) or "friend"
+
+    return {
+        "display_name": display_name,
+        "stats": me_stats,
+        "comparatives": comps,
+        "program": {"day": day, "total": total},
+    }
+
+def _finale_prompt(name: str, ctx: dict) -> str:
+    """
+    Instruct the AI to weave in counts and one comparison tastefully.
+    """
+    synonyms = {
+        "thanks": ["thank-yous", "gratitude"],
+        "apology": ["apologies", "whines"],
+        "insult": ["profanities", "shots"],
+        "mention": ["daddy-calling", "name-drops"],
+    }
+
+    # Keep JSON short to conserve tokens; AI sees the raw dict text anyway.
+    return (
+        "Write a FINAL PROPHECY for the Pushup Prophet to deliver to a player who just completed a 100-day pushup challenge.\n"
+        f"Player name: {name}\n"
+        f"Context (JSON):\n{ctx}\n\n"
+        "Constraints:\n"
+        "• Tone: Sincere congratulations + playful roast; wise, lightly poetic; profanity encouraged.\n"
+        "• Base the roast/praise on their patterns: thanks, apologies, insults, mentions. Be specific. You MAY use a couple of explicit numbers and exactly one named comparison with another user if available\n"
+        "• Do NOT mention pot amounts, debt resets, thresholds, or rules. Do NOT issue commands or adjust pushups.\n"
+        "• Refer to patterns qualitatively. You MAY cite a count if it truly sharpens the story, but keep it sparse.\n"
+        "• If no peers exist or data is thin, skip comparisons gracefully.\n"
+        "• Structure: 2 short paragraphs (about 160–230 words total), then a single, user-personal mic-drop closer on its own line.\n"
+        "• Address the player by name in the opening.\n"
+        
+    )
+
+@dp.message(Command("challenge_complete"))
+async def challenge_complete_cmd(msg: Message):
+    """
+    Posts a button to let each player claim their personal finale message.
+    You can restrict to admins by uncommenting the _is_admin check below.
+    """
+    # Optional gate: only allow posting the button after day >= total
+    try:
+        day, total = await get_program_day()
+    except Exception:
+        day, total = (None, None)
+
+    if day is None or total is None:
+        await msg.answer("Program settings not initialized yet.")
+        return
+
+    if day < total:
+        await msg.answer(f"Not yet — we are on Day {day}/{total}. Come back when the hundred is done.")
+        return
+
+    # Uncomment to require admin to post the button in groups:
+    # if not _is_admin(msg.from_user.id):
+    #     return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🎖️ Claim your Final Prophecy", callback_data="finale:claim")
+    ]])
+    await msg.answer(
+        "The circle closes. Each of you may now receive your Final Prophecy.\n"
+        "Tap the button below to claim your personal verdict.",
+        reply_markup=kb
+    )
+
+@dp.callback_query(F.data == "finale:claim")
+async def finale_claim_cb(cb: CallbackQuery):
+    chat_id = cb.message.chat.id
+    user_id = cb.from_user.id
+
+    # Check program completed (defensive check)
+    try:
+        day, total = await get_program_day()
+    except Exception:
+        day, total = (None, None)
+    if day is not None and total is not None and day < total:
+        await cb.answer("The challenge is not complete yet.", show_alert=True)
+        return
+
+    # Prevent repeat spam in this runtime
+    if not _finale_mark_claimed(chat_id, user_id):
+        await cb.answer("You’ve already claimed your Final Prophecy.", show_alert=True)
+        return
+
+    # Keep stored name fresh
+    try:
+        await upsert_username(
+            chat_id, user_id,
+            getattr(cb.from_user, "first_name", None),
+            getattr(cb.from_user, "username", None),
+        )
+    except Exception:
+        pass
+
+    profile = await _get_user_profile_for_finale(chat_id, user_id)
+    name = html.escape(profile["display_name"])
+
+    # Build compact context for the AI
+    ctx = {
+        "stats": profile["totals"],        # {thanks, apology, insult, mention, penalty}
+        "program": {"day": day, "total": total},
+    }
+
+    user_msg = _finale_prompt(name, ctx)
+
+    # Ask the AI for a longer output
+    reply = await ai_reply(PROPHET_SYSTEM, [{"role": "user", "content": user_msg}], max_tokens=550)
+
+    if not reply:
+        reply = (
+            f"{name}, you made it across the hundred dawns. Your effort outlasted your excuses. "
+            "Keep the form you forged; keep the promise you proved.\n\n"
+            "Now go—carry this standard into whatever comes next."
+        )
+
+    # Clear the loading state and post the message
+    await cb.answer()
+    await cb.message.answer(reply, parse_mode=None, disable_web_page_preview=True)
+
+    # Persist bot reply for context/history
+    try:
+        await log_chat_message(chat_id, None, True, reply)
+    except Exception:
+        pass
 
 
 
@@ -2234,6 +2489,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
     
+
 
 
 
