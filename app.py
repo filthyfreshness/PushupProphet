@@ -619,14 +619,14 @@ def _cooldown_ok(user_id: int) -> bool:
         return True
     return False
 
-async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL) -> str:
-    """Use Responses API when OPENAI_USE_RESPONSES==True (except for Venice), else Chat Completions.
-    Honors OPENAI_BASE_URL and adds Venice niceties when applicable.
-    """
+# BEFORE
+# async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL) -> str:
+
+# AFTER
+async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL, max_tokens: int = 180) -> str:
     if not OPENAI_API_KEY:
         return ""
 
-    # --- Build a robust endpoint URL ---
     base = (OPENAI_BASE_URL or "https://api.openai.com").rstrip("/")
     is_venice = "venice.ai" in base.lower()
 
@@ -634,36 +634,34 @@ async def ai_reply(system: str, messages: List[dict], model: str = OPENAI_MODEL)
         return "/".join(p.strip("/") for p in parts if p)
 
     def _after_v1(path_after_v1: str) -> str:
-        # If base already ends with /v1, don't append another /v1
         return _join(base, path_after_v1) if base.endswith("/v1") else _join(base, "v1", path_after_v1)
 
-    # Venice does not support /v1/responses → force chat/completions for Venice
+    # Venice does not use the Responses API path in your setup
     use_responses = OPENAI_USE_RESPONSES and not is_venice
     url = _after_v1("responses") if use_responses else _after_v1("chat/completions")
 
-    # -------- Build payload ----------
     if use_responses:
-        # OpenAI Responses API branch (NOT used for Venice)
         payload = {
             "model": model,
             "input": [{"role": "system", "content": system}] + messages,
             "temperature": OPENAI_TEMPERATURE,
-            "max_output_tokens": max_tokens,
+            "max_output_tokens": max_tokens,  # <-- when/if Responses API ever used
         }
     else:
-        # Chat Completions branch (Venice + OpenAI-compatible)
         payload = {
             "model": model,
             "messages": [{"role": "system", "content": system}] + messages,
             "temperature": OPENAI_TEMPERATURE,
-            "max_tokens": max_tokens,
+            "max_tokens": max_tokens,        # <-- Venice Chat Completions path (your current path)
         }
-        # Optional Venice-specific flags (guarded; ignored by other providers)
         if is_venice and os.getenv("VENICE_FLAGS", "1") == "1":
             payload["venice_parameters"] = {
                 "include_venice_system_prompt": False,
                 "strip_thinking_response": True,
             }
+
+    # ... keep the rest of ai_reply unchanged (httpx call + parsing) ...
+
 
     if os.getenv("DEBUG_AI", "0") == "1":
         logger.info("[AI] POST %s", url)
@@ -2478,6 +2476,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
     
+
 
 
 
