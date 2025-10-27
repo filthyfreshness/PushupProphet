@@ -2258,7 +2258,7 @@ def _finale_prompt(name: str, ctx: dict) -> str:
         
     )
 
-@dp.message(Command(("challenge_complete", "finale", "finale_now")))
+@dp.message(Command("challenge_complete", "finale", "finale_now"))
 async def challenge_complete_cmd(msg: Message):
     logger.info("(/challenge_complete alias) chat=%s user=%s text=%r", msg.chat.id, getattr(msg.from_user, "id", None), msg.text)
 
@@ -2482,6 +2482,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
     
+
 
 
 
