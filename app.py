@@ -2258,9 +2258,9 @@ def _finale_prompt(name: str, ctx: dict) -> str:
         
     )
 
-@dp.message(Command("challenge_complete"))
+@dp.message(Command(("challenge_complete", "finale", "finale_now")))
 async def challenge_complete_cmd(msg: Message):
-    logger.info("(/challenge_complete) chat=%s user=%s", msg.chat.id, msg.from_user.id)
+    logger.info("(/challenge_complete alias) chat=%s user=%s text=%r", msg.chat.id, getattr(msg.from_user, "id", None), msg.text)
 
     # Gate: only allow posting the button after day >= total
     try:
@@ -2284,6 +2284,12 @@ async def challenge_complete_cmd(msg: Message):
         "Tap the button below to claim your personal verdict.",
         reply_markup=kb
     )
+
+# Fallback catcher for group chats and @mentions, forwards to the same handler.
+@dp.message(F.text.regexp(r"^/(challenge_complete|finale)(?:@\w+)?(?:\s|$)"), flags={"block": False})
+async def challenge_complete_text_fallback(msg: Message):
+    logger.info("(/challenge_complete fallback) chat=%s user=%s text=%r", msg.chat.id, getattr(msg.from_user, "id", None), msg.text)
+    await challenge_complete_cmd(msg)
 
 
 @dp.callback_query(F.data == "finale:claim")
@@ -2476,6 +2482,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
     
+
 
 
 
