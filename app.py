@@ -2263,6 +2263,7 @@ def _finale_prompt(name: str, ctx: dict) -> str:
 async def challenge_complete_cmd(msg: Message):
     logger.info("(/challenge_complete) chat=%s user=%s", msg.chat.id, msg.from_user.id)
 
+    # Only post the button AFTER program is complete
     try:
         day, total = await get_program_day()
     except Exception:
@@ -2271,6 +2272,7 @@ async def challenge_complete_cmd(msg: Message):
     if day is None or total is None:
         await msg.answer("Program settings not initialized yet.")
         return
+
     if day < total:
         await msg.answer(f"Not yet — we are on Day {day}/{total}. Come back when the hundred is done.")
         return
@@ -2284,19 +2286,43 @@ async def challenge_complete_cmd(msg: Message):
         reply_markup=kb
     )
 
+
 # 2) Regex fallback — copy the “summon” approach so weird spacing/@mentions still match
 @dp.message(F.text.regexp(r"^/(?:challenge_complete|finale|finale_now)(?:@\w+)?(?:\s|$)"))
 async def challenge_complete_cmd_alias(msg: Message):
     await challenge_complete_cmd(msg)
 
-# 3) Bypass test — like your other quick-test utilities
+# 3) Button smoke test (posts the button unconditionally)
 @dp.message(Command("finale_button_test"))
 async def finale_button_test_cmd(msg: Message):
+    logger.info("(/finale_button_test) chat=%s user=%s", msg.chat.id, msg.from_user.id)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🎖️ Claim your Final Prophecy", callback_data="finale:claim")
     ]])
     await msg.answer("Test: Final Prophecy claim button below.", reply_markup=kb)
 
+@dp.message(Command("finale_now_me"))
+async def finale_now_me_cmd(msg: Message):
+    logger.info("(/finale_now_me) chat=%s user=%s", msg.chat.id, msg.from_user.id)
+    try:
+        ctx = await build_finale_context(msg.chat.id, msg.from_user.id)
+        name = html.escape(ctx["display_name"])
+        user_msg = _finale_prompt(name, ctx)
+        reply = await ai_reply(PROPHET_SYSTEM, [{"role": "user", "content": user_msg}], max_tokens=550)
+        if not reply:
+            reply = (
+                f"{name}, you made it across the hundred dawns. Your effort outlasted your excuses. "
+                "Keep the form you forged; keep the promise you proved.\n\n"
+                "Now go—carry this standard into whatever comes next."
+            )
+        await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
+        try:
+            await log_chat_message(msg.chat.id, None, True, reply)
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("/finale_now_me failed")
+        await msg.answer("Could not build your Final Prophecy right now.")
 
 
 @dp.callback_query(F.data == "finale:claim")
@@ -2489,6 +2515,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
     
+
 
 
 
