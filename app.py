@@ -1489,21 +1489,33 @@ FATE_RULES_TEXT = (
     "(12%) — ⚡ <b>Prophet’s Wrath</b> — Double your debt"
 )
 
-_fate_rolls: Dict[int, tuple[dt.date, set[int]]] = {}
+# Max rolls per user per local day (configurable via env)
+MAX_FATE_ROLLS_PER_DAY = int(os.getenv("MAX_FATE_ROLLS_PER_DAY", "3"))
+
+# chat_id -> (day, {user_id: count})
+_fate_rolls: Dict[int, tuple[dt.date, Dict[int, int]]] = {}
 
 def _fate_reset_if_new_day(chat_id: int):
     today = _today_stockholm_date()
     state = _fate_rolls.get(chat_id)
     if not state or state[0] != today:
-        _fate_rolls[chat_id] = (today, set())
+        _fate_rolls[chat_id] = (today, {})
 
-def _fate_has_rolled_today(chat_id: int, user_id: int) -> bool:
+def _fate_rolls_count(chat_id: int, user_id: int) -> int:
     _fate_reset_if_new_day(chat_id)
-    return user_id in _fate_rolls[chat_id][1]
+    return _fate_rolls[chat_id][1].get(user_id, 0)
 
-def _fate_mark_rolled(chat_id: int, user_id: int):
+def _fate_can_roll(chat_id: int, user_id: int) -> bool:
+    return _fate_rolls_count(chat_id, user_id) < MAX_FATE_ROLLS_PER_DAY
+
+def _fate_mark_rolled(chat_id: int, user_id: int) -> int:
+    """
+    Increments and returns the new count for this user today.
+    """
     _fate_reset_if_new_day(chat_id)
-    _fate_rolls[chat_id][1].add(user_id)
+    counts = _fate_rolls[chat_id][1]
+    counts[user_id] = counts.get(user_id, 0) + 1
+    return counts[user_id]
 
 def _fate_epic_text(key: str, target_name: Optional[str] = None) -> str:
     closers = [
@@ -1518,15 +1530,15 @@ def _fate_epic_text(key: str, target_name: Optional[str] = None) -> str:
         "miracle": "✨ <b>The Miracle</b>\nThe scales tilt toward mercy. Your burden is cleaved in half.",
         "giver": (
             "🤝 <b>The Giver</b>\n" +
-            (f"Give away <b>40</b> of your daily pushups to <b>{html.escape(target_name)}</b>. Strength shared is strength multiplied."
+            (f"Give away <b>50</b> of your daily pushups to <b>{html.escape(target_name)}</b>. Strength shared is strength multiplied."
              if target_name else
-             "Give away <b>40</b> of your daily pushups to a random player. Strength shared is strength multiplied.")
+             "Give away <b>50</b> of your daily pushups to a random player. Strength shared is strength multiplied.")
         ),
-        "trial_form": "⚔️ <b>Trial of Form</b>\nOffer <b>10</b> perfect pushups—tempo true, depth honest—and erase <b>20 kr</b> of debt.",
+        "trial_form": "⚔️ <b>Trial of Form</b>\nOffer <b>20</b> perfect pushups—tempo true, depth honest—and erase <b>50 kr</b> of debt.",
         "command_prophet": "👑 <b>Command of the Prophet</b>\nPick a player: he does <b>30</b> pushups or pays <b>30 kr</b>. Authority tests friendship.",
         "mercy_coin": "🪙 <b>Mercy Coin</b>\nOne regular day is pardoned. Do not spend it cheaply.",
-        "hurricane": "🌪️ <b>Hurricane of Chaos</b>\nPay <b>10 kr</b>; then shift <b>10%</b> of your debt to a random player.",
-        "oath_dawn": "🌅 <b>Oath of Dawn</b>\nBe first to rise tomorrow or pay <b>30 kr</b>. Dawn reveals the faithful.",
+        "hurricane": "🌪️ <b>Hurricane of Chaos</b>\nPay <b>50 kr</b>; then shift <b>30%</b> of your debt to a random player.",
+        "oath_dawn": "🌅 <b>Oath of Dawn</b>\nBe first to rise by 8am tomorrow or pay <b>50 kr</b>. Dawn reveals the faithful.",
         "trial_flesh": "🔥 <b>Trial of Flesh</b>\nChoose today: <b>100</b> pushups—or lay <b>45 kr</b> upon the altar.",
         "tribute_blood": "🩸 <b>Tribute of Blood</b>\nThe pot demands <b>50 kr</b>. Pay without grudge, learn without delay.",
         "wrath": "⚡ <b>Prophet’s Wrath</b>\nYour debt is doubled. Pride withers; discipline takes its seat.",
@@ -1552,26 +1564,42 @@ async def fate_roll(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     user_id = cb.from_user.id
 
-    if _fate_has_rolled_today(chat_id, user_id):
-        return await cb.answer("You have already rolled today. Return with the next dawn.", show_alert=True)
+    # Gate: limit per local day
+    if not _fate_can_roll(chat_id, user_id):
+        used = _fate_rolls_count(chat_id, user_id)
+        await cb.answer(
+            f"You’ve already rolled {used}/{MAX_FATE_ROLLS_PER_DAY} times today. Come back tomorrow.",
+            show_alert=True
+        )
+        return
 
-    _fate_mark_rolled(chat_id, user_id)
+    # Mark this attempt and get the new used count
+    used = _fate_mark_rolled(chat_id, user_id)
+
+    # Pick fate
     fate_key = _pick_fate_key()
-
     target = None
     if fate_key == "giver":
         target = _sysrand.choice(PLAYERS) if PLAYERS else None
 
     epic = _fate_epic_text(fate_key, target_name=target)
-    await cb.answer()
 
+    # Ephemeral note about remaining rolls
+    remaining = max(0, MAX_FATE_ROLLS_PER_DAY - used)
+    if remaining:
+        await cb.answer(f"Roll {used}/{MAX_FATE_ROLLS_PER_DAY}. {remaining} left today.")
+    else:
+        await cb.answer(f"Roll {used}/{MAX_FATE_ROLLS_PER_DAY}. That was your last roll today.")
+
+    # Send the result
     if fate_key == "hurricane":
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🎯 Select random player", callback_data="hurricane:spin")
-        ]])
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🎯 Select random player", callback_data="hurricane:spin")]]
+        )
         await cb.message.answer(epic, reply_markup=kb)
     else:
         await cb.message.answer(epic)
+
 
 @dp.callback_query(F.data == "hurricane:spin")
 async def hurricane_spin(cb: CallbackQuery):
@@ -2515,6 +2543,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
     
+
 
 
 
