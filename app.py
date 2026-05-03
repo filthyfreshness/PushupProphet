@@ -36,6 +36,7 @@ from sqlalchemy.orm import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.pool import NullPool
 
 # ------------------------ App & config ------------------------
 
@@ -189,8 +190,9 @@ def _is_pg_url(async_url: str) -> bool:
 ssl_ctx = ssl.create_default_context() if _is_pg_url(ASYNC_DB_URL) else None
 engine = create_async_engine(
     ASYNC_DB_URL,
-    pool_pre_ping=True,
+    poolclass=NullPool,  # <--- THIS STOPS THE BOT FROM HOLDING DEAD CONNECTIONS
     connect_args={"ssl": ssl_ctx} if ssl_ctx else {},
+)
 )
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
