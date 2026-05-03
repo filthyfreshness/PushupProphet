@@ -193,7 +193,7 @@ engine = create_async_engine(
     poolclass=NullPool,  # <--- THIS STOPS THE BOT FROM HOLDING DEAD CONNECTIONS
     connect_args={"ssl": ssl_ctx} if ssl_ctx else {},
 )
-)
+
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 if ASYNC_DB_URL.startswith("sqlite+aiosqlite"):
