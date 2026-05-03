@@ -714,4 +714,6 @@ def _normalize_text(t: str) -> str:
     return t.lower()
 
 THANKS_RE = re.compile(
-    r"\b(thank(?:\s*you)?|thanks|thx|ty|tack(?:\s*så
+    r"\b(thank(?:\s*you)?|thanks|thx|ty|tack(?:\s*så\s*mycket)?)\b",
+    re.IGNORECASE
+)
