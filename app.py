@@ -52,10 +52,10 @@ if not BOT_TOKEN:
 
 # Provider Agnostic AI Config (Optimized for Venice AI)
 AI_API_KEY = os.getenv("AI_API_KEY", os.getenv("OPENAI_API_KEY", "")).strip()
-AI_MODEL = os.getenv("AI_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")).strip()
+AI_MODEL = os.getenv("AI_MODEL", os.getenv("OPENAI_MODEL", "venice-uncensored")).strip()
 AI_TEMPERATURE = float(os.getenv("AI_TEMPERATURE", os.getenv("OPENAI_TEMPERATURE", "0.7")))
 AI_USE_RESPONSES = os.getenv("AI_USE_RESPONSES", os.getenv("OPENAI_USE_RESPONSES", "0")).strip() == "1"
-AI_BASE_URL = os.getenv("AI_BASE_URL", os.getenv("OPENAI_BASE_URL", "https://api.openai.com")).strip()
+AI_BASE_URL = os.getenv("AI_BASE_URL", os.getenv("OPENAI_BASE_URL", "https://api.venice.ai/api/v1")).strip()
 
 logger.info("[AI] Using key suffix: %s", (AI_API_KEY or "")[-8:])
 logger.info("[AI] Using model: %s", AI_MODEL)
@@ -81,6 +81,23 @@ BOT_USERNAME: Optional[str] = None
 CHAT_LAST_BOT_TS: Dict[int, float] = {}
 CHAT_CONVO_USER: Dict[int, int] = {}
 CONVO_WINDOW_S = 30
+
+
+# ------------------------ Background Task Tracker ------------
+_bg_tasks = set()
+
+def fire_and_forget(coro):
+    """Safely executes an async task without blocking and prevents Python GC from killing it."""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+async def _delete_soon(chat_id: int, message_id: int, delay: float = 2.0):
+    try:
+        await asyncio.sleep(delay)
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
 
 
 # ------------------------ Database ---------------------------
@@ -184,13 +201,26 @@ class ChatMessage(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     __table_args__ = (Index("ix_chat_messages_chat_time", "chat_id", "created_at"),)
 
+class PollVote(Base):
+    __tablename__ = "poll_votes"
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id    = Column(BigInteger, nullable=False)
+    user_id    = Column(BigInteger, nullable=False)
+    week_key   = Column(String(16), nullable=False)
+    kind       = Column(String(32), nullable=False) 
+    voted_for  = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (
+        Index("ux_pollvote_unique", "chat_id", "user_id", "week_key", "kind", unique=True),
+    )
+
 def _is_pg_url(async_url: str) -> bool:
     return async_url.startswith("postgresql+asyncpg://")
 
 ssl_ctx = ssl.create_default_context() if _is_pg_url(ASYNC_DB_URL) else None
 engine = create_async_engine(
     ASYNC_DB_URL,
-    poolclass=NullPool,  # <--- THIS STOPS THE BOT FROM HOLDING DEAD CONNECTIONS
+    poolclass=NullPool,  # Safely handles Neon's serverless connection drops
     connect_args={"ssl": ssl_ctx} if ssl_ctx else {},
 )
 
@@ -282,6 +312,17 @@ async def user_totals(chat_id: int, user_id: int) -> Dict[str, int]:
         out.setdefault(k, 0)
     return out
 
+async def upsert_poll_vote(chat_id: int, user_id: int, week_key: str, kind: str, player: str) -> None:
+    ins = _dialect_insert()(PollVote).values(
+        chat_id=chat_id, user_id=user_id, week_key=week_key, kind=kind, voted_for=player
+    )
+    stmt = ins.on_conflict_do_update(
+        index_elements=[PollVote.chat_id.name, PollVote.user_id.name, PollVote.week_key.name, PollVote.kind.name],
+        set_={"voted_for": ins.excluded.voted_for}
+    )
+    async with AsyncSessionLocal() as s:
+        await s.execute(stmt)
+        await s.commit()
 
 # ---------- Program day helpers ----------
 def _local_midnight_utc(today_local: Optional[dt.date] = None) -> dt.datetime:
@@ -484,12 +525,6 @@ def ensure_day_job(chat_id: int) -> None:
 def _is_admin(user_id: int) -> bool: return user_id in _ADMIN_IDS
 def _is_private_chat(msg: Message) -> bool: return getattr(msg.chat, "type", "") == "private"
 
-async def _delete_soon(chat_id: int, message_id: int, delay: float = 2.0):
-    try:
-        await asyncio.sleep(delay)
-        await bot.delete_message(chat_id, message_id)
-    except Exception:
-        pass
 
 # ------------------------ AI layer ---------------------------
 
@@ -553,16 +588,16 @@ async def ai_reply(system: str, messages: List[dict], model: str = AI_MODEL, max
     base = (AI_BASE_URL or "https://api.openai.com").rstrip("/")
     is_venice = "venice.ai" in base.lower()
 
-    def _join(*parts: str) -> str:
-        return "/".join(p.strip("/") for p in parts if p)
+    # Safely build the chat/completions URL
+    if base.endswith("/v1"):
+        url = f"{base}/chat/completions"
+    else:
+        url = f"{base}/v1/chat/completions"
 
-    def _after_v1(path_after_v1: str) -> str:
-        return _join(base, path_after_v1) if base.endswith("/v1") else _join(base, "v1", path_after_v1)
-
+    # Handle legacy responses model if explicitly configured (Venice doesn't use this)
     use_responses = AI_USE_RESPONSES and not is_venice
-    url = _after_v1("responses") if use_responses else _after_v1("chat/completions")
-
     if use_responses:
+        url = url.replace("chat/completions", "responses")
         payload = {
             "model": model,
             "input": [{"role": "system", "content": system}] + messages,
@@ -838,9 +873,12 @@ async def ai_raw_cmd(msg: Message):
         await msg.answer("No AI_API_KEY set.")
         return
     try:
+        base = (AI_BASE_URL or "https://api.openai.com").rstrip("/")
+        url = f"{base}/chat/completions" if base.endswith("/v1") else f"{base}/v1/chat/completions"
+        
         async with httpx.AsyncClient(timeout=25) as client:
             r = await client.post(
-                f"{AI_BASE_URL}/v1/chat/completions",
+                url,
                 headers={"Authorization": f"Bearer {AI_API_KEY}"},
                 json={
                     "model": AI_MODEL,
@@ -957,9 +995,9 @@ async def schedule_once_cmd(msg: Message):
     if not _is_admin(msg.from_user.id):
         return
     if not _is_private_chat(msg):
-        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        fire_and_forget(_delete_soon(msg.chat.id, msg.message_id, 0.1))
         m = await msg.answer("Use this command in a private chat with me.")
-        asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        fire_and_forget(_delete_soon(m.chat.id, m.message_id, 1.5))
         return
 
     raw = re.sub(r"^/schedule_once(@\w+)?\s*", "", (msg.text or ""), flags=re.IGNORECASE).strip()
@@ -998,9 +1036,9 @@ async def schedule_many_cmd(msg: Message):
     if not _is_admin(msg.from_user.id):
         return
     if not _is_private_chat(msg):
-        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        fire_and_forget(_delete_soon(msg.chat.id, msg.message_id, 0.1))
         m = await msg.answer("Use this command in a private chat with me.")
-        asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        fire_and_forget(_delete_soon(m.chat.id, m.message_id, 1.5))
         return
 
     body = re.sub(r"^/schedule_many(@\w+)?\s*", "", (msg.text or ""), flags=re.IGNORECASE).strip()
@@ -1069,9 +1107,9 @@ async def schedule_list_cmd(msg: Message):
     if not _is_admin(msg.from_user.id):
         return
     if not _is_private_chat(msg):
-        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        fire_and_forget(_delete_soon(msg.chat.id, msg.message_id, 0.1))
         m = await msg.answer("Use in private chat.")
-        asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        fire_and_forget(_delete_soon(m.chat.id, m.message_id, 1.5))
         return
 
     parts = (msg.text or "").split()
@@ -1099,9 +1137,9 @@ async def schedule_cancel_cmd(msg: Message):
     if not _is_admin(msg.from_user.id):
         return
     if not _is_private_chat(msg):
-        asyncio.create_task(_delete_soon(msg.chat.id, msg.message_id, 0.1))
+        fire_and_forget(_delete_soon(msg.chat.id, msg.message_id, 0.1))
         m = await msg.answer("Use in private chat.")
-        asyncio.create_task(_delete_soon(m.chat.id, m.message_id, 1.5))
+        fire_and_forget(_delete_soon(m.chat.id, m.message_id, 1.5))
         return
 
     parts = (msg.text or "").split(maxsplit=1)
@@ -1131,19 +1169,12 @@ async def schedule_cancel_cmd(msg: Message):
 
 # ================== Weekly Votes (polls on Sundays) ==================
 PLAYERS = ["Fresh", "Momo", "Valle", "Tän", "Hampa"]  # ← edit to your roster
-
-weakest_votes: Dict[int, Dict[str, Dict[int, str]]] = {}
-inspiration_votes: Dict[int, Dict[str, Dict[int, str]]] = {}
 POLL_META: Dict[str, Dict[str, object]] = {}
 
 def _week_key_now() -> str:
     now = dt.datetime.now(TZ)
     iso = now.isocalendar()
     return f"{iso.year}-W{iso.week:02d}"
-
-def _ensure_vote_map(bucket: Dict[int, Dict[str, Dict[int, str]]], chat_id: int, week_key: str) -> Dict[int, str]:
-    by_chat = bucket.setdefault(chat_id, {})
-    return by_chat.setdefault(week_key, {})
 
 async def send_weekly_vote_prompts(chat_id: int):
     if not PLAYERS:
@@ -1189,14 +1220,14 @@ async def handle_poll_vote(pa: PollAnswer):
     options: List[str] = meta["options"]
     if idx < 0 or idx >= len(options):
         return
+    
     player = options[idx]
     kind = meta["kind"]
     chat_id = meta["chat_id"]
     week_key = _week_key_now()
     user_id = pa.user.id
-    bucket = weakest_votes if kind == "weakest" else inspiration_votes
-    votes_map = _ensure_vote_map(bucket, chat_id, week_key)
-    votes_map[user_id] = player
+    
+    await upsert_poll_vote(chat_id, user_id, week_key, kind, player)
 
     voter_name = (pa.user.full_name or pa.user.first_name or pa.user.username or "Someone").strip()
     safe_voter = html.escape(voter_name)
@@ -1816,332 +1847,4 @@ async def _all_user_totals(chat_id: int) -> Dict[int, Dict[str, int]]:
     out: Dict[int, Dict[str, int]] = {}
     async with AsyncSessionLocal() as s:
         rows = (await s.execute(
-            select(Counter.user_id, Counter.metric, Counter.count)
-            .where(Counter.chat_id == chat_id)
-        )).all()
-    for uid, metric, count in rows:
-        bucket = out.setdefault(int(uid), {m: 0 for m in needed})
-        if metric in needed:
-            bucket[metric] = int(count or 0)
-    for uid in list(out.keys()):
-        for m in needed:
-            out[uid].setdefault(m, 0)
-    return out
-
-async def _display_names(chat_id: int) -> Dict[int, str]:
-    names: Dict[int, str] = {}
-    async with AsyncSessionLocal() as s:
-        rows = (await s.execute(
-            select(UserName.user_id, UserName.first_name, UserName.username)
-            .where(UserName.chat_id == chat_id)
-        )).all()
-    for uid, first, user in rows:
-        uid = int(uid)
-        disp = (first or "").strip() or (user or "").strip() or f"User {uid}"
-        names[uid] = disp
-    return names
-
-def _compare_against_peers(user_id: int, all_totals: Dict[int, Dict[str, int]], names: Dict[int, str]) -> Dict[str, dict]:
-    out: Dict[str, dict] = {}
-    metrics = ["apology", "thanks", "insult", "mention"]
-    user_set = list(all_totals.keys())
-    n = len(user_set)
-
-    for m in metrics:
-        board = sorted(
-            ((uid, all_totals.get(uid, {}).get(m, 0)) for uid in user_set),
-            key=lambda x: x[1],
-            reverse=True
-        )
-        idx = next((i for i, (uid, _) in enumerate(board) if uid == user_id), None)
-        if idx is None:
-            continue
-
-        user_count = board[idx][1]
-        rank = idx + 1
-        entry = {
-            "count": user_count,
-            "rank": rank,
-            "of": n,
-            "relation": "solo",
-            "versus_user_id": None,
-            "versus_name": None,
-            "delta": 0,
-        }
-
-        if n >= 2:
-            if idx == 0:
-                uid2, c2 = board[1]
-                entry.update({
-                    "relation": "ahead_of",
-                    "versus_user_id": uid2,
-                    "versus_name": names.get(uid2, f"User {uid2}"),
-                    "delta": user_count - c2,
-                })
-            else:
-                uid1, c1 = board[0]
-                entry.update({
-                    "relation": "behind",
-                    "versus_user_id": uid1,
-                    "versus_name": names.get(uid1, f"User {uid1}"),
-                    "delta": c1 - user_count,
-                })
-
-        out[m] = entry
-    return out
-
-async def build_finale_context(chat_id: int, user_id: int) -> dict:
-    names = await _display_names(chat_id)
-    all_tot = await _all_user_totals(chat_id)
-    me_stats = all_tot.get(user_id, {"thanks":0,"apology":0,"insult":0,"mention":0,"penalty":0})
-    comps = _compare_against_peers(user_id, all_tot, names)
-
-    try:
-        day, total = await get_program_day()
-    except Exception:
-        day, total = (None, None)
-
-    display_name = names.get(user_id) or "loser"
-
-    return {
-        "display_name": display_name,
-        "stats": me_stats,
-        "comparatives": comps,
-        "program": {"day": day, "total": total},
-    }
-
-def _finale_prompt(name: str, ctx: dict) -> str:
-    return (
-        "Write a FINAL ROAST for the Burpee Bitch to deliver to a player who actually managed to finish a 14-day burpee challenge without dying.\n"
-        f"Player name: {name}\n"
-        f"Context (JSON):\n{ctx}\n\n"
-        "Constraints:\n"
-        "• Tone: Harsh, heavily profane, sassy, sarcastic congratulations. You are proud of them, but you would rather die than admit it openly. Roast the shit out of them.\n"
-        "• Base the roast on their patterns: thanks, apologies, insults, mentions. Be specific. You MAY use a couple of explicit numbers and exactly one named comparison with another user if available.\n"
-        "• Do NOT mention pot amounts, debt resets, thresholds, or rules. Do NOT issue commands or adjust burpees.\n"
-        "• If no peers exist or data is thin, skip comparisons gracefully.\n"
-        "• Structure: 2 short paragraphs (about 160–230 words total), then a single, vicious mic-drop closer on its own line.\n"
-        "• Address the player by name in the opening.\n"
-    )
-
-@dp.message(Command("challenge_complete", "finale", "finale_now"))
-async def challenge_complete_cmd(msg: Message):
-    try:
-        day, total = await get_program_day()
-    except Exception:
-        day, total = (None, None)
-
-    if day is None or total is None:
-        await msg.answer("Program settings not initialized. God, you guys break everything.")
-        return
-
-    if day < total:
-        await msg.answer(f"Hold your horses, dumbass. We are on Day {day}/{total}. Come back when you're actually done.")
-        return
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🎖️ Claim your Roast", callback_data="finale:claim")
-    ]])
-    await msg.answer(
-        "Well, well. Look who survived. Each of you can now receive your Final Roast.\n"
-        "Tap the button below. I promise it will hurt.",
-        reply_markup=kb
-    )
-
-@dp.message(F.text.regexp(r"^/(?:challenge_complete|finale|finale_now)(?:@\w+)?(?:\s|$)"))
-async def challenge_complete_cmd_alias(msg: Message):
-    await challenge_complete_cmd(msg)
-
-@dp.message(Command("finale_button_test"))
-async def finale_button_test_cmd(msg: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🎖️ Claim your Roast", callback_data="finale:claim")
-    ]])
-    await msg.answer("Test: Claim button below. Don't push it unless you're ready to cry.", reply_markup=kb)
-
-@dp.message(Command("finale_now_me"))
-async def finale_now_me_cmd(msg: Message):
-    try:
-        ctx = await build_finale_context(msg.chat.id, msg.from_user.id)
-        name = html.escape(ctx["display_name"])
-        user_msg = _finale_prompt(name, ctx)
-        reply = await ai_reply(BITCH_SYSTEM, [{"role": "user", "content": user_msg}], max_tokens=550)
-        if not reply:
-            reply = (
-                f"{name}, you actually survived 14 days without quitting. Barely. "
-                "Your form is still trash, but you showed up.\n\n"
-                "Now fuck off and take a shower."
-            )
-        await msg.answer(reply, parse_mode=None, disable_web_page_preview=True)
-        try:
-            await log_chat_message(msg.chat.id, None, True, reply)
-        except Exception:
-            pass
-    except Exception:
-        logger.exception("/finale_now_me failed")
-        await msg.answer("Could not build your roast right now. You're lucky.")
-
-
-@dp.callback_query(F.data == "finale:claim")
-async def finale_claim_cb(cb: CallbackQuery):
-    chat_id = cb.message.chat.id
-    user_id = cb.from_user.id
-
-    try:
-        day, total = await get_program_day()
-    except Exception:
-        day, total = (None, None)
-    if day is None or total is None or day < total:
-        await cb.answer("The challenge is not complete yet, idiot.", show_alert=True)
-        return
-
-    if not _finale_mark_claimed(chat_id, user_id):
-        await cb.answer("You’ve already claimed your roast. Stop being needy.", show_alert=True)
-        return
-
-    try:
-        await upsert_username(
-            chat_id, user_id,
-            getattr(cb.from_user, "first_name", None),
-            getattr(cb.from_user, "username", None),
-        )
-    except Exception:
-        pass
-
-    ctx = await build_finale_context(chat_id, user_id)
-    name = html.escape(ctx["display_name"])
-
-    user_msg = _finale_prompt(name, ctx)
-    reply = await ai_reply(BITCH_SYSTEM, [{"role": "user", "content": user_msg}], max_tokens=550)
-    if not reply:
-        reply = (
-            f"{name}, you actually survived 14 days without quitting. Barely. "
-            "Your form is still trash, but you showed up.\n\n"
-            "Now fuck off and take a shower."
-        )
-
-    await cb.answer()
-    await cb.message.answer(reply, parse_mode=None, disable_web_page_preview=True)
-
-    try:
-        await log_chat_message(chat_id, None, True, reply)
-    except Exception:
-        pass
-
-# ------------------------ FastAPI Setup / Lifespan -------------------
-
-app = FastAPI()
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global BOT_ID
-    global BOT_USERNAME
-    me = await bot.get_me()
-    BOT_USERNAME = (me.username or "").lower()
-    BOT_ID = me.id
-    logger.info(f"Bot authorized: @{me.username} (id={me.id})")
-
-    for attempt in range(1, 6):
-        try:
-            await bot.delete_webhook(drop_pending_updates=True, request_timeout=30)
-            info = await bot.get_webhook_info()
-            if not info.url:
-                break
-        except Exception as e:
-            logger.warning(f"delete_webhook attempt {attempt} failed: {e}")
-        await asyncio.sleep(min(2 ** attempt, 10))
-
-    await init_db()
-    await ensure_program_settings()
-    await load_and_schedule_pending()
-
-    try:
-        async with AsyncSessionLocal() as s:
-            res = await s.execute(select(ChatSettings.chat_id).where(ChatSettings.chain_enabled.is_(True)))
-            rows = [r[0] for r in res.all()]
-        for cid in rows:
-            if cid not in random_jobs:
-                schedule_random_daily(cid)
-        logger.info(f"Resumed Forgiveness Chain for {len(rows)} chat(s) from DB.")
-    except Exception:
-        logger.exception("Failed to resume chain from DB")
-
-    ids = os.getenv("GROUP_CHAT_IDS", "").strip()
-    if ids:
-        for raw in ids.split(","):
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                chat_id = int(raw)
-                scheduler.add_job(
-                    send_ai_day_message, "cron",
-                    hour=7, minute=0, args=[chat_id],
-                    id=f"day_msg_{chat_id}", replace_existing=True,
-                )
-                scheduler.add_job(
-                    send_weekly_vote_prompts, "cron",
-                    day_of_week="sun", hour=11, minute=0, args=[chat_id],
-                    id=f"weekly_votes_{chat_id}", replace_existing=True,
-                )
-                schedule_random_daily(chat_id)
-            except Exception as e:
-                logger.exception(f"Startup scheduling failed for chat {raw}: {e}")
-
-    scheduler.start()
-    polling_task = asyncio.create_task(run_bot_polling())
-    
-    yield
-    
-    # Shutdown logic
-    polling_task.cancel()
-    try:
-        scheduler.shutdown(wait=False)
-    except Exception:
-        pass
-    try:
-        await bot.session.close()
-    except Exception:
-        pass
-    try:
-        await engine.dispose()
-    except Exception:
-        pass
-
-app.router.lifespan_context = lifespan
-
-@app.get("/")
-def health(): return {"ok": True, "service": "burpee-bitch"}
-
-@app.head("/")
-def health_head(): return Response(status_code=200)
-
-async def run_bot_polling():
-    delays = [0, 1, 3, 5, 10]
-    for i, delay in enumerate(delays, start=1):
-        if delay: await asyncio.sleep(delay)
-        try:
-            logger.info(f"Starting polling (attempt {i})…")
-            await dp.start_polling(bot, polling_timeout=30)
-            break
-        except TelegramBadRequest as e:
-            msg = str(e)
-            logger.warning(f"Polling TelegramBadRequest: {msg}")
-            try:
-                await bot.delete_webhook(drop_pending_updates=True, request_timeout=30)
-            except Exception as e2:
-                logger.warning(f"delete_webhook after conflict failed: {e2}")
-            continue
-        except TelegramNetworkError as e:
-            logger.warning(f"Network error on polling attempt {i}: {e}")
-            continue
-        except Exception as e:
-            logger.exception(f"Unexpected polling error attempt {i}: {e}")
-            continue
-
-
-# ------------------------ Entrypoint -------------------------
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=False, workers=1)
+            select(Counter.user_
