@@ -1412,7 +1412,7 @@ async def hurricane_spin(cb: CallbackQuery):
     await cb.answer()
     await cb.message.answer(
         f"🎯 The shitstorm lands on: <b>{html.escape(target)}</b>.\n"
-        f"Shift <b>10%</b> of your debt to them. Try not to feel guilty."
+        f"Shift <b>30%</b> of your debt to them. Try not to feel guilty."
     )
 
 FATE_SUMMON_RE = re.compile(
