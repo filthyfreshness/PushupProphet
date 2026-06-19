@@ -1168,7 +1168,7 @@ async def schedule_cancel_cmd(msg: Message):
 
 
 # ================== Weekly Votes (polls on Sundays) ==================
-PLAYERS = ["Fresh", "Momo", "Valle", "Tän", "Hampa"]  # ← edit to your roster
+PLAYERS = ["Fresh", "Momo", "Valle", "Tän", "Hampa", "Big D", "Robs"]  # ← edit to your roster
 POLL_META: Dict[str, Dict[str, object]] = {}
 
 def _week_key_now() -> str:
