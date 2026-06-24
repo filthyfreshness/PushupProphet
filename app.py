@@ -1306,10 +1306,10 @@ FATE_RULES_TEXT = (
     "\n"
     "(10%) — ✨ <b>Dumb Luck</b> — Wipe away 50% of your current debt.\n"
     "(10%) — ⚔️ <b>Form Check</b> — 10 strict, chest-to-ground burpees with an overhead clap to erase 50 kr. No sloppy reps.\n"
-    "(12%) — 🤝 <b>The Parasite</b> — Completely pass today’s burpee count to a single victim. They must do theirs AND yours.\n\n"
-    "(12%) — 🌪️ <b>Shitstorm</b> — Pay 30 kr. Then, force every other player to roll the dice immediately.\n\n" 
+    "(11%) — 🤝 <b>The Parasite</b> — Completely pass today’s burpee count to a single victim. They must do theirs AND yours.\n\n"
+    "(14%) — 🌪️ <b>Shitstorm</b> — Pay 30 kr. Then, force every other player to roll the dice immediately.\n\n" 
     "(14%) — 🌅 <b>Early Bird Gets the Pain</b> — Complete daily burpees by 08:00 tomorrow or pay 66 kr.\n"
-    "(15%) — 🔥 <b>Meat Grinder</b> — 40 extra burpees or cough up 60 kr.\n"
+    "(14%) — 🔥 <b>Meat Grinder</b> — 40 extra burpees or cough up 60 kr.\n"
     "(15%) — 🩸 <b>Blood Money</b> — Pay 70 kr to the group pot. Sucks to suck.\n"
     "(12%) — ⚡ <b>Bitch's Wrath</b> — Pay 20 kr, then double your total debt."
 )
