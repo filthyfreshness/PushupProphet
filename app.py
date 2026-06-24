@@ -1273,16 +1273,27 @@ def _get_insult_threshold(user_id: int) -> int:
     return stored[1]
 
 
-# ================== Dice of Misery ==================
+# ================== Dice of Bitch ==================
+import os
+import re
+import html
+import datetime as dt
+from typing import Dict, Optional
+# Assuming _sysrand, dp, Message, Command, F, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, PLAYERS, _today_stockholm_date are defined elsewhere in your file.
+
 FATE_WEIGHTS = [
     ("miracle",         10),
-    ("trial_form",      8),
+    ("trial_form",      10),
     ("giver",           12),
     ("hurricane",       12),
-    ("oath_dawn",       16),
-    ("trial_flesh",     16),
+    ("oath_dawn",       14),
+    ("trial_flesh",     15),
     ("tribute_blood",   15),
     ("wrath",           12),
+    
+    # --- UNUSED / RETIRED FATES (Uncomment and adjust weights to 100% total if bringing back) ---
+    # ("command_prophet", 0),
+    # ("mercy_coin",      0),
 ]
 
 def _pick_fate_key() -> str:
@@ -1291,16 +1302,18 @@ def _pick_fate_key() -> str:
     return _sysrand.choices(keys, weights=weights, k=1)[0]
 
 FATE_RULES_TEXT = (
-    "<b>Dice of Misery</b>\n\n"
-    "(10%) — ✨ <b>Dumb Luck</b> — Halve your debt. Don't get used to it.\n"
-    "(8%) — ⚔️ <b>Form Check</b> — 10 perfect burpees to erase 50 kr. Don't cheat.\n"
-    "(12%) — 🤝 <b>The Parasite</b> — Give away 15 of your daily burpees to some poor bastard.\n"
-    "(12%) — 🌪️ <b>Shitstorm</b> — Pay 50 kr; dump 30% of your debt on a random player.\n"
-    "(16%) — 🌅 <b>Early Bird Gets the Pain</b> — Complete daily burpees by 8am or pay 50 kr.\n"
-    "\n"
-    "(16%) — 🔥 <b>Meat Grinder</b> — 30 extra burpees today or cough up 45 kr.\n"
-    "(15%) — 🩸 <b>Blood Money</b> — Pay 50 kr. Sucks to suck.\n"
-    "(12%) — ⚡ <b>Bitch's Wrath</b> — Double your debt. Deal with it."
+    "<b>Dice of Bitch: The Final Stretch</b>\n\n"
+    "<b>[THE MERCIFUL REWARDS]</b>\n"
+    "(10%) — ✨ <b>Dumb Luck</b> — Wipe away 50% of your current debt.\n"
+    "(10%) — ⚔️ <b>Form Check</b> — 15 strict, chest-to-ground burpees with an overhead clap to erase 100 kr. No sloppy reps.\n"
+    "(12%) — 🤝 <b>The Parasite</b> — Completely pass today’s burpee count to a single victim. They must do theirs AND yours.\n\n"
+    "<b>[THE CHAOTIC NEUTRAL]</b>\n"
+    "(12%) — 🌪️ <b>Shitstorm</b> — Pay 50 kr. Then, force every other player to roll the dice immediately.\n\n" 
+    "<b>[THE BRUTAL PUNISHMENTS]</b>\n"
+    "(14%) — 🌅 <b>Early Bird Gets the Pain</b> — Complete daily burpees by 7:30 AM tomorrow or pay 100 kr AND add +20 burpees.\n"
+    "(15%) — 🔥 <b>Meat Grinder</b> — 50 extra burpees today or cough up 75 kr.\n"
+    "(15%) — 🩸 <b>Blood Money</b> — Pay 100 kr to the group pot. Sucks to suck.\n"
+    "(12%) — ⚡ <b>Bitch's Wrath</b> — Double your total burpee debt AND pay 50 kr. Deal with it."
 )
 
 MAX_FATE_ROLLS_PER_DAY = int(os.getenv("MAX_FATE_ROLLS_PER_DAY", "3"))
@@ -1335,21 +1348,23 @@ def _fate_epic_text(key: str, target_name: Optional[str] = None) -> str:
     ]
     end = _sysrand.choice(closers)
     texts = {
-        "miracle": "✨ <b>Dumb Luck</b>\nYour debt is halved. Wipe that stupid smile off your face.",
+        "miracle": "✨ <b>Dumb Luck</b>\nWipe away <b>50%</b> of your current debt. The Bitch force is on your side today.",
         "giver": (
             "🤝 <b>The Parasite</b>\n" +
-            (f"Dump <b>15</b> of your daily burpees onto <b>{html.escape(target_name)}</b>. They probably hate you now."
+            (f"Completely pass today’s burpee count to <b>{html.escape(target_name)}</b>. They must do theirs AND yours."
              if target_name else
-             "Dump <b>15</b> of your daily burpees onto a random victim. Have fun making enemies.")
+             "Completely pass today’s burpee count to a random victim. They must do theirs AND yours.")
         ),
-        "trial_form": "⚔️ <b>Form Check</b>\nDo <b>10</b> perfect burpees—chest to floor, full jump—and erase <b>50 kr</b>. I'm watching you.",
-        "command_prophet": "👑 <b>Bitch's Command</b>\nPick a player: they do <b>15</b> burpees or pay <b>30 kr</b>. Assert dominance.",
-        "mercy_coin": "🪙 <b>Mercy Coin</b>\nOne day pardoned. Save it for when you're truly pathetic.",
-        "hurricane": "🌪️ <b>Shitstorm</b>\nPay <b>50 kr</b>; then force <b>30%</b> of your debt on some random poor bastard.",
-        "oath_dawn": "🌅 <b>Early Bird Gets the Pain</b>\nFinish by 8am tomorrow or pay <b>50 kr</b>. Get out of bed, lazy.",
-        "trial_flesh": "🔥 <b>Meat Grinder</b>\n<b>30 extra burpees</b> today or lay down <b>45 kr</b>. Choose your pain.",
-        "tribute_blood": "🩸 <b>Blood Money</b>\nThe pot demands <b>50 kr</b>. Pay up.",
-        "wrath": "⚡ <b>Bitch's Wrath</b>\nYour debt is doubled. Don't look at me like that. Deal with it.",
+        "trial_form": "⚔️ <b>Form Check</b>\nPerform <b>15</b> strict, chest-to-ground burpees with an overhead clap to erase <b>100 kr</b>. No sloppy reps.",
+        "hurricane": "🌪️ <b>Shitstorm</b>\nPay <b>50 kr</b>. Then, force every other player to roll the dice immediately. Chaos reigns.",
+        "oath_dawn": "🌅 <b>Early Bird Gets the Pain</b>\nComplete your daily burpees by <b>7:30 AM</b> tomorrow. Miss the deadline? Pay <b>100 kr</b> AND add <b>+20 burpees</b> to your personal pool.",
+        "trial_flesh": "🔥 <b>Meat Grinder</b>\nAdd <b>50 extra burpees</b> to your plate today, or cough up a steep <b>75 kr</b> on the spot. Choose your pain.",
+        "tribute_blood": "🩸 <b>Blood Money</b>\nPay <b>100 kr</b> to the group pot. No shortcuts, no deals.",
+        "wrath": "⚡ <b>Bitch's Wrath</b>\nDouble your total burpee debt AND pay <b>50 kr</b>. May the fitness gods have mercy on your soul.",
+        
+        # --- UNUSED / RETIRED TEXTS (Kept for future use) ---
+        # "command_prophet": "👑 <b>Bitch's Command</b>\nPick a player: they do <b>15</b> burpees or pay <b>30 kr</b>. Assert dominance.",
+        # "mercy_coin": "🪙 <b>Mercy Coin</b>\nOne day pardoned. Save it for when you're truly pathetic.",
     }
     return texts.get(key, "The dice rolled off the table. Moron.") + f"\n\n<i>{end}</i>"
 
@@ -1383,11 +1398,14 @@ async def fate_roll(cb: CallbackQuery):
     used = _fate_mark_rolled(chat_id, user_id)
     fate_key = _pick_fate_key()
     target = None
+    
+    # If parasite is rolled, pick a random target
     if fate_key == "giver":
         target = _sysrand.choice(PLAYERS) if PLAYERS else None
 
     epic = _fate_epic_text(fate_key, target_name=target)
     remaining = max(0, MAX_FATE_ROLLS_PER_DAY - used)
+    
     if remaining:
         await cb.answer(f"Roll {used}/{MAX_FATE_ROLLS_PER_DAY}. {remaining} left. Keep pushing your luck.")
     else:
@@ -1395,28 +1413,39 @@ async def fate_roll(cb: CallbackQuery):
 
     if fate_key == "hurricane":
         kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🎯 Select random victim", callback_data="hurricane:spin")]]
+            inline_keyboard=[[InlineKeyboardButton(text="🌪️ Unleash the Shitstorm", callback_data="hurricane:trigger")]]
         )
         await cb.message.answer(epic, reply_markup=kb)
     else:
         await cb.message.answer(epic)
 
-@dp.callback_query(F.data == "hurricane:spin")
-async def hurricane_spin(cb: CallbackQuery):
+@dp.callback_query(F.data == "hurricane:trigger")
+async def hurricane_trigger(cb: CallbackQuery):
     invoker = (cb.from_user.first_name or "").strip()
-    candidates = [p for p in PLAYERS if p.lower() != invoker.lower()] or PLAYERS
-    if not candidates:
-        await cb.answer("No players configured.", show_alert=True)
-        return
-    target = _sysrand.choice(candidates)
     await cb.answer()
     await cb.message.answer(
-        f"🎯 The shitstorm lands on: <b>{html.escape(target)}</b>.\n"
-        f"Shift <b>30%</b> of your debt to them. Try not to feel guilty."
+        f"🚨 <b>SHITSTORM INITIATED BY {html.escape(invoker).upper()}</b> 🚨\n\n"
+        f"{html.escape(invoker)} pays <b>50 kr</b>.\n\n"
+        f"<b>EVERY OTHER PLAYER MUST NOW ROLL THE DICE.</b> Tag them. Make sure they suffer."
     )
 
+# --- OLD SHITSTORM LOGIC (Commented out in case you want the 30% debt shift back later) ---
+# @dp.callback_query(F.data == "hurricane:spin")
+# async def hurricane_spin(cb: CallbackQuery):
+#     invoker = (cb.from_user.first_name or "").strip()
+#     candidates = [p for p in PLAYERS if p.lower() != invoker.lower()] or PLAYERS
+#     if not candidates:
+#         await cb.answer("No players configured.", show_alert=True)
+#         return
+#     target = _sysrand.choice(candidates)
+#     await cb.answer()
+#     await cb.message.answer(
+#         f"🎯 The shitstorm lands on: <b>{html.escape(target)}</b>.\n"
+#         f"Shift <b>30%</b> of your debt to them. Try not to feel guilty."
+#     )
+
 FATE_SUMMON_RE = re.compile(
-    r"\b(?:dice\s+of\s+misery|summon(?:\s+the)?\s+dice|roll\s+the\s+dice)\b",
+    r"\b(?:dice\s+of\s+bitch|summon(?:\s+the)?\s+dice|roll\s+the\s+dice)\b",
     re.IGNORECASE
 )
 
@@ -1769,9 +1798,9 @@ async def ai_catchall(msg: Message):
         elif is_insult_direct:
             user_mode = "User just insulted you. Roast them back mercilessly. If punishment is due, clearly state +15 kr to the pot. Swear as much as you want."
         elif is_apology:
-            user_mode = "User apologized. Tell them apologies are for the weak and to do their reps. Do NOT punish apologies."
+            user_mode = "User apologized. Tell the the apology is noted and to focus on their reps. Do NOT punish apologies."
         elif is_summon:
-            user_mode = "They summoned you. Answer briefly, harshly, and tell them to shut up and work."
+            user_mode = "They summoned you. Answer briefly, with sass, and tell them to shut up and work."
         else:
             user_mode = "General message. Be your usual sassy, foul-mouthed self."
 
