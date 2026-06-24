@@ -1284,10 +1284,10 @@ from typing import Dict, Optional
 FATE_WEIGHTS = [
     ("miracle",         10),
     ("trial_form",      10),
-    ("giver",           12),
-    ("hurricane",       12),
+    ("giver",           11),
+    ("hurricane",       14),
     ("oath_dawn",       14),
-    ("trial_flesh",     15),
+    ("trial_flesh",     14),
     ("tribute_blood",   15),
     ("wrath",           12),
     
@@ -1302,18 +1302,16 @@ def _pick_fate_key() -> str:
     return _sysrand.choices(keys, weights=weights, k=1)[0]
 
 FATE_RULES_TEXT = (
-    "<b>Dice of Bitch: The Final Stretch</b>\n\n"
-    "<b>[THE MERCIFUL REWARDS]</b>\n"
+    "<b>DICE OF BITCH: THE FINAL STRETCH</b>\n\n"
+    "\n"
     "(10%) — ✨ <b>Dumb Luck</b> — Wipe away 50% of your current debt.\n"
-    "(10%) — ⚔️ <b>Form Check</b> — 15 strict, chest-to-ground burpees with an overhead clap to erase 100 kr. No sloppy reps.\n"
+    "(10%) — ⚔️ <b>Form Check</b> — 10 strict, chest-to-ground burpees with an overhead clap to erase 50 kr. No sloppy reps.\n"
     "(12%) — 🤝 <b>The Parasite</b> — Completely pass today’s burpee count to a single victim. They must do theirs AND yours.\n\n"
-    "<b>[THE CHAOTIC NEUTRAL]</b>\n"
-    "(12%) — 🌪️ <b>Shitstorm</b> — Pay 50 kr. Then, force every other player to roll the dice immediately.\n\n" 
-    "<b>[THE BRUTAL PUNISHMENTS]</b>\n"
-    "(14%) — 🌅 <b>Early Bird Gets the Pain</b> — Complete daily burpees by 7:30 AM tomorrow or pay 100 kr AND add +20 burpees.\n"
-    "(15%) — 🔥 <b>Meat Grinder</b> — 50 extra burpees today or cough up 75 kr.\n"
-    "(15%) — 🩸 <b>Blood Money</b> — Pay 100 kr to the group pot. Sucks to suck.\n"
-    "(12%) — ⚡ <b>Bitch's Wrath</b> — Double your total burpee debt AND pay 50 kr. Deal with it."
+    "(12%) — 🌪️ <b>Shitstorm</b> — Pay 30 kr. Then, force every other player to roll the dice immediately.\n\n" 
+    "(14%) — 🌅 <b>Early Bird Gets the Pain</b> — Complete daily burpees by 08:00 tomorrow or pay 66 kr.\n"
+    "(15%) — 🔥 <b>Meat Grinder</b> — 40 extra burpees or cough up 60 kr.\n"
+    "(15%) — 🩸 <b>Blood Money</b> — Pay 70 kr to the group pot. Sucks to suck.\n"
+    "(12%) — ⚡ <b>Bitch's Wrath</b> — Pay 20 kr, then double your total debt."
 )
 
 MAX_FATE_ROLLS_PER_DAY = int(os.getenv("MAX_FATE_ROLLS_PER_DAY", "3"))
@@ -1355,12 +1353,12 @@ def _fate_epic_text(key: str, target_name: Optional[str] = None) -> str:
              if target_name else
              "Completely pass today’s burpee count to a random victim. They must do theirs AND yours.")
         ),
-        "trial_form": "⚔️ <b>Form Check</b>\nPerform <b>15</b> strict, chest-to-ground burpees with an overhead clap to erase <b>100 kr</b>. No sloppy reps.",
-        "hurricane": "🌪️ <b>Shitstorm</b>\nPay <b>50 kr</b>. Then, force every other player to roll the dice immediately. Chaos reigns.",
-        "oath_dawn": "🌅 <b>Early Bird Gets the Pain</b>\nComplete your daily burpees by <b>7:30 AM</b> tomorrow. Miss the deadline? Pay <b>100 kr</b> AND add <b>+20 burpees</b> to your personal pool.",
-        "trial_flesh": "🔥 <b>Meat Grinder</b>\nAdd <b>50 extra burpees</b> to your plate today, or cough up a steep <b>75 kr</b> on the spot. Choose your pain.",
-        "tribute_blood": "🩸 <b>Blood Money</b>\nPay <b>100 kr</b> to the group pot. No shortcuts, no deals.",
-        "wrath": "⚡ <b>Bitch's Wrath</b>\nDouble your total burpee debt AND pay <b>50 kr</b>. May the fitness gods have mercy on your soul.",
+        "trial_form": "⚔️ <b>Form Check</b>\nPerform <b>15</b> strict, chest-to-ground burpees with an overhead clap to erase <b>50 kr</b>. No sloppy reps.",
+        "hurricane": "🌪️ <b>Shitstorm</b>\nPay <b>30 kr</b>. Then, force every other player to roll the dice immediately. Chaos reigns.",
+        "oath_dawn": "🌅 <b>Early Bird Gets the Pain</b>\nComplete your daily burpees by <b>08:00 AM</b> tomorrow. Miss the deadline? Pay <b>66 kr</b>.",
+        "trial_flesh": "🔥 <b>Meat Grinder</b>\nAdd <b>40 extra burpees</b> to your plate today, or cough up a <b>60 kr</b> to the spot. Choose your pain.",
+        "tribute_blood": "🩸 <b>Blood Money</b>\nPay <b>70 kr</b> to the group pot. No shortcuts, no deals.",
+        "wrath": "⚡ <b>Bitch's Wrath</b>\n Pay <b>25 kr</b>, then double your debt. Damn, may the Bitch gods have mercy on your soul.",
         
         # --- UNUSED / RETIRED TEXTS (Kept for future use) ---
         # "command_prophet": "👑 <b>Bitch's Command</b>\nPick a player: they do <b>15</b> burpees or pay <b>30 kr</b>. Assert dominance.",
